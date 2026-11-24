@@ -58,6 +58,41 @@ def encode_runs(runs: Iterable[tuple[int, int]]) -> bytes:
     return bytes([START]) + bytes(body) + bytes([(~sum(body)) & 0xFF])
 
 
+MAX_RUN = (1 << 28) - 1
+
+
+def encode_lengths(values, lengths) -> bytes:
+    """encode_runs for arrays of runs at numpy speed: values (0 or 255 only; grey needs the
+    value byte) and lengths, no run longer than MAX_RUN. Adjacent equal values are merged
+    first. Byte-identical to encode_runs."""
+    import numpy as np
+    v = np.asarray(values, np.int64)
+    n = np.asarray(lengths, np.int64)
+    keep = n > 0
+    v, n = v[keep], n[keep]
+    if len(v) and ((v != 0) & (v != 0xFF)).any():
+        return encode_runs(zip(v.tolist(), n.tolist()))
+    if len(v) > 1:                                   # merge neighbours of the same value
+        first = np.r_[True, v[1:] != v[:-1]]
+        idx = np.flatnonzero(first)
+        n = np.add.reduceat(n, idx)
+        v = v[idx]
+    if len(n) and n.max() > MAX_RUN:
+        return encode_runs(zip(v.tolist(), n.tolist()))
+    hi = n >> 4
+    lb = np.where(hi == 0, 0, np.where(hi < 1 << 8, 1, np.where(hi < 1 << 16, 2, 3)))
+    size = 1 + lb
+    off = np.cumsum(size) - size
+    body = np.zeros(int(size.sum()), np.uint8)
+    kind = np.where(v == 0, 0, 3)
+    body[off] = ((kind << 6) | (lb << 4) | (n & 0xF)).astype(np.uint8)
+    for k in (1, 2, 3):                              # big-endian length bytes
+        m = lb >= k
+        body[off[m] + k] = ((hi[m] >> (8 * (lb[m] - k))) & 0xFF).astype(np.uint8)
+    check = (~int(body.sum(dtype=np.int64))) & 0xFF
+    return bytes([START]) + body.tobytes() + bytes([check])
+
+
 def encode(pixels: bytes | bytearray | memoryview) -> bytes:
     """Encode an 8-bit grayscale bitmap (row-major) to `0x55 | chunks | checksum`.
 

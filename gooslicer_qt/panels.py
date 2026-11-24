@@ -6,8 +6,8 @@ from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QPushButton, QStyle, QStyledItemDelegate,
-                               QStyleOptionViewItem, QVBoxLayout, QWidget)
+                               QListWidgetItem, QPushButton, QSizePolicy, QStyle, QStyledItemDelegate,
+                               QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget)
 
 from gooslicer.mesh import MeshReport
 
@@ -57,12 +57,40 @@ class InfoButton(QAbstractButton):
         p.end()
 
 
+def show_popup(popup: QWidget, button: QWidget) -> None:
+    """Open a details pop-up under an (i) button, right-aligned to it (above it if there's no
+    room below)."""
+    popup.adjustSize()
+    anchor = button.mapToGlobal(button.rect().bottomRight())
+    x, y = anchor.x() - popup.width() + 1, anchor.y() + 4
+    scr = button.screen().availableGeometry() if button.screen() else None
+    if scr is not None:
+        x = max(scr.left(), min(x, scr.right() - popup.width()))
+        if y + popup.height() > scr.bottom():
+            y = button.mapToGlobal(button.rect().topLeft()).y() - popup.height() - 4
+    popup.move(x, y)
+    popup.show()
+
+
+def disclosure_button(text: str, tooltip: str = "") -> QToolButton:
+    """A full-width "▸ text" toggle that shows or hides a section (collapsed to start with)."""
+    b = QToolButton()
+    b.setText(text)
+    b.setCheckable(True)
+    b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+    b.setArrowType(Qt.RightArrow)
+    b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    if tooltip:
+        b.setToolTip(tooltip)
+    return b
+
+
 REMOVE_COLOR = "#e5484d"
 REMOVE_SIZE = 16        # px: the clickable square of the red x at the right of each row
 
 
 class _RemoveDelegate(QStyledItemDelegate):
-    """Each row: the model's name, and a red x at the right that removes it."""
+    """Each row: its text, and a red x at the right that removes it."""
 
     def __init__(self, view):
         super().__init__(view)
@@ -105,31 +133,14 @@ class _RemoveDelegate(QStyledItemDelegate):
         return super().editorEvent(event, model, option, index)
 
 
-class PartsList(QListWidget):
-    selectionChangedIds = Signal(list)
-    removeRequested = Signal(int)               # part id, from the red x of its row
+class _RemovableList(QListWidget):
+    """A list whose rows end in a red x (emits removeRequested with the row's UserRole data)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setSelectionMode(QListWidget.ExtendedSelection)
         self.hover_row = -1
         self.setMouseTracking(True)
         self.setItemDelegate(_RemoveDelegate(self))
-        self.itemSelectionChanged.connect(
-            lambda: self.selectionChangedIds.emit([i.data(Qt.UserRole) for i in self.selectedItems()]))
-
-    def refresh(self, scene, selected: list[int]):
-        self.blockSignals(True)
-        self.clear()
-        for p in scene.parts:
-            warn = "" if scene.in_volume(p) else "  ⚠ outside build volume"
-            it = QListWidgetItem(f"{p.name}{warn}")
-            it.setData(Qt.UserRole, p.id)
-            it.setToolTip(f"{p.name}{warn}\nThe red x removes it from the build plate")
-            self.addItem(it)
-            it.setSelected(p.id in selected)
-        self.blockSignals(False)
-
 
     def x_rect(self, row: int) -> QRect:
         return _RemoveDelegate.x_rect(self.visualRect(self.model().index(row, 0)))
@@ -149,6 +160,85 @@ class PartsList(QListWidget):
             self.viewport().unsetCursor()
             self.viewport().update()
         super().leaveEvent(e)
+
+
+class PartsList(_RemovableList):
+    selectionChangedIds = Signal(list)
+    removeRequested = Signal(int)               # part id, from the red x of its row
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QListWidget.ExtendedSelection)
+        self.itemSelectionChanged.connect(
+            lambda: self.selectionChangedIds.emit([i.data(Qt.UserRole) for i in self.selectedItems()]))
+
+    def refresh(self, scene, selected: list[int]):
+        self.blockSignals(True)
+        self.clear()
+        for p in scene.parts:
+            warn = "" if scene.in_volume(p) else "  ⚠ outside build volume"
+            it = QListWidgetItem(f"{p.name}{warn}")
+            it.setData(Qt.UserRole, p.id)
+            it.setToolTip(f"{p.name}{warn}\nThe red x removes it from the build plate")
+            self.addItem(it)
+            it.setSelected(p.id in selected)
+        self.blockSignals(False)
+
+
+class FlawsList(_RemovableList):
+    """Every detected flaw. Clicking a row selects it (its guide line turns red in the 3D view,
+    as clicking its label does) and clicking again deselects; the red x dismisses it."""
+    selectionChangedKeys = Signal(object)       # set of (kind, number)
+    removeRequested = Signal(object)            # (kind, number), from the red x of its row
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QListWidget.MultiSelection)       # a click toggles the row
+        # rows fit the column (the red x must stay in view): no sideways scrolling, long text cut
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setTextElideMode(Qt.ElideRight)
+        self.itemSelectionChanged.connect(
+            lambda: self.selectionChangedKeys.emit({i.data(Qt.UserRole) for i in self.selectedItems()}))
+
+    def refresh(self, flaws, selected) -> None:
+        self.blockSignals(True)
+        self.clear()
+        for f in flaws:
+            it = QListWidgetItem(f"{f.title}\n{f.detail}")
+            it.setData(Qt.UserRole, f.key)
+            it.setToolTip(f"{f.title}: {f.detail}\nClick to highlight its guide line in red; "
+                          "the red x dismisses it as a false positive")
+            self.addItem(it)
+            it.setSelected(f.key in selected)
+        self.blockSignals(False)
+
+    def set_selected(self, keys) -> None:
+        self.blockSignals(True)
+        for i in range(self.count()):
+            it = self.item(i)
+            it.setSelected(it.data(Qt.UserRole) in keys)
+        self.blockSignals(False)
+
+
+class FlawsPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.list = FlawsList()
+        self.empty = QLabel("No flaws found. Use Detect islands (Supports) or Check for voids "
+                            "(Hollowing) in the Models tab, or slice.")
+        self.empty.setWordWrap(True)
+        self.hint = QLabel("Click a flaw to highlight it in red. The red × dismisses a false "
+                           "positive until a part changes.")
+        self.hint.setWordWrap(True)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.empty)
+        lay.addWidget(self.hint)
+        lay.addWidget(self.list, 1)
+
+    def refresh(self, flaws, selected) -> None:
+        self.list.refresh(flaws, selected)
+        self.empty.setVisible(not flaws)
+        self.hint.setVisible(bool(flaws))
 
 
 def _spin(lo, hi, dec=2, suffix=" mm", step=1.0):
@@ -174,7 +264,16 @@ class PropertiesPanel(QWidget):
         lay.addWidget(self.title)
 
         g = QGroupBox("Transform")
-        grid = QGridLayout(g)
+        tl = QVBoxLayout(g)
+        # position, size and scale are tucked away behind a toggle (collapsed), like Advanced settings
+        self.transform_btn = disclosure_button("Position, size and scale",
+                                               "Exact position, size and scale of the selected part")
+        self.transform_btn.toggled.connect(self.set_transform_visible)
+        tl.addWidget(self.transform_btn)
+        self.transform = QWidget()
+        tl.addWidget(self.transform)
+        grid = QGridLayout(self.transform)
+        grid.setContentsMargins(0, 0, 0, 0)
         self.pos = [_spin(-1000, 1000) for _ in AXES]
         self.size = [_spin(0.01, 2000) for _ in AXES]
         self.scale = [_spin(0.1, 10000, 1, " %", 5) for _ in AXES]
@@ -188,6 +287,7 @@ class PropertiesPanel(QWidget):
         self.uniform = QCheckBox("Uniform scale")
         self.uniform.setChecked(True)
         grid.addWidget(self.uniform, 4, 1, 1, 3)
+        self.transform.hide()
         lay.addWidget(g)
 
         g = QGroupBox("Rotate")
@@ -216,6 +316,10 @@ class PropertiesPanel(QWidget):
         for b in (self.btn_flat, self.btn_drop, self.btn_center, self.btn_reset):
             row.addWidget(b)
         lay.addLayout(row)
+        self.btn_auto = QPushButton("Auto Position")
+        self.btn_auto.setToolTip("Turn the selected part to the angle that needs the fewest supports "
+                                 "(and has no large flat areas facing the plate)")
+        lay.addWidget(self.btn_auto)
 
         g = QGroupBox("Mesh")
         ml = QFormLayout(g)
@@ -239,7 +343,14 @@ class PropertiesPanel(QWidget):
         self.btn_center.clicked.connect(lambda: self._edit("Center", self._center))
         self.btn_reset.clicked.connect(lambda: self._edit("Reset transform", self._reset))
         self.btn_repair.clicked.connect(win.repair_selected)
+        self.btn_auto.clicked.connect(win.auto_position)
         self.set_part(None, None)
+
+    def set_transform_visible(self, on: bool) -> None:
+        self.transform.setVisible(on)
+        self.transform_btn.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        if self.transform_btn.isChecked() != on:
+            self.transform_btn.setChecked(on)
 
     # ---------------------------------------------------------------- view
     def set_part(self, part, report: MeshReport | None):
@@ -248,6 +359,8 @@ class PropertiesPanel(QWidget):
         for t in (QDoubleSpinBox, QPushButton, QCheckBox, QComboBox):
             for w in self.findChildren(t):
                 w.setEnabled(enabled)
+        if getattr(self.win, "_orienting", False):
+            self.btn_auto.setEnabled(False)             # one Auto Position at a time
         if not enabled:
             self.title.setText("No part selected")
             self.mesh_info.setText("–")

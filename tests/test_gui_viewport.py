@@ -178,10 +178,16 @@ def test_repair_broken_mesh(app, win, tmp_path):
     quit_ = lambda *_: loop.quit()  # noqa: E731
     win.undo.indexChanged.connect(quit_)
     QTimer.singleShot(30000, loop.quit)
+    seen = []
+    win.statusBar().messageChanged.connect(seen.append)
     win.repair_selected()
     loop.exec()
     win.undo.indexChanged.disconnect(quit_)
+    win.statusBar().messageChanged.disconnect(seen.append)
     assert p.mesh is not old and "printable mesh" in win.props.mesh_info.text()
+    # each step showed in the status bar, then the result
+    assert "Repairing holey…" in seen and any(m.startswith("Repairing holey: closing holes") for m in seen)
+    assert win.statusBar().currentMessage() == "Repaired holey"
     win.undo.undo()
     assert p.mesh is old and "open (hole)" in win.props.mesh_info.text()
 
@@ -356,7 +362,33 @@ def test_plate_see_through_and_supports_half_transparent(app, win):
     best = max(min(img.pixelColor(int(mid.x() * dpr) + dx, int(mid.y() * dpr) + dy).getRgb()[:3])
                for dx in range(-2, 3) for dy in range(-2, 3))
     assert best > 220
+
+    # a label at the outer end of each line, just outside the build plate, naming the problem
+    from gooslicer_qt.viewport import LABEL_CAVITY, LABEL_ISLAND
+    vp.cavity_lines = island_guides([[10, 5, 3]], win.scene.size)
+    labels = vp.guide_labels()
+    assert sorted(lab.text for lab in labels) == sorted([LABEL_ISLAND + " 1", LABEL_CAVITY + " 1"])
+    for r, t, *_ in labels:
+        lines = vp.island_lines if t.startswith(LABEL_ISLAND) else vp.cavity_lines
+        end, start = project(vp, lines[1]), project(vp, lines[0])
+        # beyond the end, continuing the line
+        assert (r.center().x() - end.x()) * (end.x() - start.x()) + (r.center().y() - end.y()) * (end.y() - start.y()) > 0
+        assert not r.contains(end)
+    # the island label (front edge) is drawn: light text on a dark box
+    r = next(lab.rect for lab in labels if lab.text.startswith(LABEL_ISLAND))
+    img = vp.grabFramebuffer()
+    px = [img.pixelColor(int(x * dpr), int(r.center().y() * dpr)) for x in np.linspace(r.left() + 4, r.right() - 4, 60)]
+    assert max(c.lightness() for c in px) > 200 and min(c.lightness() for c in px) < 60
+    # overlapping labels of the same kind collapse into one
+    vp.island_lines = island_guides([[5, 0, 5], [5, 0.3, 5]], win.scene.size)
+    vp.cavity_lines = np.zeros((0, 3))
+    labels = vp.guide_labels()
+    assert [lab.text for lab in labels] == [LABEL_ISLAND + "s 1, 2"] and len(labels[0].keys) == 2
+    vp.island_numbers = [14, 3]                          # numbers come from the flaw list
+    assert [lab.text for lab in vp.guide_labels()] == [LABEL_ISLAND + "s 3, 14"]
+    vp.island_numbers = None
     vp.island_lines = np.zeros((0, 3))
+    assert vp.guide_labels() == []
 
 
 def _ring_point(vp, axis, deg):
@@ -456,3 +488,180 @@ def test_right_click_menu_on_a_part(app, win, tmp_path, monkeypatch):
     mouse(vp, QEvent.MouseButtonPress, QPointF(5, 5), Qt.RightButton)
     mouse(vp, QEvent.MouseButtonRelease, QPointF(5, 5), Qt.RightButton, Qt.NoButton)
     assert len(asked) == 1
+
+
+def test_click_guide_label_selects_its_line(app, win, tmp_path):
+    from gooslicer_qt.viewport import LABEL_CAVITY, LABEL_ISLAND, island_guides
+    vp = win.viewport
+    vp.set_view(-90, 89)                                 # from above
+    # a tall box hides the middle of the island's guide line
+    wait_import(app, win, [box_file(tmp_path, (20, 20, 60))])
+    win.scene.parts[0].position[:2] = (0, -20)
+    win.select([])
+    vp.island_lines = island_guides([[0, 0, 5]], win.scene.size)        # runs to the front (−Y)
+    vp.update()
+    pump(app)
+    dpr = vp.grabFramebuffer().devicePixelRatio()
+    behind = project(vp, [0, -20, 5])                    # under the box: hidden from above
+
+    def colour(pt):
+        im = vp.grabFramebuffer()
+        return im.pixelColor(int(pt.x() * dpr), int(pt.y() * dpr))
+    c = colour(behind)
+    assert not (c.red() > 200 and c.green() < 90)        # white guide, dimmed under the box
+    lab = vp.guide_labels()[0]
+    assert lab.text == LABEL_ISLAND + " 1" and not lab.selected
+
+    mouse(vp, QEvent.MouseButtonPress, lab.rect.center())
+    mouse(vp, QEvent.MouseButtonRelease, lab.rect.center(), Qt.LeftButton, Qt.NoButton)
+    pump(app)
+    assert vp.selected_guides == {("island", 1)} and vp.guide_labels()[0].selected
+    assert win.selected_ids() == []                      # the click didn't pick or move a part
+    c = colour(behind)                                   # red, and drawn over the box
+    assert c.red() > 200 and c.green() < 90 and c.blue() < 90
+    # a selected label is never left out, even where another label would cover it
+    vp.cavity_lines = vp.island_lines.copy()
+    vp.cavity_lines[0, 2] = vp.cavity_lines[1, 2] = 5.01
+    texts = [x.text for x in vp.guide_labels()]
+    assert texts[0] == LABEL_ISLAND + " 1" and not any(t.startswith(LABEL_CAVITY) for t in texts)
+    vp.cavity_lines = np.zeros((0, 3))
+    assert vp.selected_guides == {("island", 1)}         # a new cavity check keeps the island's
+
+    lab = vp.guide_labels()[0]
+    mouse(vp, QEvent.MouseButtonPress, lab.rect.center())    # clicking again deselects
+    mouse(vp, QEvent.MouseButtonRelease, lab.rect.center(), Qt.LeftButton, Qt.NoButton)
+    pump(app)
+    assert vp.selected_guides == set() and not vp.guide_labels()[0].selected
+    c = colour(behind)
+    assert not (c.red() > 200 and c.green() < 90)
+    vp.toggle_guide(vp.guide_labels()[0])
+    assert vp.guide_selection()
+    vp.clear_guide_selection("cavity")                   # another kind's check: kept
+    assert vp.guide_selection() == {("island", 1)}
+    vp.clear_guide_selection("island")                   # a new island check renumbers: cleared
+    assert vp.guide_selection() == set()
+    vp.toggle_guide(vp.guide_labels()[0])
+    vp.island_lines = np.zeros((0, 3))                   # its line is gone: so is the selection
+    assert vp.guide_selection() == set()
+    vp.island_lines = np.zeros((0, 3))
+
+
+
+def test_auto_position(app, win, tmp_path):
+    wait_import(app, win, [box_file(tmp_path, size=(40, 40, 2), name="plate.stl")])
+    p = win.scene.parts[0]
+    pp = win.props
+    # under the Lay flat / Drop to plate row, enabled with a part selected
+    lay = pp.layout()
+    row = next(i for i in range(lay.count())
+               if lay.itemAt(i).layout() is not None and lay.itemAt(i).layout().indexOf(pp.btn_flat) >= 0)
+    assert lay.indexOf(pp.btn_auto) == row + 1
+    win.select([])
+    assert not pp.btn_auto.isEnabled()
+    win.select([p.id])
+    assert pp.btn_auto.isEnabled() and pp.btn_auto.text() == "Auto Position"
+    old = p.state()
+    loop = QEventLoop()
+    quit_ = lambda *_: loop.quit()  # noqa: E731
+    win.undo.indexChanged.connect(quit_)
+    QTimer.singleShot(30000, loop.quit)
+    seen = []
+    win.statusBar().messageChanged.connect(seen.append)
+    pp.btn_auto.click()
+    assert not pp.btn_auto.isEnabled()                    # busy
+    loop.exec()
+    win.undo.indexChanged.disconnect(quit_)
+    win.statusBar().messageChanged.disconnect(seen.append)
+    assert not np.allclose(p.rotation, old.rotation)
+    assert abs(p.bounds()[0][2] - p.elevation) < 1e-6     # still on the plate
+    n = trimesh.Trimesh(p.world_vertices(), p.mesh.faces).face_normals
+    assert (n[:, 2] > -0.95).all()                         # nothing flat against the plate
+    assert any("angles tried" in m for m in seen) and "Auto Position: tilted" in win.statusBar().currentMessage()
+    assert "Auto Position plate: tilted" in win.log.toPlainText()
+    assert pp.btn_auto.isEnabled()
+    win.undo.undo()
+    assert p.state() == old
+
+
+def test_drain_hole_panel_and_preview(app, win, tmp_path):
+    from gooslicer_qt.hollowing import DrainHolePanel
+    wait_import(app, win, [box_file(tmp_path, size=(30, 30, 20), name="block.stl")])
+    p = win.scene.parts[0]
+    vp = win.viewport
+    vp.reset_view()
+    win.drain_hole_mode()
+    app.processEvents()
+    panel = win.hole_panel
+    # floats over the top-left of the 3D view, no dialog: the view stays usable
+    assert isinstance(panel, DrainHolePanel) and panel.isVisible() and panel.parentWidget() is vp
+    assert (panel.x(), panel.y()) == (12, 12) and QApplication.activeModalWidget() is None
+    assert vp.hole_mode and vp.hole_preview is None
+    f = panel.fields
+    # linked by default: one value sets both
+    assert f.radii_linked and f.depths_linked
+    f.r1.setValue(2.5)
+    assert f.r2.value() == 2.5
+    f.e2.setValue(4.0)
+    assert f.e1.value() == 4.0
+    # each padlock sits right of its pair, centred between the two rows
+    for lock, a, b in ((f.radius_lock, f.r1, f.r2), (f.depth_lock, f.e1, f.e2)):
+        assert lock.geometry().left() >= max(a.geometry().right(), b.geometry().right())
+        mid = (a.geometry().center().y() + b.geometry().center().y()) / 2
+        assert abs(lock.geometry().center().y() - mid) <= 2
+    # unlocked: separately
+    f.radius_lock.click()
+    f.depth_lock.click()
+    assert not f.radii_linked and win.settings.value("drain/linkRadius") in (False, "false")
+    f.r1.setValue(2.0)
+    f.r2.setValue(1.5)
+    f.e1.setValue(1.0)
+    f.e2.setValue(3.0)
+    assert (f.r1.value(), f.r2.value(), f.e1.value(), f.e2.value()) == (2.0, 1.5, 1.0, 3.0)
+    f.direction.setCurrentIndex(f.direction.findData("vertical"))      # straight up through the top
+    top = np.array([p.position[0], p.position[1], p.bounds()[1][2]])
+    pos = project(vp, top)
+    mouse(vp, QEvent.MouseMove, pos, Qt.NoButton, Qt.NoButton)
+    app.processEvents()                                                  # moves are picked once in
+    prev = vp.hole_preview
+    assert prev is not None
+    lo, hi = prev.bounds
+    assert np.allclose(hi[:2] - lo[:2], 4.0, atol=0.05)                 # outer radius 2
+    assert np.isclose(hi[2] - lo[2], 4.0, atol=1e-6)                    # 1 outside + 3 inside
+    # it follows the settings: wider, deeper
+    f.r1.setValue(3.0)
+    assert vp.hole_preview is not prev and np.allclose(np.ptp(vp.hole_preview.bounds[:, :2], axis=0), 6.0, atol=0.05)
+    f.e2.setValue(5.0)
+    assert np.isclose(np.ptp(vp.hole_preview.bounds[:, 2]), 6.0)
+    assert float(win.settings.value("drain/radius1")) == 3.0          # remembered
+    vp.update()
+    app.processEvents()                                                 # draws (no GL errors)
+    # a click drills there; the panel stays for the next hole
+    old = p.mesh
+    mouse(vp, QEvent.MouseButtonPress, pos)
+    mouse(vp, QEvent.MouseButtonRelease, pos, Qt.LeftButton, Qt.NoButton)
+    assert win.drilling() and p.mesh is old                              # drilled in the background
+    loop = QEventLoop()
+    win.undo.indexChanged.connect(lambda *_: loop.quit())
+    QTimer.singleShot(30000, loop.quit)
+    loop.exec()
+    assert not win.drilling() and p.mesh is not old and len(p.mesh.faces) > len(old.faces)
+    assert win.undo.undoText() == "Drain hole"
+    assert panel.isVisible() and vp.hole_mode and vp.hole_preview is not None
+    # over the panel: no preview; Done ends it
+    QApplication.sendEvent(panel, QEvent(QEvent.Enter))
+    assert vp.hole_preview is None
+    panel.done_btn.click()
+    assert not vp.hole_mode and not panel.isVisible() and vp.hole_preview is None
+    # Esc ends it too
+    win.drain_hole_mode()
+    assert panel.isVisible() and vp.hole_mode
+    from PySide6.QtGui import QKeyEvent
+    QApplication.sendEvent(vp, QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+    assert not vp.hole_mode and not panel.isVisible()
+    win.undo.undo()
+    assert p.mesh is old
+    # re-locking makes the pair equal again (the second takes the first's value)
+    win.drain_hole_mode()
+    f.radius_lock.click()
+    assert f.radii_linked and f.r2.value() == f.r1.value() == 3.0
+    win.viewport.stop_hole_mode()

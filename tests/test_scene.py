@@ -232,3 +232,55 @@ def test_place_free_finds_the_nearest_gap():
     big = Part.from_mesh("big", trimesh.creation.box((95, 50, 5)))
     sc.add(big)
     assert not sc.place_free(big)                     # no room anywhere
+
+
+def test_repair_removes_walls_debris_and_fins_and_closes_big_holes():
+    cyl = trimesh.creation.cylinder(5, 10, sections=48)
+    top = np.flatnonzero(np.isclose(cyl.triangles_center[:, 2], 5))
+    f = np.delete(cyl.faces, top, axis=0)                 # a 48-sided hole
+    v = cyl.vertices
+    n = len(v)
+    # a zero-thickness wall (a triangle and its reverse), a speck, and a fin on an edge
+    v = np.vstack([v, [[20, 0, 0], [21, 0, 0], [20, 1, 0]],
+                   trimesh.creation.box((0.05, 0.05, 0.05)).vertices + 30,
+                   [[0, 0, 0]]])
+    speck = trimesh.creation.box((0.05, 0.05, 0.05)).faces + n + 3
+    e = f[0][:2]
+    v[n + 11] = v[e].mean(axis=0) * 0.98                  # a sliver sticking inwards off a side edge
+    f = np.vstack([f, [[n, n + 1, n + 2], [n + 2, n + 1, n]], speck, [[e[0], e[1], n + 11]]])
+    bad = trimesh.Trimesh(v, f, process=False)
+    r = M.analyze(bad)
+    assert r.boundary_edges >= 48 and r.duplicate_faces == 1 and r.nonmanifold_edges == 1
+    steps = []
+    fixed = M.repair(bad, progress=steps.append)
+    r2 = M.analyze(fixed)
+    assert r2.ok and r2.components == 1, r2.problems()
+    assert r2.volume == pytest.approx(cyl.volume, rel=1e-3)
+    assert steps[0] == "welding vertices" and "closing holes" in steps and steps[-1] == "turning shells outwards"
+
+
+def test_repair_keeps_separate_solids_and_small_real_parts():
+    a = trimesh.creation.box((10, 10, 10))
+    b = trimesh.creation.box((0.5, 0.5, 0.5))              # small but real: 0.125 mm³
+    b.apply_translation((20, 0, 0))
+    m = trimesh.util.concatenate([a, b])
+    fixed = M.repair(m)
+    r = M.analyze(fixed)
+    assert r.ok and r.components == 2 and r.volume == pytest.approx(1000.125)
+
+
+def test_ray_triangles_matches_trimesh():
+    from gooslicer.scene import ray_triangles
+    m = trimesh.creation.icosphere(4, 10)
+    m.apply_translation((3, -2, 7))
+    rng = np.random.default_rng(3)
+    for _ in range(100):
+        d = rng.normal(size=3)
+        d /= np.linalg.norm(d)
+        o = np.array([3, -2, 7]) - d * 40 + rng.normal(size=3) * 6
+        got = ray_triangles(m, o, d)
+        loc, _, tri = m.ray.intersects_location(o[None], d[None], multiple_hits=False)
+        assert (got is None) == (len(loc) == 0)
+        if got is not None:
+            assert np.allclose(got[1], loc[0], atol=1e-6)
+    assert ray_triangles(m, [0, 0, 100], [0, 0, 1]) is None          # pointing away

@@ -296,13 +296,51 @@ class Cavity:
     lowest: tuple[float, float, float]  # world point near the cavity's bottom (drain hole hint)
 
 
-def sealed_cavities(meshes: list[trimesh.Trimesh], pitch: float | None = None,
-                    min_volume: float = 1.0) -> list[Cavity]:
-    """Enclosed voids that resin cannot drain from: empty-space components of the voxelised
-    union that do not reach the grid border (6-connectivity). Openings narrower than about
-    two voxels are not resolved, so `pitch` defaults to ≤ 0.5 mm."""
-    if not meshes:
-        return []
+REFINE_FACTOR = 4              # a candidate cavity is re-checked at pitch / REFINE_FACTOR …
+REFINE_MAX_VOXELS = 24_000_000  # … in a window around it of at most this many voxels
+REFINE_MARGIN_MM = 4.0         # around the cavity in that window: thicker than its walls, so
+                               # a gap through the wall reaches space outside the window's part
+
+
+def _opens_out(meshes, g: Grid, lab: np.ndarray, i: int, outside: np.ndarray) -> bool:
+    """Whether coarse cavity `i` reaches the outside at a finer pitch. A gap narrower than about
+    two coarse voxels (a crease, or a slot between a part and its supports) is closed off at the
+    coarse pitch and the space behind it looks sealed. Re-voxelise a window around the cavity
+    finer, and if the cavity's empty space joins empty space the coarse pass already found
+    open (`outside`: the labels that reach the grid border), resin drains from it."""
+    idx = np.argwhere(lab == i)
+    margin = max(3, int(math.ceil(REFINE_MARGIN_MM / g.pitch)))
+    k0 = np.maximum(idx.min(0) - margin, 0)
+    k1 = np.minimum(idx.max(0) + margin, np.array(g.shape) - 1)
+    lo = g.origin + k0 * g.pitch - g.pitch / 2
+    hi = g.origin + k1 * g.pitch + g.pitch / 2
+    pf = max(g.pitch / REFINE_FACTOR, float(np.prod(hi - lo) / REFINE_MAX_VOXELS) ** (1 / 3), 0.02)
+    if pf > g.pitch / 2:
+        return False                                  # too big to refine: keep it (large cavities
+                                                      # are hollows, not slivers)
+    shape = tuple(int(math.ceil(x / pf)) for x in hi - lo)
+    gf = Grid(lo + pf / 2, pf, shape)
+    occ = np.zeros(shape, bool)
+    for m in meshes:
+        b = m.bounds
+        if (b[1][:2] < lo[:2]).any() or (b[0][:2] > hi[:2]).any() or b[0][2] > hi[2]:
+            continue                                  # can't cross the window's columns below its top
+        occ |= occupancy(m, gf)
+    fl, _ = ndimage.label(~occ)
+    # coarse label at each fine voxel centre
+    ii = [np.clip(np.rint((gf.origin[d] + np.arange(shape[d]) * pf - g.origin[d]) / g.pitch).astype(np.int64),
+                  0, g.shape[d] - 1) for d in range(3)]
+    coarse = lab[np.ix_(*ii)]
+    empty = ~occ
+    seeds = np.unique(fl[empty & (coarse == i)])
+    seeds = seeds[seeds > 0]
+    if not len(seeds):
+        return False
+    out = np.unique(fl[empty & np.isin(coarse, outside)])
+    return bool(np.isin(seeds, out[out > 0]).any())
+
+
+def _cavity_labels(meshes, pitch, min_volume):
     lo = np.min([m.bounds[0] for m in meshes], axis=0)
     hi = np.max([m.bounds[1] for m in meshes], axis=0)
     if pitch is None:
@@ -318,10 +356,89 @@ def sealed_cavities(meshes: list[trimesh.Trimesh], pitch: float | None = None,
     out = []
     v = pitch ** 3
     sizes = ndimage.sum_labels(np.ones_like(lab), lab, np.arange(1, n + 1))
+    outside = np.array(sorted(x for x in border if x > 0))
     for i in range(1, n + 1):
         if i in border or sizes[i - 1] * v < min_volume:
             continue
+        if _opens_out(meshes, g, lab, i, outside):
+            continue                                  # a narrow gap the coarse grid closed off
         idx = np.argwhere(lab == i)
         bot = idx[idx[:, 2].argmin()]
-        out.append(Cavity(float(sizes[i - 1] * v), tuple((g.origin + bot * pitch).tolist())))
-    return sorted(out, key=lambda c: -c.volume)
+        out.append((i, Cavity(float(sizes[i - 1] * v), tuple((g.origin + bot * pitch).tolist()))))
+    out.sort(key=lambda x: -x[1].volume)
+    return g, lab, out
+
+
+def sealed_cavities(meshes: list[trimesh.Trimesh], pitch: float | None = None,
+                    min_volume: float = 1.0) -> list[Cavity]:
+    """Enclosed voids that resin cannot drain from: empty-space components of the voxelised
+    union that do not reach the grid border (6-connectivity). Openings narrower than about
+    two voxels close up at that pitch (≤ 0.5 mm by default), so each candidate is confirmed at
+    a quarter of the pitch in a window around it (_opens_out)."""
+    if not meshes:
+        return []
+    return [c for _, c in _cavity_labels(meshes, pitch, min_volume)[2]]
+
+
+def cavity_faces(meshes: list[trimesh.Trimesh], pitch: float | None = None,
+                 min_volume: float = 1.0) -> tuple[list[Cavity], list[np.ndarray]]:
+    """sealed_cavities, plus for each mesh a mask of the faces that line a sealed cavity: a
+    point just off the face, on its outward (empty) side, lies in the cavity's voxels."""
+    cav, each = cavity_faces_each(meshes, pitch, min_volume)
+    masks = [np.zeros(len(m.faces), bool) for m in meshes]
+    for per_mesh in each:
+        for mask, hit in zip(masks, per_mesh):
+            mask |= hit
+    return cav, masks
+
+
+def cavity_faces_each(meshes: list[trimesh.Trimesh], pitch: float | None = None,
+                      min_volume: float = 1.0) -> tuple[list[Cavity], list[list[np.ndarray]]]:
+    """cavity_faces for each cavity on its own: [cavity][mesh] face masks."""
+    if not meshes:
+        return [], []
+    g, lab, found = _cavity_labels(meshes, pitch, min_volume)
+    cav = [c for _, c in found]
+    shape = np.array(g.shape)
+    got_all = []
+    for m in meshes:
+        c, nrm = np.asarray(m.triangles_center, float), np.asarray(m.face_normals, float)
+        gots = []
+        for k in (0.6, 1.2, 2.0):                 # thin walls: the nearest voxel may be solid
+            ijk = np.rint((c + nrm * (k * g.pitch) - g.origin) / g.pitch).astype(np.int64)
+            ok = np.all((ijk >= 0) & (ijk < shape), axis=1)
+            got = np.zeros(len(c), np.int64)
+            got[ok] = lab[ijk[ok, 0], ijk[ok, 1], ijk[ok, 2]]
+            gots.append(got)
+        got_all.append(gots)
+    each = [[np.any([got == i for got in gots], axis=0) if len(gots[0]) else np.zeros(0, bool)
+             for gots in got_all] for i, _ in found]
+    return cav, each
+
+
+def cavity_shells(meshes: list[trimesh.Trimesh], pitch: float | None = None,
+                  min_volume: float = 1.0) -> tuple[list[Cavity], list[np.ndarray]]:
+    """sealed_cavities, plus for each mesh a mask of the faces to delete to make its cavities
+    solid: every connected shell that (by area, ≥ 80 %, as the face test can miss slivers) only
+    lines a sealed cavity, such as the inner shell hollowing leaves. A cavity whose wall is also
+    part of the outer surface (several parts closing it off, say) has no such shell and stays."""
+    cav, masks = cavity_faces(meshes, pitch, min_volume)
+    out = []
+    for m, mask in zip(meshes, masks):
+        rm = np.zeros(len(m.faces), bool)
+        if mask.any():
+            lab = trimesh.graph.connected_component_labels(m.face_adjacency, node_count=len(m.faces))
+            area = np.asarray(m.area_faces, float)
+            for c in np.unique(lab[mask]):
+                comp = lab == c
+                if area[comp & mask].sum() >= 0.8 * area[comp].sum():
+                    rm |= comp
+        out.append(rm)
+    return cav, out
+
+
+def without_faces(mesh: trimesh.Trimesh, remove: np.ndarray) -> trimesh.Trimesh:
+    """`mesh` with the faces in `remove` deleted (and the vertices only they used)."""
+    m = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.faces)[~remove], process=False)
+    m.remove_unreferenced_vertices()
+    return m

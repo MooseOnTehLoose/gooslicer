@@ -9,7 +9,9 @@ from OpenGL import GL
 # pointer per context and fails when PyOpenGL's platform differs from Qt's; we only pass
 # VBO offsets, so use the raw entry point.
 from OpenGL.raw.GL.VERSION.GL_2_0 import glVertexAttribPointer as _raw_attrib_pointer
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from typing import NamedTuple
+
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF, QSurfaceFormat, QTransform
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -49,6 +51,31 @@ COL_SUPPORT = (0.22, 0.48, 0.96)       # blue, drawn half transparent
 COL_ISLAND = (0.92, 0.16, 0.14)       # unsupported islands, after the island check
 SUPPORT_ALPHA = 0.5                    # supports are see-through, so the model shows behind them
 GUIDE_DIM = 0.35                       # island guide lines where something is in front of them
+COL_HOLE = (0.15, 0.45, 1.0)           # drain-hole preview (blue)
+HOLE_ALPHA = 0.75                      # its visible part (less and orange parts turn it grey)
+HOLE_ALPHA_HIDDEN = 0.4                # its part inside the model, through the surface
+CAVITY_XRAY = 0.45                     # sealed cavities are inside the model: shown through it
+LABEL_ISLAND = "Unsupported island"    # text at the outer end of each guide line
+LABEL_CAVITY = "Sealed cavity"
+LABEL_GAP_PX = 6                       # between a guide line's end and its label
+COL_GUIDE_SELECTED = (0.95, 0.20, 0.18)  # a guide line whose label was clicked
+
+
+class GuideLabel(NamedTuple):
+    rect: QRectF                       # widget coordinates
+    text: str
+    keys: tuple                        # the flaws it stands for: ("island" | "cavity", number)
+    selected: bool
+
+
+def label_text(kind_text: str, numbers: list[int]) -> str:
+    """'Unsupported island 14', or for lines that end together 'Unsupported islands 3, 4'."""
+    numbers = sorted(numbers)
+    if len(numbers) == 1:
+        return f"{kind_text} {numbers[0]}"
+    shown = ", ".join(str(n) for n in numbers[:3])
+    more = f" +{len(numbers) - 3}" if len(numbers) > 3 else ""
+    return f"{kind_text}s {shown}{more}"
 
 
 def island_guides(points, size) -> np.ndarray:
@@ -188,6 +215,7 @@ class Viewport(QOpenGLWidget):
     filesDropped = Signal(list)
     rotateFinished = Signal(object, str)           # {id: (before, after)}, undo text
     partContextMenu = Signal(int, object)          # part id, global QPoint (right click on a part)
+    guideSelectionChanged = Signal(object)         # set of flaw keys, after a label click
 
     def __init__(self, scene: Scene, parent=None):
         super().__init__(parent)
@@ -201,6 +229,17 @@ class Viewport(QOpenGLWidget):
         self.lay_flat_mode = False
         self.hole_mode = False
         self.support_mode = False
+        # drain-hole preview: hole_preview_maker(part, face, hit) -> world trimesh or None; the
+        # last hover is kept so the preview can follow settings changes
+        self.hole_preview_maker = None
+        self.hole_preview = None
+        self._hole_hover = None
+        self._hole_pos = None
+        self._hole_pending = None       # the latest cursor spot, picked once the queued moves are in
+        self._hole_timer = QTimer(self)
+        self._hole_timer.setSingleShot(True)
+        self._hole_timer.setInterval(0)
+        self._hole_timer.timeout.connect(self._hover_pending)
         self.show_compass = True
         self.show_front = True
         self.show_rings = True                     # rotation rings around the selection
@@ -211,8 +250,16 @@ class Viewport(QOpenGLWidget):
         self.extra_meshes = lambda: []             # [(trimesh, 4x4 world matrix)] drawn as supports
         self.island_meshes: list = []              # world-space trimeshes drawn red over the model
         self.island_lines = np.zeros((0, 3))       # segments from each island to the build area's edge
+        self.cavity_meshes: list = []              # world-space trimeshes lining sealed cavities (red)
+        self.cavity_lines = np.zeros((0, 3))       # segments from each cavity to the build area's edge
+        self.island_numbers: list | None = None    # flaw number of each island segment (None: 1, 2, …)
+        self.cavity_numbers: list | None = None
         self._guide_buf = None
         self._guide_src = None
+        self.selected_guides: set = set()          # guide keys picked by clicking their label
+        self._sel_buf = None
+        self._sel_src = None
+        self._label_hover = False
         self._buffers: dict[int, tuple[object, _Buffer]] = {}  # id(mesh) -> (mesh, buffer)
         self._plate: tuple | None = None
         self._plate_size = None
@@ -266,6 +313,9 @@ class Viewport(QOpenGLWidget):
         if self._guide_buf is not None:
             self._guide_buf.delete()
             self._guide_buf, self._guide_src = None, None
+        if self._sel_buf is not None:
+            self._sel_buf.delete()
+            self._sel_buf, self._sel_src = None, None
         if self._plate:
             for b in self._plate:
                 b.delete()
@@ -277,6 +327,9 @@ class Viewport(QOpenGLWidget):
         self._extras = list(self.extra_meshes())
         live.update({id(m): m for m, _ in self._extras})
         live.update({id(m): m for m in self.island_meshes})
+        live.update({id(m): m for m in self.cavity_meshes})
+        if self.hole_preview is not None:
+            live[id(self.hole_preview)] = self.hole_preview
         for k in [k for k in self._buffers if k not in live]:
             self._buffers.pop(k)[1].delete()
         for k, m in live.items():
@@ -339,19 +392,39 @@ class Viewport(QOpenGLWidget):
             GL.glBindVertexArray(b.vao)
             GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
         GL.glFrontFace(GL.GL_CCW)
-        if self.island_meshes:
-            # the unsupported surface, drawn over the part's own faces (same depth): pulled forward
+        if self.island_meshes or self.cavity_meshes:
+            # the unsupported / cavity surface, drawn over the part's own faces (same depth):
+            # pulled forward
             GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, vp.astype(np.float32))
             GL.glUniformMatrix3fv(u_n, 1, GL.GL_TRUE, np.eye(3, dtype=np.float32))
             GL.glUniform3f(u_c, *COL_ISLAND)
             GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
             GL.glPolygonOffset(-1.0, -2.0)
             GL.glDepthFunc(GL.GL_LEQUAL)
-            for m in self.island_meshes:
+            for m in self.island_meshes + self.cavity_meshes:
                 b = self._buffers[id(m)][1]
                 GL.glBindVertexArray(b.vao)
                 GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
             GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
+            if self.cavity_meshes:
+                # a sealed cavity is hidden inside its part: show it through the walls. Its
+                # faces point into the void, so culling back faces leaves one layer (the far
+                # side) and the colour stays even
+                GL.glEnable(GL.GL_CULL_FACE)
+                GL.glCullFace(GL.GL_BACK)
+                GL.glDepthFunc(GL.GL_GREATER)
+                GL.glDepthMask(GL.GL_FALSE)
+                GL.glEnable(GL.GL_BLEND)
+                GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)
+                GL.glUniform1f(u_alpha, CAVITY_XRAY)
+                for m in self.cavity_meshes:
+                    b = self._buffers[id(m)][1]
+                    GL.glBindVertexArray(b.vao)
+                    GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
+                GL.glUniform1f(u_alpha, 1.0)
+                GL.glDisable(GL.GL_BLEND)
+                GL.glDisable(GL.GL_CULL_FACE)
+                GL.glDepthMask(GL.GL_TRUE)
             GL.glDepthFunc(GL.GL_LESS)
         self._draw_guides(vp)
         if self._extras:
@@ -377,6 +450,9 @@ class Viewport(QOpenGLWidget):
             GL.glDisable(GL.GL_CULL_FACE)
             GL.glDisable(GL.GL_BLEND)
             GL.glUniform1f(u_alpha, 1.0)
+        self._draw_selected_guides(vp)
+        if self.hole_preview is not None:
+            self._draw_hole_preview(vp)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
         painter = QPainter(self)
@@ -385,18 +461,83 @@ class Viewport(QOpenGLWidget):
                 self._draw_front(painter, vp, w, h)
             if self.show_compass:
                 self._draw_compass(painter)
+            self._draw_guide_labels(painter, vp, w, h)
             self._draw_rings(painter, vp, w, h)
         finally:
             painter.end()
 
+    def _draw_hole_preview(self, vp) -> None:
+        """The drain hole a click would drill: translucent blue, its part inside the model shown
+        fainter through the surface."""
+        GL.glUseProgram(self._mesh_prog)
+        GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._mesh_prog, "mvp"), 1, GL.GL_TRUE, vp.astype(np.float32))
+        GL.glUniformMatrix3fv(GL.glGetUniformLocation(self._mesh_prog, "nmat"), 1, GL.GL_TRUE,
+                              np.eye(3, dtype=np.float32))
+        GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "color"), *COL_HOLE)
+        u_alpha = GL.glGetUniformLocation(self._mesh_prog, "alpha")
+        b = self._buffers[id(self.hole_preview)][1]
+        GL.glBindVertexArray(b.vao)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)
+        GL.glEnable(GL.GL_CULL_FACE)
+        GL.glCullFace(GL.GL_BACK)
+        GL.glDepthMask(GL.GL_FALSE)
+        for func, alpha in ((GL.GL_GREATER, HOLE_ALPHA_HIDDEN), (GL.GL_LEQUAL, HOLE_ALPHA)):
+            GL.glDepthFunc(func)
+            GL.glUniform1f(u_alpha, alpha)
+            GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
+        GL.glDepthFunc(GL.GL_LESS)
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glDisable(GL.GL_BLEND)
+        GL.glUniform1f(u_alpha, 1.0)
+
+    def _hover_hole(self, pos) -> None:
+        """Pick under the cursor and rebuild the preview there (none off the parts)."""
+        self._hole_pos = QPointF(pos)
+        part, face, hit = self.scene.pick(*self._ray(pos))
+        self._hole_hover = (part.id, face, hit) if part is not None else None
+        self.refresh_hole_preview()
+
+    def _hover_pending(self) -> None:
+        pos, self._hole_pending = self._hole_pending, None
+        if pos is not None and self.hole_mode:
+            self._hover_hole(pos)
+
+    def repick_hole(self) -> None:
+        """Pick again at the cursor's last spot (the part's mesh changed under it)."""
+        if self.hole_mode and self._hole_pos is not None:
+            self._hover_hole(self._hole_pos)
+
+    def clear_hole_hover(self) -> None:
+        """The cursor left the model view (or went over the settings panel): no preview."""
+        self._hole_hover = self._hole_pos = self._hole_pending = None
+        self._hole_timer.stop()
+        self.refresh_hole_preview()
+
+    def refresh_hole_preview(self) -> None:
+        """Rebuild the preview at the last hover (after a settings change or a drilled hole)."""
+        prev = self.hole_preview
+        self.hole_preview = None
+        if self.hole_mode and self._hole_hover and self.hole_preview_maker:
+            pid, face, hit = self._hole_hover
+            part = self.scene.get(pid)
+            if part is not None and 0 <= face < len(part.mesh.faces):
+                self.hole_preview = self.hole_preview_maker(part, face, hit)
+        if prev is not None or self.hole_preview is not None:
+            self.update()
+
     def _draw_guides(self, vp) -> None:
-        """White lines from each unsupported island to the edge of the build area: solid where
-        visible, dimmer where the model is in front, so they can always be followed."""
-        if self._guide_src is not self.island_lines:
+        """White lines from each unsupported island and sealed cavity to the edge of the build
+        area: solid where visible, dimmer where the model is in front, so they can always be
+        followed."""
+        src = (self.island_lines, self.cavity_lines)
+        if self._guide_src is None or any(a is not b for a, b in zip(self._guide_src, src)):
             if self._guide_buf is not None:
                 self._guide_buf.delete()
-            self._guide_buf = _Buffer(self.island_lines, False) if len(self.island_lines) else None
-            self._guide_src = self.island_lines
+            lines = np.concatenate([self.island_lines, self.cavity_lines]).reshape(-1, 3)
+            self._guide_buf = _Buffer(lines, False) if len(lines) else None
+            self._guide_src = src
         if self._guide_buf is None:
             return
         GL.glUseProgram(self._line_prog)
@@ -421,6 +562,140 @@ class Viewport(QOpenGLWidget):
         GL.glDepthMask(GL.GL_TRUE)
         GL.glDisable(GL.GL_BLEND)
         GL.glUseProgram(self._mesh_prog)
+
+    # ------------------------------------------------------------ guide selection
+    def _numbers(self, kind: str) -> list[int]:
+        lines = self.island_lines if kind == "island" else self.cavity_lines
+        nums = self.island_numbers if kind == "island" else self.cavity_numbers
+        n = len(lines) // 2
+        return list(nums) if nums is not None and len(nums) == n else list(range(1, n + 1))
+
+    def guide_selection(self) -> set:
+        """The selected flaw keys ((kind, number)). Keys whose line is gone are dropped."""
+        live = {(k, n) for k in ("island", "cavity") for n in self._numbers(k)}
+        self.selected_guides &= live
+        return self.selected_guides
+
+    def set_guide_selection(self, keys) -> None:
+        self.selected_guides = set(keys)
+        self.update()
+
+    def clear_guide_selection(self, kind: str | None = None) -> None:
+        """A new check renumbers its flaws: forget that kind's selection."""
+        self.selected_guides = {k for k in self.selected_guides if kind is not None and k[0] != kind}
+        self.update()
+
+    def _guide_segments(self):
+        """[(key, start, end, kind text)] for every guide line."""
+        out = []
+        for kind, lines, text in (("island", self.island_lines, LABEL_ISLAND),
+                                  ("cavity", self.cavity_lines, LABEL_CAVITY)):
+            for num, a, b in zip(self._numbers(kind), lines[0::2], lines[1::2]):
+                out.append(((kind, num), a, b, text))
+        return out
+
+    def guide_labels(self, vp=None, w=None, h=None) -> list[GuideLabel]:
+        """Where the text at the outer end of each guide line goes: just past the end, on the
+        line's continuation, outside the build plate. Lines of the same kind whose labels would
+        overlap share one label (they end together). Selected labels are placed first and always
+        shown; an unselected label that would cover another kind's label is left out."""
+        w = w or max(self.width(), 1)
+        h = h or max(self.height(), 1)
+        if vp is None:
+            vp = self.camera.projection(w / h) @ self.camera.view()
+        sel = self.guide_selection()
+        fm = self.fontMetrics()
+        cands = []
+        for key, a, b, text in self._guide_segments():
+            out_dir = (b - a) / max(float(np.linalg.norm(b - a)), 1e-9)
+            (e, f), ok = self._screen(np.array([b, b + out_dir]), vp)
+            if not ok.all():
+                continue
+            d = f - e
+            n = float(np.hypot(*d))
+            d = d / n if n > 1e-6 else np.array([0.0, 1.0])
+            cands.append((e, d, text, key))
+
+        def rect(e, d, text):
+            tw, th = fm.horizontalAdvance(text) + 10, fm.height() + 2
+            reach = LABEL_GAP_PX + abs(d[0]) * tw / 2 + abs(d[1]) * th / 2
+            return QRectF(e[0] + d[0] * reach - tw / 2, e[1] + d[1] * reach - th / 2, tw, th)
+
+        cands.sort(key=lambda c: c[3] not in sel)                # selected first
+        placed: list[list] = []                                    # [e, d, kind text, keys, selected, rect]
+        for e, d, text, key in cands:
+            is_sel = key in sel
+            r = rect(e, d, label_text(text, [key[1]]))
+            same = next((L for L in placed if L[2] == text and L[5].intersects(r)), None)
+            if same is not None:
+                same[3].append(key)
+                same[4] = same[4] or is_sel
+                same[5] = rect(same[0], same[1], label_text(text, [k[1] for k in same[3]]))
+                continue
+            if is_sel or not any(L[5].intersects(r) for L in placed):
+                placed.append([e, d, text, [key], is_sel, r])
+        return [GuideLabel(L[5], label_text(L[2], [k[1] for k in L[3]]), tuple(L[3]), L[4]) for L in placed]
+
+    def guide_label_at(self, pos) -> GuideLabel | None:
+        for lab in reversed(self.guide_labels()):                # topmost first
+            if lab.rect.contains(QPointF(pos)):
+                return lab
+        return None
+
+    def toggle_guide(self, lab: GuideLabel) -> None:
+        """Clicking a label selects its line(s) (red, never hidden); clicking again deselects."""
+        sel = self.guide_selection()
+        if lab.selected:
+            sel.difference_update(lab.keys)
+        else:
+            sel.update(lab.keys)
+        self.update()
+        self.guideSelectionChanged.emit(set(sel))
+
+    def _draw_selected_guides(self, vp) -> None:
+        """Selected guide lines in red over everything, so nothing hides them."""
+        sel = self.guide_selection()
+        segs = [(a, b) for key, a, b, _ in self._guide_segments() if key in sel]
+        src = (self.island_lines, self.cavity_lines, frozenset(sel))          # numbers follow the lines
+        if (self._sel_src is None or self._sel_src[0] is not src[0] or self._sel_src[1] is not src[1]
+                or self._sel_src[2] != src[2]):
+            if self._sel_buf is not None:
+                self._sel_buf.delete()
+            self._sel_buf = _Buffer(np.array(segs, float).reshape(-1, 3), False) if segs else None
+            self._sel_src = src
+        if self._sel_buf is None:
+            return
+        GL.glUseProgram(self._line_prog)
+        u_mvp = GL.glGetUniformLocation(self._line_prog, "mvp")
+        GL.glUniform4f(GL.glGetUniformLocation(self._line_prog, "color"), *COL_GUIDE_SELECTED, 1.0)
+        GL.glBindVertexArray(self._sel_buf.vao)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        px, py = 2.0 / max(self.width(), 1), 2.0 / max(self.height(), 1)
+        for dx, dy in ((0, 0), (px, 0), (-px, 0), (0, py), (0, -py)):
+            T = np.eye(4)
+            T[0, 3], T[1, 3] = dx, dy
+            GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (T @ vp).astype(np.float32))
+            GL.glDrawArrays(GL.GL_LINES, 0, self._sel_buf.count)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+
+    def _draw_guide_labels(self, p: QPainter, vp, w, h) -> None:
+        labels = self.guide_labels(vp, w, h)
+        if not labels:
+            return
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        font = QFont(self.font())
+        font.setBold(True)
+        p.setFont(font)
+        red = QColor.fromRgbF(*COL_GUIDE_SELECTED)
+        for lab in labels:
+            p.setPen(QPen(red, 1.5) if lab.selected else Qt.NoPen)
+            p.setBrush(QColor(20, 20, 24, 170))              # readable over the grid and models
+            p.drawRoundedRect(lab.rect, 4, 4)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(lab.rect, Qt.AlignCenter, lab.text)
+        p.restore()
 
     def front_label_quad(self, vp=None, w=None, h=None) -> list[QPointF] | None:
         """Screen corners (top-left, top-right, bottom-right, bottom-left) of the FRONT label,
@@ -683,6 +958,10 @@ class Viewport(QOpenGLWidget):
         if e.button() == Qt.RightButton and not (e.modifiers() & Qt.ShiftModifier):
             self._rpress = e.position()
         if e.button() == Qt.LeftButton and not e.modifiers() and self._rot is None:
+            lab = self.guide_label_at(e.position())
+            if lab is not None:
+                self.toggle_guide(lab)
+                return
             axis = self.ring_at(e.position())
             if axis is not None:
                 self._start_rotate(axis, e.position())
@@ -718,6 +997,14 @@ class Viewport(QOpenGLWidget):
             self._drag = {"z": float(hit[2]), "start": hit, "parts": moving,
                           "before": {p.id: p.state() for p in moving}}
 
+    def _restore_cursor(self) -> None:
+        if self.support_mode or self.hole_mode or self.lay_flat_mode:
+            self.setCursor(Qt.CrossCursor)
+        elif self._ring_hover is not None:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.unsetCursor()
+
     def mouseMoveEvent(self, e):
         pos = e.position()
         dx, dy = pos.x() - self._last.x(), pos.y() - self._last.y()
@@ -725,7 +1012,22 @@ class Viewport(QOpenGLWidget):
         if self._rot is not None and e.buttons() & Qt.LeftButton:
             self._drag_rotate(pos)
             return
+        if self.hole_mode and not e.buttons():
+            # a fast mouse sends many moves: pick only where the cursor ends up once they're in
+            self._hole_pending = QPointF(pos)
+            if not self._hole_timer.isActive():
+                self._hole_timer.start()
+            return
         if not e.buttons():
+            on_label = self.guide_label_at(pos) is not None
+            if on_label != self._label_hover:
+                self._label_hover = on_label
+                if on_label:
+                    self.setCursor(Qt.PointingHandCursor)
+                else:
+                    self._restore_cursor()
+            if on_label:
+                return
             hover = self.ring_at(pos)
             if hover != self._ring_hover:
                 self._ring_hover = hover
@@ -805,8 +1107,14 @@ class Viewport(QOpenGLWidget):
     def stop_hole_mode(self):
         if self.hole_mode:
             self.hole_mode = False
+            self.clear_hole_hover()
             self.unsetCursor()
             self.holeModeEnded.emit()
+
+    def leaveEvent(self, e):
+        if self.hole_mode and self._hole_hover is not None:
+            self.clear_hole_hover()
+        super().leaveEvent(e)
 
     def start_lay_flat(self):
         self.lay_flat_mode = True

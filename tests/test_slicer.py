@@ -266,3 +266,26 @@ def test_build_in_memory_matches_file(tmp_path):
         [(x.data, x.definition.pack()) for x in on_disk.layers]
     with pytest.raises(ValueError):
         SL.SliceJob([], SPEC16K, ABS_LIKE_16K, "x").build()
+
+
+def test_vectorised_encoder_is_byte_identical():
+    from elegoo_goo import rle
+    from gooslicer.raster import encode_spans, runs_from_spans
+    rng = np.random.default_rng(7)
+    for _ in range(200):
+        w, h = int(rng.integers(1, 2000)), int(rng.integers(1, 40))
+        rows, ls, rs = [], [], []
+        for r in range(h):
+            xs = np.sort(rng.choice(w + 1, size=min(2 * int(rng.integers(0, 5)), (w + 1) // 2 * 2), replace=False))
+            for a, b in zip(xs[0::2], xs[1::2]):
+                if a < b:
+                    rows.append(r), ls.append(a), rs.append(b)
+        r, L, R = (np.array(x, np.int64) for x in (rows, ls, rs))
+        assert encode_spans(r, L, R, w, h) == rle.encode_runs(runs_from_spans(r, L, R, w, h))
+    w, h = 15120, 6230                                   # the 16K: long runs need 3 length bytes
+    for r, L, R in (([], [], []), ([0], [0], [w]), (list(range(h)), [0] * h, [w] * h), ([3000], [17], [9000])):
+        r, L, R = (np.array(x, np.int64) for x in (r, L, R))
+        assert encode_spans(r, L, R, w, h) == rle.encode_runs(runs_from_spans(r, L, R, w, h))
+    assert rle.encode_lengths([0, 0, 255, 255, 0], [3, 2, 5, 1, 4]) == rle.encode_runs([(0, 5), (255, 6), (0, 4)])
+    assert rle.encode_lengths([0, 7, 0], [3, 2, 1]) == rle.encode_runs([(0, 3), (7, 2), (0, 1)])   # grey: slow path
+

@@ -868,8 +868,18 @@ def island_faces(meshes: list[trimesh.Trimesh], islands: list[Island],
     """Per mesh (world coordinates), the faces that make up the islands' unsupported surface:
     downward-facing faces over each island's footprint (two pixels of slack) within the height
     it hangs. An island too small to catch such a face gets the faces nearest its point."""
-    from scipy import ndimage
     sels = [np.zeros(len(m.faces), bool) for m in meshes]
+    for hits in island_faces_each(meshes, islands, layer_height):
+        for sel, hit in zip(sels, hits):
+            sel |= hit
+    return sels
+
+
+def island_faces_each(meshes: list[trimesh.Trimesh], islands: list[Island],
+                      layer_height: float = 0.05) -> list[list[np.ndarray]]:
+    """island_faces for each island on its own: [island][mesh] face masks."""
+    from scipy import ndimage
+    out = []
     cens = [m.triangles_center if len(m.faces) else np.zeros((0, 3)) for m in meshes]
     for isl in islands:
         hits = []
@@ -894,9 +904,8 @@ def island_faces(meshes: list[trimesh.Trimesh], islands: list[Island],
             if not any(h.any() for h in hits) and any(len(d) for d in ds):
                 best = min(float(d.min()) for d in ds if len(d))
                 hits = [d == best for d in ds]
-        for sel, hit in zip(sels, hits):
-            sel |= hit
-    return sels
+        out.append(hits)
+    return out
 
 
 # ------------------------------------------------------------------------- auto support

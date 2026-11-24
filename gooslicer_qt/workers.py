@@ -11,6 +11,7 @@ _live: set = set()  # keep signal objects alive until delivered
 class _Signals(QObject):
     done = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)
 
 
 class Job(QRunnable):
@@ -28,9 +29,14 @@ class Job(QRunnable):
             self.signals.done.emit(res)
 
 
-def submit(fn, *args, on_done=None, on_failed=None, **kw) -> Job:
+def submit(fn, *args, on_done=None, on_failed=None, on_progress=None, **kw) -> Job:
+    """Run fn(*args, **kw) on the thread pool. With on_progress, fn is also given
+    progress=callable(text), delivered to on_progress on the GUI thread."""
     job = Job(fn, *args, **kw)
     sig = job.signals
+    if on_progress:
+        sig.progress.connect(on_progress)
+        job.kw["progress"] = sig.progress.emit
     _live.add(sig)
 
     def finish(*_):

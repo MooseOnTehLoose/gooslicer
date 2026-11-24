@@ -7,7 +7,7 @@ import math
 from PySide6.QtCore import QEvent, QObject, QPointF, QSize, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QHBoxLayout, QLabel,
-                               QSizePolicy, QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget)
+                               QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget)
 
 from elegoo_goo import goo, rle
 from gooslicer import settings as S
@@ -124,14 +124,10 @@ class PrintSettingsPanel(QWidget):
         self._top.addRow("Resin profile", self.resin)
         outer.addLayout(self._top)
         # everything below the resin is tucked away behind "Advanced settings" (collapsed)
-        self.advanced_btn = QToolButton()
-        self.advanced_btn.setText("Advanced settings")
-        self.advanced_btn.setCheckable(True)
-        self.advanced_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.advanced_btn.setArrowType(Qt.RightArrow)
-        self.advanced_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.advanced_btn.setToolTip("Layer height, exposures, delays, light power and slice position. "
-                                     "Choosing a resin profile fills these in.")
+        from .panels import disclosure_button
+        self.advanced_btn = disclosure_button(
+            "Advanced settings", "Layer height, exposures, delays, light power and slice position. "
+                                 "Choosing a resin profile fills these in.")
         self.advanced_btn.toggled.connect(self.set_advanced_visible)
         outer.addWidget(self.advanced_btn)
         self.advanced = QWidget()
@@ -250,18 +246,43 @@ class SliceThread(QThread):
     finishedOk = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, job: SL.SliceJob, path: str | None, parent=None):
+    def __init__(self, job: SL.SliceJob, path: str | None, parent=None, gpu: bool = False):
         super().__init__(parent)
         self.job, self.path = job, path          # path None: slice into memory (result.goo)
         self._cancel = False
+        self.gl = None
+        self.gpu_error = ""
+        if gpu:                                  # the offscreen surface must be made on the GUI thread
+            from .gpuslice import ThreadGL
+            try:
+                self.gl = ThreadGL()
+            except Exception as e:  # noqa: BLE001
+                self.gpu_error = str(e)
 
     def cancel(self):
         self._cancel = True
 
+    def _slice(self, **kw):
+        return self.job.build(**kw) if self.path is None else self.job.write(self.path, **kw)
+
     def run(self):
         kw = dict(progress=lambda d, n: self.progress.emit(d, n), cancelled=lambda: self._cancel)
         try:
-            res = self.job.build(**kw) if self.path is None else self.job.write(self.path, **kw)
+            if self.gl is not None:
+                try:
+                    self.gl.__enter__()
+                except RuntimeError as e:        # no context on this thread: the CPU then
+                    self.gpu_error = str(e)
+                    res = self._slice(**kw)
+                else:
+                    try:
+                        res = self._slice(gpu=True, **kw)
+                    finally:
+                        self.gl.__exit__(None, None, None)
+            else:
+                res = self._slice(**kw)
+            if self.gpu_error and not self.job.backend_note:
+                self.job.backend_note = f"GPU unavailable ({self.gpu_error}); sliced on the CPU"
         except SL.SliceCancelled:
             self.failed.emit("cancelled")
         except Exception as e:  # surface every failure in the UI

@@ -179,3 +179,23 @@ SatelLite exports resin presets as `.satres` files. GooSlicer imports them with 
 - **Front is −Y** in GooSlicer's plate coordinates; the 3D view marks it with FRONT on the floor just in front of the −Y edge. [INFERRED] GooSlicer's Front view and default camera look from −Y, and slices match SatelLite's byte for byte (§8), so this is SatelLite's −Y as well. SatelLite's platform model (`resources/PlatformModel/*/…stl`, the build plate with its centred mounting bracket) does not settle which physical side that is. To be confirmed on the printer: slice a part placed near the FRONT edge and check that it prints at the door side of the plate. [UNKNOWN]
 - **Models → Slicing → Slice** builds the whole `.goo` in memory (`SliceJob.build`): the same layers and header as a sliced file (tested against `write`). The estimates shown are the header's: print time (§6), volume (mm³ / 1000 = ml) and weight (g, §5), plus layer count and layer height.
 - The held slice stays valid while the printer, the print settings and every part (mesh and support plan by identity, since edits replace them; position, rotation and scale by value) are unchanged. While valid, the panel's Export and Send to printer buttons (and File → Slice and save, and Slice and send) write it out instead of slicing again; once anything changes, the panel says so and those commands slice afresh.
+
+## 12. GPU slicing (experimental) [GOOSLICER]
+Off by default: Models → Slicing → "Use the GPU (experimental)" (setting `gpuSlicing`). `gooslicer/gpu_raster.py`, with `gooslicer_qt/gpuslice.py` giving the slicing thread its own offscreen OpenGL 3.3 context.
+- **Method:** the meshes are drawn, not their sections. For each layer the models' pixel area is drawn from above in the printer's pixel grid (the same float32 mm → pixel transform as §3, in the vertex shader), clipped to z ≥ the layer height (`gl_ClipDistance`). Front faces add 1 to the stencil, back faces take 1 off, so the stencil is the winding number at the layer height under each pixel centre: non-zero is resin. This is the CPU path's non-zero rule, sampled at pixel centres like it.
+- **Readback:** a second pass packs 8 pixels a byte (each row ending in black), into pixel-pack buffers read one layer behind the drawing. Only the models' bounding area is drawn, in tiles of up to 4096 px. Run edges come from the packed bytes: XOR each byte with itself shifted one bit, find the non-zero bytes 8 at a time, unpack only those. Encoding runs on worker threads.
+- **Encoder:** `rle.encode_lengths` / `raster.encode_spans` encode runs with numpy. They are byte-identical to `encode_runs` (tested), and the CPU path uses them too.
+- **Agreement:** the 10 mm cube sample is byte-identical to SatelLite's file on the GPU too. On curved models, 0.004–0.02 % of lit pixels differ from the CPU, all on outlines: Skia snaps vertices to 1/64 px, the GPU doesn't, and GL's tie rule differs. Against SatelLite's 10 mm sphere, the GPU's per-layer lit area is as close as the CPU's (mean |Δ| 321 px of ~196 000 for both).
+- **Speed** (Radeon RX 9070 XT against 15 CPU processes, 16K at 0.05 mm, layers only):
+
+  | Model | Layers | CPU | GPU |
+  |---|---|---|---|
+  | 10 mm cube | 200 | 0.9 s | 0.3 s |
+  | 20 mm sphere | 400 | 4.0 s | 0.3 s |
+  | arc sample | 1058 | 6.6 s | 0.9 s |
+  | Lisa torso (supported, 651k triangles) | 1016 | 7.7 s | 1.4 s |
+  | 8 × Lisa, full plate (5.2M triangles) | 1016 | 19.0 s | 8.5 s |
+
+  On the full plate, about 84 Mpx per layer are packed, read back and scanned. Drawing is under 1 ms a tile.
+- **Fallback:** with no context, an old GL or a framebuffer it can't make, the slice runs on the CPU, and the Log says why. The results show "Sliced on: GPU, 1.4 s" (or CPU); the (i) beside it pops up the device (the GL renderer, or the CPU model and thread count) and the time.
+- **Limits:** a non-watertight mesh has no consistent winding, so open areas can fill or empty wrongly. The CPU path closes open sections instead.

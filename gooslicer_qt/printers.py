@@ -209,6 +209,16 @@ class PrinterControlPanel(QWidget):
         i = self.combo.currentIndex()
         return self.known[i] if 0 <= i < len(self.known) else None
 
+    def forget(self, key: str) -> bool:
+        """Drop a saved printer (by mainboard ID or IP). Not the one connected."""
+        p = self.current()
+        if p is not None and (p.mainboard_id or p.ip) == key and self.session and self.session.connected:
+            return False
+        self.known = [k for k in self.known if (k.mainboard_id or k.ip) != key]
+        self._save_known()
+        self._fill_combo()
+        return True
+
     def _remember(self, found: list[Printer]):
         for p in found:
             key = p.mainboard_id or p.ip

@@ -4,6 +4,7 @@ from __future__ import annotations
 import shutil
 import os
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -22,23 +23,25 @@ from gooslicer import slicer as slicermod
 from gooslicer import support_defaults
 from gooslicer import supports as supportmod
 from gooslicer.raster import RasterSpec
-from gooslicer.scene import Part, Scene
+from gooslicer.scene import Part, Scene, rotation_between
 
 from . import workers
 from .commands import AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, StateCommand
-from .hollowing import DrainHoleDialog, HollowDialog, drill_part, hollow_part
+from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowDialog, drill_part_at, hole_axis_world,
+                        hole_preview_mesh, hollow_part)
 from .jobpanel import JobPanel
-from .panels import InfoButton, PartsList, PropertiesPanel
+from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, show_popup
 from .printers import PrinterControlPanel
 from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
-from .supporting import SupportDialog, SupportManager, SupportsCommand
+from .supporting import SupportDialog, SupportManager, SupportsCommand, support_params
 from .theme import THEMES, ThemeManager
+from . import flaws as flawmod
 from .viewport import Viewport, default_format, island_guides
 
 APP = "GooSlicer"
 # Bumped when the dock layout changes enough that an older saved layout should be dropped
 # (2: Parts inside Properties; Print settings and Properties are tabs).
-LAYOUT_VERSION = 4          # 3: Log and Layers became own windows; 4: tabs renamed
+LAYOUT_VERSION = 5          # 3: Log and Layers became own windows; 4: tabs renamed; 5: Flaws tab
 MODEL_FILTER = "3D models (*.stl *.STL *.obj *.OBJ *.3mf *.3MF);;All files (*)"
 
 
@@ -84,17 +87,7 @@ class PrinterPanel(QWidget):
 
     def show_details(self) -> None:
         """Open the details pop-up under the (i) button, right-aligned to it."""
-        d = self.details
-        d.adjustSize()
-        anchor = self.info_btn.mapToGlobal(self.info_btn.rect().bottomRight())
-        x, y = anchor.x() - d.width() + 1, anchor.y() + 4
-        scr = self.info_btn.screen().availableGeometry() if self.info_btn.screen() else None
-        if scr is not None:
-            x = max(scr.left(), min(x, scr.right() - d.width()))
-            if y + d.height() > scr.bottom():                 # no room below: open above
-                y = self.info_btn.mapToGlobal(self.info_btn.rect().topLeft()).y() - d.height() - 4
-        d.move(x, y)
-        d.show()
+        show_popup(self.details, self.info_btn)
 
     def set_profiles(self, ps: dict[str, profiles.PrinterProfile], current: str | None = None):
         self._profiles = ps
@@ -166,15 +159,23 @@ class ToolWindow(QWidget):
         super().hideEvent(e)
 
 
+def _red(meshes, masks) -> list:
+    return [m.submesh([np.flatnonzero(sel)], append=True) for m, sel in zip(meshes, masks) if sel.any()]
+
+
 def _islands_and_faces(meshes, layer_height):
-    """The island check, plus the unsupported surface of each island as red meshes for the 3D view."""
+    """The island check, plus each island's unsupported surface as red meshes for the 3D view:
+    (islands, [[meshes] per island])."""
     isl = supportmod.unsupported_islands(meshes, layer_height=layer_height)
-    red = []
-    if isl:
-        for m, sel in zip(meshes, supportmod.island_faces(meshes, isl, layer_height)):
-            if sel.any():
-                red.append(m.submesh([np.flatnonzero(sel)], append=True))
-    return isl, red
+    reds = [_red(meshes, masks) for masks in supportmod.island_faces_each(meshes, isl, layer_height)] if isl else []
+    return isl, reds
+
+
+def _cavities_and_faces(meshes):
+    """The trapped-resin check, plus the surface lining each sealed cavity as red meshes:
+    (cavities, [[meshes] per cavity])."""
+    cav, each = hollowmod.cavity_faces_each(meshes)
+    return cav, [_red(meshes, masks) for masks in each]
 
 
 def _warm(part_mesh):
@@ -192,9 +193,29 @@ def _load_and_analyze(path: str):
     return out
 
 
-def _repair_and_analyze(m):
-    fixed = meshmod.repair(m)
+def _repair_and_analyze(m, progress=None):
+    fixed = meshmod.repair(m, progress=progress)
+    if progress:
+        progress("checking the result")
     return fixed, meshmod.analyze(fixed)
+
+
+def cpu_name() -> str:
+    """The processor's model name and thread count, e.g. "AMD Ryzen 7 7800X3D, 16 threads"."""
+    import os
+    import platform
+    name = ""
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("model name"):
+                    name = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    name = name or platform.processor() or platform.machine() or "CPU"
+    n = os.cpu_count()
+    return f"{name}, {n} threads" if n else name
 
 
 class MainWindow(QMainWindow):
@@ -277,8 +298,10 @@ class MainWindow(QMainWindow):
         self._drops = _DropForwarder(self)
         # the right column (Printer settings, Models) runs the full height
         self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+        self.flaws_panel = FlawsPanel()
         for title, w, area in (("Printer settings", self.settings_scroll, Qt.RightDockWidgetArea),
-                               ("Models", self.properties_split, Qt.RightDockWidgetArea)):
+                               ("Models", self.properties_split, Qt.RightDockWidgetArea),
+                               ("Flaws", self.flaws_panel, Qt.RightDockWidgetArea)):
             d = QDockWidget(title, self)
             d.setObjectName(f"dock{title.replace(' ', '')}")
             d.setWidget(w)
@@ -293,6 +316,12 @@ class MainWindow(QMainWindow):
             tw.setAcceptDrops(True)
             tw.installEventFilter(self._drops)
         self._islands_fp = None          # plate fingerprint of the island check shown in red
+        self._cavities_fp = None         # … and of the trapped-resin check
+        self.flaws = {k: [] for k in flawmod.KINDS}          # shown flaws, numbered per kind
+        self._dismissed = {k: [] for k in flawmod.KINDS}     # points of flaws dismissed as false positives
+        self._dismissed_parts = None     # the parts (meshes, placement) the dismissals are for
+        self._hole_queue: list = []      # drain-hole clicks waiting to be drilled
+        self._drilling = False
         self._layout_done = False
         self._slice_thread = None
         self._progress = QProgressBar()             # only shown while slicing
@@ -321,6 +350,10 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)       # drops anywhere in the window, not only on the 3D view
         self.parts.selectionChangedIds.connect(lambda ids: self.select(ids))
         self.parts.removeRequested.connect(self.remove_part)
+        self.flaws_panel.list.selectionChangedKeys.connect(self.viewport.set_guide_selection)
+        self.flaws_panel.list.removeRequested.connect(self.dismiss_flaw)
+        self.viewport.guideSelectionChanged.connect(self.flaws_panel.list.set_selected)
+        self.flaws_panel.refresh([], set())
         self.printer_panel.combo.currentIndexChanged.connect(self._printer_changed)
         self.load_profiles()
         if self.settings.value("geometry"):
@@ -341,8 +374,9 @@ class MainWindow(QMainWindow):
             self.restoreState(self.settings.value("windowState"), LAYOUT_VERSION)   # older: ignored
 
     def _default_layout(self) -> None:
-        # right-hand tabs: Printer settings first, then Models (with the parts list)
+        # right-hand tabs: Printer settings first, then Models (with the parts list), then Flaws
         self.tabifyDockWidget(self.docks["Printer settings"], self.docks["Models"])
+        self.tabifyDockWidget(self.docks["Models"], self.docks["Flaws"])
         self.docks["Printer settings"].raise_()
 
     def restore_default_windows(self) -> None:
@@ -396,14 +430,19 @@ class MainWindow(QMainWindow):
         e.addSeparator()
         self._act(e, "&Hollow…", self.hollow_dialog, "Ctrl+Shift+H")
         self._act(e, "Add drain &holes…", self.drain_hole_mode, "Ctrl+Shift+D")
-        self._act(e, "Check for &trapped resin", self.check_trapped_resin)
+        self._act(e, "Check for &voids", self.check_trapped_resin, None,
+                  "Look for sealed cavities that would trap uncured resin")
+        e.addSeparator()
+        self.prefs_action = self._act(e, "&Preferences…", self.open_preferences, QKeySequence.Preferences,
+                                      "Every GooSlicer option, by category")
 
         sm = mb.addMenu("&Supports")
         self._act(sm, "&Auto-support…", self.auto_support_dialog, "Ctrl+Shift+A")
         self._act(sm, "&Edit supports (click to add, Ctrl+click to remove)", self.support_edit_mode, "S")
         self._act(sm, "&Clear supports of selected", self.clear_supports)
         sm.addSeparator()
-        self._act(sm, "Check for &unsupported islands", self.check_islands)
+        self._act(sm, "&Detect islands", self.check_islands, None,
+                  "Look for unsupported islands: regions with nothing under them in the layer below")
 
         pm = mb.addMenu("&Printer")
         self._act(pm, "&Find printers on network", self._show_lan(self.lan.find_printers))
@@ -573,6 +612,71 @@ class MainWindow(QMainWindow):
         if not fits:
             self.log_msg("Arrange: the parts do not all fit on the build plate.")
 
+    def auto_position(self):
+        """Turn the selected parts to the angles needing the fewest supports (orient.py), in a
+        background job; one undo step."""
+        from gooslicer import orient
+        ids = [i for i in self.selected_ids() if self.scene.get(i)]
+        if not ids or getattr(self, "_orienting", False):
+            return
+        params, _ = support_params(self.job_panel.support_type.currentData())
+        jobs = [(p.id, p.name, p.world_vertices().copy(), np.asarray(p.mesh.faces).copy())
+                for p in (self.scene.get(i) for i in ids)]
+        self._orienting = True
+        self.props.btn_auto.setEnabled(False)
+        self.statusBar().showMessage("Auto Position: finding the angle that needs the fewest supports…")
+
+        def work(progress=None):
+            out = []
+            for n, (pid, name, v, f) in enumerate(jobs):
+                def tick(done, total, name=name, n=n):
+                    if progress:
+                        progress(f"{name}{f' ({n + 1}/{len(jobs)})' if len(jobs) > 1 else ''}: "
+                                 f"{done}/{total} angles tried")
+                out.append((pid, name, orient.best_orientation(v, f, params.critical_angle, params.anchor_dis,
+                                                               progress=tick)))
+            return out
+
+        def step(text):
+            self.statusBar().showMessage(f"Auto Position: {text}…")
+
+        def finish():
+            self._orienting = False
+            self.props.btn_auto.setEnabled(self.primary() is not None)
+
+        def failed(msg):
+            finish()
+            self.log_msg(f"Auto Position failed: {msg}")
+            self.statusBar().showMessage("Auto Position failed", 8000)
+
+        def done(results):
+            finish()
+            turn = {pid: r for pid, _, r in results if r.improves and self.scene.get(pid) is not None}
+            for pid, name, r in results:
+                if pid in turn:
+                    self.log_msg(f"Auto Position {name}: tilted {r.tilt_deg:.0f}°; about "
+                                 f"{r.current.contacts:.0f} → {r.best.contacts:.0f} support contacts, area "
+                                 f"needing support {r.current.overhang_area:.0f} → {r.best.overhang_area:.0f} mm², "
+                                 f"height {r.current.height:.1f} → {r.best.height:.1f} mm")
+                else:
+                    self.log_msg(f"Auto Position {name}: already at a good angle "
+                                 f"(about {r.current.contacts:.0f} support contacts); left as it is")
+
+            def apply(p):
+                r = turn[p.id]
+                before = p.bounds().mean(axis=0)
+                p.rotation = rotation_between(r.up, [0, 0, 1]) @ p.rotation
+                p.position[:2] += (before - p.bounds().mean(axis=0))[:2]
+                self.scene.drop_to_plate(p)
+            if turn:
+                self.edit_parts(list(turn), "Auto Position", apply)
+                self.statusBar().showMessage(
+                    f"Auto Position: turned {len(turn)} part(s)" if len(results) > 1 else
+                    f"Auto Position: tilted {next(iter(turn.values())).tilt_deg:.0f}° — see the Log", 8000)
+            else:
+                self.statusBar().showMessage("Auto Position: already at a good angle", 8000)
+        workers.submit(work, on_done=done, on_failed=failed, on_progress=step)
+
     def start_lay_flat(self):
         if self.scene.parts:
             self.viewport.start_lay_flat()
@@ -583,13 +687,15 @@ class MainWindow(QMainWindow):
         self.statusBar().clearMessage()
 
     # ------------------------------------------------------- hollow / drain holes
-    def _replace_mesh(self, pid, mesh, text):
+    def _replace_mesh(self, pid, mesh, text, report=None):
+        """Swap in a new mesh as an undo step. Pass the mesh's analysis if it was made off the
+        GUI thread (it takes about a second for 300k triangles)."""
         if self.scene.get(pid) is None:
             return
         self.reports.pop(id(self.scene.get(pid).mesh), None)
         self.undo.push(MeshCommand(self, pid, mesh, text))
         new = self.scene.get(pid).mesh
-        self.reports[id(new)] = meshmod.analyze(new)
+        self.reports[id(new)] = report if report is not None else meshmod.analyze(new)
         workers.submit(_warm, new)
         self._sync_panels()
 
@@ -629,33 +735,188 @@ class MainWindow(QMainWindow):
         workers.submit(hollow_part, p, hs, on_done=done, on_failed=failed)
 
     def drain_hole_mode(self):
+        """Show the drain-hole settings over the top-left of the 3D view and drill where the
+        user clicks; the blue preview under the cursor follows the settings."""
         if not self.scene.parts:
             return
-        dlg = DrainHoleDialog(self.settings, self)
-        if dlg.exec() != DrainHoleDialog.Accepted:
-            return
-        dlg.save()
-        self._hole_settings = dlg.value()
+        panel = getattr(self, "hole_panel", None)
+        if panel is None:
+            panel = self.hole_panel = DrainHolePanel(self.settings, self.viewport)
+            panel.fields.changed.connect(self._hole_settings_changed)
+            panel.finished.connect(self.viewport.stop_hole_mode)
+            panel.entered.connect(self.viewport.clear_hole_hover)
+            self.viewport.holeModeEnded.connect(panel.hide)
+            self.viewport.hole_preview_maker = lambda part, face, hit: hole_preview_mesh(
+                part, face, hit, *self.hole_panel.fields.value())
+        if self.viewport.support_mode:
+            self.viewport.stop_support_mode()
+        self.viewport.lay_flat_mode = False
+        panel.fields.load()
+        self._hole_settings = panel.fields.value()
+        panel.place()
+        panel.show()
         self.viewport.start_hole_mode()
-        self.statusBar().showMessage("Drain holes: click on a part to drill (Esc to finish)")
+        self.viewport.setFocus()
+        self.statusBar().showMessage("Drain holes: click on a part to drill (Esc or Done to finish)")
+
+    def _hole_settings_changed(self) -> None:
+        f = self.hole_panel.fields
+        f.save()
+        self._hole_settings = f.value()
+        self.viewport.refresh_hole_preview()
 
     def _hole_picked(self, pid, face, hit):
+        """A click in drain-hole mode: the hole is drilled in the background (the view stays
+        responsive); clicks made meanwhile wait their turn."""
         p = self.scene.get(pid)
-        s, direction = getattr(self, "_hole_settings", None) or DrainHoleDialog(self.settings).value()
-        try:
-            mesh = drill_part(p, face, hit, s, direction)
-        except (hollowmod.HollowError, ValueError) as e:
-            self.log_msg(f"Drain hole failed: {e}")
+        if p is None:
             return
-        self._replace_mesh(pid, mesh, "Drain hole")
-        self.log_msg(f"Drain hole in {p.name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
-                     f"Ø{2 * s.radius1:.1f} mm")
+        s, direction = getattr(self, "_hole_settings", None) or DrainHoleDialog(self.settings).value()
+        self._hole_queue.append((pid, np.asarray(hit, float), hole_axis_world(p, face, direction), s))
+        self._drill_next()
+
+    def drilling(self) -> bool:
+        return self._drilling or bool(self._hole_queue)
+
+    def _drill_next(self) -> None:
+        if self._drilling:
+            return
+        while self._hole_queue:
+            pid, hit, axis, s = self._hole_queue.pop(0)
+            p = self.scene.get(pid)
+            if p is not None:
+                break
+        else:
+            return
+        src = p.mesh
+        snap = SimpleNamespace(mesh=src, position=p.position.copy(), rotation=p.rotation.copy(),
+                               scale=p.scale.copy())
+        name = p.name
+        self._drilling = True
+        left = len(self._hole_queue)
+        self.statusBar().showMessage(f"Drilling a drain hole in {name}…" + (f" ({left} more waiting)" if left else ""))
+
+        def work():
+            mesh = drill_part_at(snap, hit, axis, s)
+            return mesh, meshmod.analyze(mesh)
+
+        def done(res):
+            self._drilling = False
+            mesh, rep = res
+            now = self.scene.get(pid)
+            if now is not None and now.mesh is src:         # not undone or changed meanwhile
+                self._replace_mesh(pid, mesh, "Drain hole", report=rep)
+                self.log_msg(f"Drain hole in {name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
+                             f"Ø{2 * s.radius1:.1f} mm")
+                self.viewport.repick_hole()                 # the surface under the cursor changed
+            self._drill_finished()
+
+        def failed(msg):
+            self._drilling = False
+            self.log_msg(f"Drain hole failed: {msg.splitlines()[0]}")
+            self._drill_finished()
+        workers.submit(work, on_done=done, on_failed=failed)
+
+    def _drill_finished(self) -> None:
+        if self._hole_queue:
+            self._drill_next()
+        elif self.viewport.hole_mode:
+            self.statusBar().showMessage("Drain holes: click on a part to drill (Esc or Done to finish)")
+        else:
+            self.statusBar().clearMessage()
 
     def trapped_resin(self) -> list:
         return hollowmod.sealed_cavities([x.world_mesh() for x in self.scene.parts])
 
+    # ------------------------------------------------------------------- flaws
+    @staticmethod
+    def _same_parts(a, b) -> bool:
+        """Same parts, meshes and placement (supports aside) in two plate fingerprints' part lists."""
+        return len(a) == len(b) and all(x[0] == y[0] and x[1] is y[1] and x[3:] == y[3:] for x, y in zip(a, b))
+
+    def _is_dismissed(self, kind: str, point) -> bool:
+        return flawmod.dismissed(point, self._dismissed[kind])
+
+    def _set_flaws(self, kind: str, flaws: list) -> None:
+        """A check's result: numbered afresh, so that kind's selection is cleared."""
+        self.flaws[kind] = flaws
+        self.viewport.clear_guide_selection(kind)
+        self._apply_flaws(kind)
+
+    def _apply_flaws(self, kind: str) -> None:
+        """Show `kind`'s flaws in the 3D view (red surfaces, numbered guide lines) and the list."""
+        fl = self.flaws[kind]
+        meshes = [m for f in fl for m in f.red]
+        segs, nums = [], []
+        for f in fl:
+            seg = island_guides([f.point], self.scene.size)
+            if len(seg):                         # none for a point outside the build area
+                segs.append(seg)
+                nums.append(f.number)
+        lines = np.concatenate(segs) if segs else np.zeros((0, 3))
+        vp = self.viewport
+        if kind == "island":
+            vp.island_meshes, vp.island_lines, vp.island_numbers = meshes, lines, nums
+        else:
+            vp.cavity_meshes, vp.cavity_lines, vp.cavity_numbers = meshes, lines, nums
+        vp.update()
+        if hasattr(self, "flaws_panel"):
+            self.flaws_panel.refresh(self.flaws["island"] + self.flaws["cavity"], vp.guide_selection())
+
+    def dismiss_flaw(self, key) -> None:
+        """Drop a flaw the user judged a false positive (Flaws tab, red x). Checking again leaves
+        it out until a part's mesh or placement changes."""
+        kind, number = key
+        f = next((x for x in self.flaws[kind] if x.number == number), None)
+        if f is None:
+            return
+        if not any(self._dismissed.values()):
+            self._dismissed_parts = self._plate_fingerprint()[2]
+        self._dismissed[kind].append(f.point)
+        self.flaws[kind] = [x for x in self.flaws[kind] if x is not f]
+        self.viewport.selected_guides.discard(key)
+        if not self.flaws[kind]:
+            if kind == "island":
+                self._islands_fp = None
+            else:
+                self._cavities_fp = None
+        self._apply_flaws(kind)
+        self.log_msg(f"Dismissed {f.title} ({f.detail}) as a false positive.")
+        if hasattr(self, "job_panel"):
+            self.job_panel.flaws_changed(kind, len(self.flaws[kind]))
+
+    def _check_dismissed(self) -> None:
+        if self._dismissed_parts is not None and not self._same_parts(self._dismissed_parts, self._plate_fingerprint()[2]):
+            self._dismissed = {k: [] for k in flawmod.KINDS}
+            self._dismissed_parts = None
+
+    def show_cavities(self, cav, reds, fp) -> list:
+        """Show the sealed cavities' walls in red, with a numbered guide line to the edge of the
+        build area, until a part changes. Dismissed ones are left out; returns those shown."""
+        kept = [(c, r) for c, r in zip(cav or [], list(reds or []) + [[]] * len(cav or []))
+                if not self._is_dismissed("cavity", c.lowest)]
+        self._set_flaws("cavity", flawmod.cavity_flaws([c for c, _ in kept], [r for _, r in kept]))
+        self._cavities_fp = fp if kept else None
+        return [c for c, _ in kept]
+
+    def _check_cavities_shown(self) -> None:
+        if self._cavities_fp is None:
+            return
+        # supports don't change cavities: only the parts' meshes and placement count
+        if not self._same_parts(self._cavities_fp[2], self._plate_fingerprint()[2]):
+            self.show_cavities([], [], None)
+            if hasattr(self, "job_panel"):
+                self.job_panel.cavities_out_of_date()
+
+    def _trapped_resin_shown(self) -> list:
+        """The trapped-resin check, shown in the 3D view."""
+        fp = self._plate_fingerprint()
+        meshes = [x.world_mesh() for x in self.scene.parts]
+        cav, red = _cavities_and_faces(meshes) if meshes else ([], [])
+        return self.show_cavities(cav, red, fp)
+
     def check_trapped_resin(self) -> bool:
-        cav = self.trapped_resin()
+        cav = self._trapped_resin_shown()
         if not cav:
             self.log_msg("No sealed cavities: resin can drain from every part.")
             self.statusBar().showMessage("No trapped resin", 5000)
@@ -663,14 +924,82 @@ class MainWindow(QMainWindow):
         self._report_cavities(cav)
         return False
 
+    def check_trapped_resin_async(self, on_done) -> None:
+        """The trapped-resin check in the background; shows the cavities in red, reports to the
+        Log and calls on_done(cavities), or on_done(None) if it failed."""
+        meshes = [x.world_mesh() for x in self.scene.parts]
+        fp = self._plate_fingerprint()
+        if not meshes:
+            self.show_cavities([], [], None)
+            on_done([])
+            return
+
+        def done(res):
+            cav, red = res
+            cav = self.show_cavities(cav, red, fp)
+            if cav:
+                self._report_cavities(cav)
+            else:
+                self.log_msg("No sealed cavities: resin can drain from every part.")
+            on_done(cav)
+
+        def failed(msg):
+            self.log_msg("Trapped-resin check failed: " + msg.splitlines()[0])
+            on_done(None)
+        workers.submit(_cavities_and_faces, meshes, on_done=done, on_failed=failed)
+
+    def seal_cavities(self, on_done) -> None:
+        """Make every sealed cavity solid: check in the background, delete the shells that only
+        line a cavity (one undo step), then check again. Calls on_done(message)."""
+        parts = [(p.id, p.mesh) for p in self.scene.parts]
+        meshes = [p.world_mesh() for p in self.scene.parts]
+        if not meshes:
+            on_done("No parts to check.")
+            return
+
+        def done(res):
+            cav, removes = res
+            cav = [c for c in cav if not self._is_dismissed("cavity", c.lowest)]
+            if not cav:
+                self.show_cavities([], [], None)
+                on_done("✓ No sealed cavities: nothing to seal.")
+                return
+            todo = [(pid, mesh, rm) for (pid, mesh), rm in zip(parts, removes)
+                    if rm.any() and self.scene.get(pid) is not None and self.scene.get(pid).mesh is mesh]
+            if todo:
+                self.undo.beginMacro("Seal cavities")
+                for pid, mesh, rm in todo:
+                    self._replace_mesh(pid, hollowmod.without_faces(mesh, rm), "Seal cavity")
+                self.undo.endMacro()
+
+            def rechecked(left):
+                if left is None:
+                    on_done("The check after sealing failed; see the Log.")
+                    return
+                sealed = max(len(cav) - len(left), 0)
+                msg = (f"Sealed {sealed} cavit{'y' if sealed == 1 else 'ies'}: "
+                       "the part is solid there now (Edit → Undo brings the hollow back)." if sealed
+                       else "Nothing was sealed.")
+                if left:
+                    msg += (f" ⚠ {len(left)} cavit{'y' if len(left) == 1 else 'ies'} could not be sealed "
+                            "(shown in red): its wall is also the outside of a part. Add a drain hole "
+                            "instead.")
+                self.log_msg("Seal cavities: " + msg)
+                on_done(msg)
+            self.check_trapped_resin_async(rechecked)
+
+        def failed(msg):
+            self.log_msg("Seal cavities failed: " + msg.splitlines()[0])
+            on_done("Sealing failed; see the Log.")
+        workers.submit(hollowmod.cavity_shells, meshes, on_done=done, on_failed=failed)
+
     def _report_cavities(self, cav):
-        lines = [f"• {c.volume:.0f} mm³, lowest point ({c.lowest[0]:.1f}, {c.lowest[1]:.1f}, {c.lowest[2]:.1f})"
-                 for c in cav[:8]]
+        lines = [f"• {f.title}: {f.detail}" for f in flawmod.cavity_flaws(cav[:8], [[]] * len(cav[:8]))]
         self.log_msg(f"{len(cav)} sealed cavit{'y' if len(cav) == 1 else 'ies'} will trap resin:\n" + "\n".join(lines))
         return lines
 
     def _confirm_no_trapped_resin(self) -> bool:
-        cav = self.trapped_resin()
+        cav = self._trapped_resin_shown()
         if not cav:
             return True
         lines = self._report_cavities(cav)
@@ -830,12 +1159,14 @@ class MainWindow(QMainWindow):
         meshes += [m for m in (self.supports.world_mesh(p) for p in self.scene.parts) if m is not None]
         return meshes
 
-    def show_islands(self, isl, red, fp) -> None:
-        """Show the islands' unsupported surface in red until the plate changes."""
-        self.viewport.island_meshes = list(red) if isl else []
-        self.viewport.island_lines = island_guides([i.point for i in isl or []], self.scene.size)
-        self._islands_fp = fp if isl else None
-        self.viewport.update()
+    def show_islands(self, isl, reds, fp) -> list:
+        """Show the islands' unsupported surface in red, with a numbered guide line, until the
+        plate changes. Dismissed ones are left out; returns those shown."""
+        kept = [(i, r) for i, r in zip(isl or [], list(reds or []) + [[]] * len(isl or []))
+                if not self._is_dismissed("island", i.point)]
+        self._set_flaws("island", flawmod.island_flaws([i for i, _ in kept], [r for _, r in kept]))
+        self._islands_fp = fp if kept else None
+        return [i for i, _ in kept]
 
     def _check_islands_shown(self) -> None:
         if self._islands_fp is None:
@@ -850,7 +1181,7 @@ class MainWindow(QMainWindow):
         meshes = self._island_meshes()
         h = self.print_settings.settings().layer_height if self.printer_panel.current() else 0.05
         isl, red = _islands_and_faces(meshes, max(h, 0.05)) if meshes else ([], [])
-        self.show_islands(isl, red, fp)
+        isl = self.show_islands(isl, red, fp)
         if not isl:
             self.log_msg("No unsupported islands: every region connects to the layer below.")
             self.statusBar().showMessage("No unsupported islands", 5000)
@@ -871,7 +1202,7 @@ class MainWindow(QMainWindow):
 
         def done(res):
             isl, red = res
-            self.show_islands(isl, red, fp)
+            isl = self.show_islands(isl, red, fp)
             if isl:
                 self._report_islands(isl)
             else:
@@ -966,8 +1297,8 @@ class MainWindow(QMainWindow):
         return added, full, missed
 
     def _report_islands(self, isl) -> list[str]:
-        lines = [f"• z {i.z:.2f} mm at ({i.point[0]:.1f}, {i.point[1]:.1f}): up to {i.area:.2f} mm², "
-                 f"hangs {i.height:.2f} mm" for i in isl[:10]]
+        lines = [f"• {f.title}: {f.detail}, at ({f.point[0]:.1f}, {f.point[1]:.1f})"
+                 for f in flawmod.island_flaws(isl[:10], [[]] * len(isl[:10]))]
         if len(isl) > 10:
             lines.append(f"• … and {len(isl) - 10} more")
         self.log_msg(f"{len(isl)} unsupported island(s) would print in mid-air:\n" + "\n".join(lines))
@@ -977,12 +1308,21 @@ class MainWindow(QMainWindow):
         p = self.primary()
         if not p:
             return
-        pid = p.id
-        self.log_msg(f"Repairing {p.name}…")
+        pid, name = p.id, p.name
+        self.log_msg(f"Repairing {name}…")
+        self.statusBar().showMessage(f"Repairing {name}…")
+
+        def step(text):
+            self.statusBar().showMessage(f"Repairing {name}: {text}…")
+
+        def failed(msg):
+            self.log_msg(f"Repair failed: {msg}")
+            self.statusBar().showMessage(f"Repair of {name} failed", 8000)
 
         def done(res):
             fixed, rep = res
             if self.scene.get(pid) is None:
+                self.statusBar().clearMessage()
                 return
             self.reports[id(fixed)] = rep
             self.undo.push(MeshCommand(self, pid, fixed))
@@ -991,9 +1331,10 @@ class MainWindow(QMainWindow):
             workers.submit(_warm, self.scene.get(pid).mesh)
             self.log_msg(f"Repaired {self.scene.get(pid).name}: "
                          + ("OK" if rep.ok else "; ".join(rep.problems())))
+            self.statusBar().showMessage(f"Repaired {name}" + ("" if rep.ok else " — problems remain (see the Mesh pane)"),
+                                         8000)
             self._sync_panels()
-        workers.submit(_repair_and_analyze, p.mesh, on_done=done,
-                       on_failed=lambda m: self.log_msg(f"Repair failed: {m}"))
+        workers.submit(_repair_and_analyze, p.mesh, on_done=done, on_failed=failed, on_progress=step)
 
     # --------------------------------------------------------------- import
     def import_dialog(self):
@@ -1122,7 +1463,9 @@ class MainWindow(QMainWindow):
     def _check_held(self) -> None:
         if not hasattr(self, "job_panel"):
             return
+        self._check_dismissed()
         self._check_islands_shown()
+        self._check_cavities_shown()
         if self.held is not None:
             self.job_panel.set_stale(self.held_slice() is None)
 
@@ -1245,7 +1588,7 @@ class MainWindow(QMainWindow):
             isl, red = res
             self._set_slicing_enabled(True)
             self.statusBar().clearMessage()
-            self.show_islands(isl, red, fp)
+            isl = self.show_islands(isl, red, fp)
             if isl:
                 lines = self._report_islands(isl)
                 if QMessageBox.warning(
@@ -1271,7 +1614,10 @@ class MainWindow(QMainWindow):
         self.log_msg(f"Slicing {job.layer_count} layers ({job.settings.layer_height} mm) → "
                      + (path or "memory"))
         self.job_panel.slicing_started(job.layer_count)
-        t = SliceThread(job, path, self)
+        gpu = self.gpu_slicing()
+        t = SliceThread(job, path, self, gpu=gpu)
+        if gpu:
+            self.log_msg("Slicing on the GPU (experimental)…")
         t.progress.connect(self._slice_progress)
         t.finishedOk.connect(self._slice_done)
         t.failed.connect(self._slice_failed)
@@ -1285,6 +1631,25 @@ class MainWindow(QMainWindow):
         self._cancel_btn.show()
         t.start()
 
+    def gpu_slicing(self) -> bool:
+        return str(self.settings.value("gpuSlicing", "false")).lower() in ("true", "1")
+
+    def set_gpu_slicing(self, on: bool) -> None:
+        self.settings.setValue("gpuSlicing", bool(on))
+
+    def _backend_text(self, res, detail: bool = False) -> str:
+        """"GPU, 1.4 s"; with detail, "GPU (AMD Radeon …), 1.4 s"."""
+        where = "GPU" if res.backend.startswith("gpu") else "CPU"
+        dev = self._backend_device(res) if detail else ""
+        return f"{where}{f' ({dev})' if dev else ''}, {res.seconds:.1f} s"
+
+    @staticmethod
+    def _backend_device(res) -> str:
+        """The GPU's renderer string, or the CPU's model name."""
+        if res.backend.startswith("gpu ("):
+            return res.backend[5:-1]
+        return cpu_name()
+
     def cancel_slice(self):
         if self._slice_thread:
             self._slice_thread.cancel()
@@ -1297,6 +1662,10 @@ class MainWindow(QMainWindow):
     def _slice_done(self, res):
         m, s = divmod(res.print_time, 60)
         h, m = divmod(m, 60)
+        note = self._slice_thread.job.backend_note if self._slice_thread else ""
+        if note:
+            self.log_msg(note)
+        self.log_msg(f"Layers made on the {self._backend_text(res, detail=True)}")
         if res.goo is not None:              # sliced into memory
             self.held = (res, self._slicing_fp)
             self._slicing_fp = None
@@ -1325,6 +1694,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Slicing cancelled" if msg == "cancelled" else "Slicing failed", 8000)
 
     def _slice_cleanup(self):
+        t = self._slice_thread
+        if t is not None and t.gl is not None:
+            t.gl.destroy()                       # the offscreen surface belongs to the GUI thread
         self.job_panel.slicing_finished()
         self._progress.hide()
         self._cancel_btn.hide()
@@ -1423,6 +1795,31 @@ class MainWindow(QMainWindow):
         p = self.printer_panel.current()
         if p:
             self._load_resins(p)
+
+    def open_preferences(self, page: str | None = None):
+        from .preferences import PreferencesDialog
+        dlg = PreferencesDialog(self)
+        if page:
+            dlg.show_page(page)
+        dlg.open()
+        self._preferences = dlg
+        return dlg
+
+    def set_resin_dir(self, path: str) -> None:
+        """Where SatelLite's resin .data files are read from ("": next to the printer profiles)."""
+        if path:
+            self.settings.setValue("resinDir", str(path))
+        else:
+            self.settings.remove("resinDir")
+        self.refresh_resins()
+
+    def set_template_dir(self, path: str) -> None:
+        """Where SatelLite's support templates are read from ("": next to the printer profiles)."""
+        if path:
+            self.settings.setValue("scriptDir", str(path))
+        else:
+            self.settings.remove("scriptDir")
+        self.job_panel.refresh(reload=True)
 
     def manage_resins(self):
         from .resins import ResinManager

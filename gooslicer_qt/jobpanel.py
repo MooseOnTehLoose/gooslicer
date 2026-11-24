@@ -1,13 +1,15 @@
-"""Supports and Slicing sections of the Models tab (below Mesh): pick the support type and
-generate supports, check for unsupported islands, and slice the build area into memory with the
-estimates shown underneath."""
+"""Hollowing, Supports and Slicing sections of the Models tab (below Mesh): hollow parts, drill
+drain holes and check for voids (sealed cavities); pick the support type and generate supports,
+detect unsupported islands; and slice the build area into memory with the estimates shown underneath."""
 from __future__ import annotations
 
 import numpy as np
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+                               QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+
+from .panels import InfoButton, show_popup
 
 from .supporting import recommended_choice, support_choices, support_note, support_params
 
@@ -24,6 +26,27 @@ class JobPanel(QWidget):
         self.win = win
         self._user_choice: str | None = win.settings.value("supportType", None) or None
         self._templates: list = []
+        self._trapped_busy = False
+
+        # ---- Hollowing
+        hol = QGroupBox("Hollowing")
+        hl = QVBoxLayout(hol)
+        self.hollow_btn = QPushButton("Hollow…")
+        self.hollow_btn.setToolTip("Hollow the selected part (Ctrl+Shift+H)")
+        self.drain_btn = QPushButton("Add drain holes…")
+        self.drain_btn.setToolTip("Click on a part to drill drain holes so resin can escape "
+                                  "(Ctrl+Shift+D)")
+        self.trapped_btn = QPushButton("Check for voids")
+        self.trapped_btn.setToolTip("Look for sealed cavities that would trap uncured resin; they "
+                                    "are shown in red")
+        self.seal_btn = QPushButton("Seal cavity")
+        self.seal_btn.setToolTip("Fill every sealed cavity, making the part solid there instead of "
+                                 "hollow (Edit → Undo brings it back)")
+        self.trapped_result = QLabel()
+        self.trapped_result.setWordWrap(True)
+        self.trapped_result.hide()
+        hl.addLayout(self._button_grid([self.hollow_btn, self.drain_btn, self.trapped_btn, self.seal_btn]))
+        hl.addWidget(self.trapped_result)
 
         # ---- Supports
         sup = QGroupBox("Supports")
@@ -38,9 +61,9 @@ class JobPanel(QWidget):
         self.remove_btn = QPushButton("Remove supports")
         self.remove_btn.setToolTip("Remove the supports of the selected parts (all parts if none "
                                    "is selected); Edit → Undo brings them back")
-        self.islands_btn = QPushButton("Check for unsupported islands")
+        self.islands_btn = QPushButton("Detect islands")
         self.fix_btn = QPushButton("Fix islands")
-        self.fix_btn.setToolTip("Check for unsupported islands and add a support under each one "
+        self.fix_btn.setToolTip("Detect unsupported islands and add a support under each one "
                                 "(parts without supports get a full set of the type above)")
         self.islands_result = QLabel()
         self.islands_result.setWordWrap(True)
@@ -49,15 +72,14 @@ class JobPanel(QWidget):
         form.addRow("Support type", self.support_type)
         sl.addLayout(form)
         sl.addWidget(self.support_note)
-        row = QHBoxLayout()
-        row.addWidget(self.generate_btn, 1)
-        row.addWidget(self.remove_btn)
-        sl.addLayout(row)
-        irow = QHBoxLayout()
-        irow.addWidget(self.islands_btn, 1)
-        irow.addWidget(self.fix_btn)
-        sl.addLayout(irow)
+        sl.addLayout(self._button_grid([self.generate_btn, self.remove_btn, self.islands_btn, self.fix_btn]))
         sl.addWidget(self.islands_result)
+        # every Hollowing and Supports button the same width: the widest one's
+        same = [self.hollow_btn, self.drain_btn, self.trapped_btn, self.seal_btn,
+                self.generate_btn, self.remove_btn, self.islands_btn, self.fix_btn]
+        w = max(b.sizeHint().width() for b in same)
+        for b in same:
+            b.setMinimumWidth(w)
 
         # ---- Slicing
         sli = QGroupBox("Slicing")
@@ -65,6 +87,13 @@ class JobPanel(QWidget):
         self.slice_btn = QPushButton("Slice")
         self.slice_btn.setToolTip("Slice everything on the build plate and keep the result in memory "
                                   "for Export and Send to printer")
+        self.gpu_box = QCheckBox("Use the GPU (experimental)")
+        self.gpu_box.setToolTip("Draw the layers on the graphics card instead of the CPU: several times "
+                                "faster. Edge pixels can differ slightly from the CPU slicer (which "
+                                "matches SatelLite), and models with holes in their mesh may slice "
+                                "wrongly. Falls back to the CPU if the GPU can't be used.")
+        self.gpu_box.setChecked(win.gpu_slicing())
+        self.gpu_box.toggled.connect(win.set_gpu_slicing)
         self.export_btn = QPushButton("Export…")
         self.export_btn.setToolTip("Save the sliced plate held in memory as a .goo file")
         self.send_btn = QPushButton("Send to printer")
@@ -77,12 +106,36 @@ class JobPanel(QWidget):
         rf = QFormLayout(self.results)
         rf.setContentsMargins(0, 0, 0, 0)
         self.result = {k: QLabel("–") for k in
-                       ("Print time", "Volume", "Weight", "Layers", "Layer thickness")}
+                       ("Print time", "Volume", "Weight", "Layers", "Layer thickness", "Sliced on")}
         for k, w in self.result.items():
             w.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            rf.addRow(k, w)
+            if k != "Sliced on":
+                rf.addRow(k, w)
+        # "GPU, 1.4 s" with an (i) to the right: the device in a pop-up
+        self.backend_btn = InfoButton("Slicing hardware")
+        self.backend_btn.clicked.connect(self.show_backend_details)
+        brow = QHBoxLayout()
+        brow.setContentsMargins(0, 0, 0, 0)
+        brow.addWidget(self.result["Sliced on"], 1)
+        brow.addWidget(self.backend_btn)
+        rf.addRow("Sliced on", brow)
+        self.backend_row = brow
+        self.backend_details = QFrame(self, Qt.Popup)
+        self.backend_details.setFrameShape(QFrame.StyledPanel)
+        bf = QFormLayout(self.backend_details)
+        bf.setContentsMargins(12, 10, 12, 10)
+        self.backend_title = QLabel("Slicing hardware")
+        f = self.backend_title.font()
+        f.setBold(True)
+        self.backend_title.setFont(f)
+        bf.addRow(self.backend_title)
+        self.backend_info = {k: QLabel("–") for k in ("Processor", "Device", "Time")}
+        for k, w in self.backend_info.items():
+            w.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            bf.addRow(k, w)
         self.results.hide()
         vl.addWidget(self.slice_btn)
+        vl.addWidget(self.gpu_box)
         out = QHBoxLayout()                      # progress is in the status bar while slicing
         out.addWidget(self.export_btn, 1)
         out.addWidget(self.send_btn, 1)
@@ -93,9 +146,14 @@ class JobPanel(QWidget):
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(9, 0, 9, 9)
+        lay.addWidget(hol)
         lay.addWidget(sup)
         lay.addWidget(sli)
 
+        self.hollow_btn.clicked.connect(lambda: self.win.hollow_dialog())
+        self.drain_btn.clicked.connect(lambda: self.win.drain_hole_mode())
+        self.trapped_btn.clicked.connect(self.check_trapped_resin)
+        self.seal_btn.clicked.connect(self.seal_cavities)
         self.support_type.currentIndexChanged.connect(self._type_picked)
         self.generate_btn.clicked.connect(self.generate)
         self.remove_btn.clicked.connect(lambda: self.win.clear_supports())
@@ -142,19 +200,49 @@ class JobPanel(QWidget):
     def _update_support_text(self, parts=None, h=None) -> None:
         parts = self._targets() if parts is None else parts
         h = self._height(parts) if h is None else h
-        self.support_note.setText(support_note(self.support_type.currentData(), h, bool(self._templates)))
         n = len(parts)
         if not n:
             target = ""
         elif self.win.selected_ids():
-            target = " (selected part)" if n == 1 else f" ({n} selected parts)"
+            target = "the selected part" if n == 1 else f"the {n} selected parts"
         else:
-            target = " (1 part)" if n == 1 else f" (all {n} parts)"
-        self.generate_btn.setText("Generate supports" + target)
+            target = "the part on the plate" if n == 1 else f"all {n} parts"
+        note = support_note(self.support_type.currentData(), h, bool(self._templates))
+        # the button keeps one short label (the Hollowing and Supports buttons share a width)
+        self.support_note.setText(f"{note} Supports go on {target}." if target else note)
+        self.hollow_btn.setEnabled(bool(self.win.selected_ids()))
+        self.drain_btn.setEnabled(n > 0)
+        self.trapped_btn.setEnabled(n > 0 and not self._trapped_busy)
+        self.seal_btn.setEnabled(n > 0 and not self._trapped_busy)
+        self.generate_btn.setToolTip(f"Generate supports for {target}" if target else
+                                     "Generate supports (import a model first)")
         self.generate_btn.setEnabled(n > 0)
         if self.islands_btn.isEnabled():
             self.fix_btn.setEnabled(bool(self.win.scene.parts))
         self.remove_btn.setEnabled(any(p.supports is not None for p in parts))
+
+    @staticmethod
+    def _button_grid(buttons) -> QGridLayout:
+        """Two equal columns: the buttons' widths ignore their text, so every column matches."""
+        g = QGridLayout()
+        for n, b in enumerate(buttons):
+            b.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            g.addWidget(b, n // 2, n % 2)
+        g.setColumnStretch(0, 1)
+        g.setColumnStretch(1, 1)
+        return g
+
+    def support_choice(self) -> str | None:
+        """The support type picked by the user, or None to let the height rule pick."""
+        return self._user_choice
+
+    def set_support_choice(self, label: str | None) -> None:
+        self._user_choice = label or None
+        if label:
+            self.win.settings.setValue("supportType", label)
+        else:
+            self.win.settings.remove("supportType")
+        self.refresh()
 
     def _type_picked(self, *_):
         self._user_choice = self.support_type.currentText()
@@ -168,6 +256,61 @@ class JobPanel(QWidget):
         params, name = support_params(self.support_type.currentData())
         for p in parts:
             self.win.auto_support(p, params, name)
+
+    # ---------------------------------------------------------------- trapped resin
+    def _trapped_idle(self) -> None:
+        self._trapped_busy = False
+        self.trapped_btn.setEnabled(bool(self.win.scene.parts))
+        self.seal_btn.setEnabled(bool(self.win.scene.parts))
+
+    def check_trapped_resin(self) -> None:
+        self._trapped_busy = True
+        self.trapped_btn.setEnabled(False)
+        self.seal_btn.setEnabled(False)
+        self.trapped_result.setText("Checking…")
+        self.trapped_result.show()
+
+        def done(cav):
+            self._trapped_idle()
+            if cav is None:
+                self.trapped_result.setText("The check failed; see the Log.")
+            elif not cav:
+                self.trapped_result.setText("✓ No sealed cavities: resin can drain from every part.")
+            else:
+                self.trapped_result.setText(
+                    f"⚠ {len(cav)} sealed cavit{'y' if len(cav) == 1 else 'ies'} would trap uncured "
+                    "resin, shown in red. Add a drain hole near the bottom of each (Add drain "
+                    "holes); details are in the Log.")
+        self.win.check_trapped_resin_async(done)
+
+    def seal_cavities(self) -> None:
+        self._trapped_busy = True
+        self.trapped_btn.setEnabled(False)
+        self.seal_btn.setEnabled(False)
+        self.trapped_result.setText("Sealing cavities…")
+        self.trapped_result.show()
+
+        def done(msg: str):
+            self._trapped_idle()
+            self.trapped_result.setText(msg)
+            self.trapped_result.show()
+        self.win.seal_cavities(done)
+
+    def flaws_changed(self, kind: str, left: int) -> None:
+        """A flaw was dismissed in the Flaws tab: update that check's result."""
+        label = self.islands_result if kind == "island" else self.trapped_result
+        if label.isHidden():
+            return
+        what = ("unsupported island", "unsupported islands") if kind == "island" else ("sealed cavity", "sealed cavities")
+        if left:
+            label.setText(f"⚠ {left} {what[0] if left == 1 else what[1]} left, shown in red (the rest "
+                          "were dismissed in Flaws).")
+        else:
+            label.setText(f"✓ No {what[1]} left: the rest were dismissed as false positives in Flaws.")
+
+    def cavities_out_of_date(self) -> None:
+        if not self.trapped_result.isHidden():
+            self.trapped_result.setText("A part changed since the trapped-resin check. Check again.")
 
     # ---------------------------------------------------------------- islands
     def check_islands(self) -> None:
@@ -233,6 +376,7 @@ class JobPanel(QWidget):
 
     def slicing_started(self, layers: int) -> None:
         self.slice_btn.setText("Cancel slicing")
+        self.gpu_box.setEnabled(False)
         self.status.setText(f"Slicing {layers} layers…")
         self.status.show()
         self.results.hide()
@@ -243,10 +387,14 @@ class JobPanel(QWidget):
 
     def slicing_finished(self) -> None:
         self.slice_btn.setText("Slice")
+        self.gpu_box.setEnabled(True)
 
     def slicing_failed(self, msg: str) -> None:
         self.status.setText("Slicing cancelled." if msg == "cancelled" else f"Slicing failed: {msg}")
         self.status.show()
+
+    def show_backend_details(self) -> None:
+        show_popup(self.backend_details, self.backend_btn)
 
     def show_result(self, res, held: bool = True) -> None:
         r = self.result
@@ -255,6 +403,11 @@ class JobPanel(QWidget):
         r["Weight"].setText(f"{res.weight:.2f} g")
         r["Layers"].setText(f"{res.layers:,}")
         r["Layer thickness"].setText(f"{res.layer_height * 1000:g} µm ({res.layer_height:g} mm)")
+        r["Sliced on"].setText(self.win._backend_text(res))
+        gpu = res.backend.startswith("gpu")
+        self.backend_info["Processor"].setText("GPU (OpenGL)" if gpu else "CPU")
+        self.backend_info["Device"].setText(self.win._backend_device(res))
+        self.backend_info["Time"].setText(f"{res.seconds:.2f} s to make {res.layers:,} layers")
         self.results.show()
         if held:
             self.set_stale(False)

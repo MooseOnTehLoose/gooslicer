@@ -231,6 +231,36 @@ def test_hollow_drill_and_trapped_resin(app, tmp_path, monkeypatch):
     cav = w.trapped_resin()
     assert len(cav) == 1
 
+    # the Hollowing pane (above Supports) checks too, and shows the cavity in red with a guide
+    jp = w.job_panel
+    lay = jp.layout()
+    assert [lay.itemAt(i).widget().title() for i in range(lay.count())] == ["Hollowing", "Supports", "Slicing"]
+    assert jp.hollow_btn.isEnabled() and jp.drain_btn.isEnabled() and jp.trapped_btn.isEnabled()
+    jp.trapped_btn.click()
+    assert _wait(app, lambda: jp.trapped_btn.isEnabled(), 60)
+    assert "1 sealed cavity" in jp.trapped_result.text() and "red" in jp.trapped_result.text()
+    red = w.viewport.cavity_meshes
+    assert len(red) == 1 and len(red[0].faces) >= 12
+    lo, hi = wm.bounds
+    assert (red[0].bounds[0] > lo + 1).all() and (red[0].bounds[1] < hi - 1).all()   # the inner wall only
+    g = w.viewport.cavity_lines
+    assert g.shape == (2, 3) and np.isclose(g[0, 2], g[1, 2])
+    assert [lab.text for lab in w.viewport.guide_labels()] == ["Sealed cavity 1"]
+    w.scene_changed()                                   # supports or nothing changed: still shown
+    assert w.viewport.cavity_meshes
+
+    # Seal cavity fills it in (one undo step brings the hollow back)
+    hollow_mesh = part.mesh
+    jp.seal_btn.click()
+    assert _wait(app, lambda: jp.seal_btn.isEnabled() and "Seal" in jp.trapped_result.text(), 60)
+    assert "Sealed 1 cavity" in jp.trapped_result.text()
+    assert w.trapped_resin() == [] and w.viewport.cavity_meshes == []
+    assert part.world_mesh().volume == pytest.approx(4000, rel=1e-6) and part.world_mesh().is_watertight
+    assert w.undo.undoText() == "Seal cavities"
+    w.undo.undo()
+    assert part.mesh is hollow_mesh and len(w.trapped_resin()) == 1
+    wm = part.world_mesh()
+
     asked = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: asked.append(a[2]) or QMessageBox.No)
     assert not w._confirm_no_trapped_resin() and "sealed cavit" in asked[0]
@@ -241,7 +271,13 @@ def test_hollow_drill_and_trapped_resin(app, tmp_path, monkeypatch):
     assert hit_part is part
     w._hole_settings = DrainHoleDialog(s).value()
     w._hole_picked(part.id, face, hit)
+    assert _wait(app, lambda: not w.drilling() and w.undo.undoText() == "Drain hole", 60)
     assert part.world_mesh().is_watertight and w.trapped_resin() == []
+    assert w.viewport.cavity_meshes == [] and len(w.viewport.cavity_lines) == 0   # the part changed
+    assert "changed since the trapped-resin check" in jp.trapped_result.text()
+    jp.trapped_btn.click()
+    assert _wait(app, lambda: jp.trapped_btn.isEnabled(), 60)
+    assert "No sealed cavities" in jp.trapped_result.text()
     assert w._confirm_no_trapped_resin()
     w.undo.undo()
     assert len(w.trapped_resin()) == 1
@@ -738,12 +774,12 @@ def test_restore_windows_to_default(app, tmp_path, monkeypatch):
     assert not any(d.isFloating() for d in w.docks.values())
     assert {t: w.dockWidgetArea(d) for t, d in w.docks.items()} == areas
     assert w.docks["Printer settings"].isVisible()
-    assert set(w.tabifiedDockWidgets(w.docks["Printer settings"])) == {w.docks["Models"]}
+    assert set(w.tabifiedDockWidgets(w.docks["Printer settings"])) == {w.docks["Models"], w.docks["Flaws"]}
     w.close()
     w = MainWindow(settings=s)                                # and the restored layout is kept
     w.show()
     app.processEvents()
-    assert set(w.tabifiedDockWidgets(w.docks["Printer settings"])) == {w.docks["Models"]}
+    assert set(w.tabifiedDockWidgets(w.docks["Printer settings"])) == {w.docks["Models"], w.docks["Flaws"]}
     w.close()
 
 
@@ -991,13 +1027,13 @@ def test_right_hand_tabs(app, tmp_path, monkeypatch):
     assert "Parts" not in w.docks
     ps, pr = w.docks["Printer settings"], w.docks["Models"]
     assert w.dockWidgetArea(ps) == w.dockWidgetArea(pr) == Qt.RightDockWidgetArea
-    assert w.tabifiedDockWidgets(ps) == [pr]
+    assert set(w.tabifiedDockWidgets(ps)) == {pr, w.docks["Flaws"]}
     def right_bar():
         return next((b for b in w.findChildren(QTabBar) if b.isVisible()
                      and "Models" in [b.tabText(i) for i in range(b.count())]), None)
     assert _wait(app, right_bar, 5)
     bar = right_bar()
-    assert [bar.tabText(i) for i in range(bar.count())] == ["Printer settings", "Models"]
+    assert [bar.tabText(i) for i in range(bar.count())] == ["Printer settings", "Models", "Flaws"]
     def on_screen(wid):                          # a dock behind another tab still reports isVisible()
         return wid.isVisible() and not wid.visibleRegion().isEmpty()
     assert bar.currentIndex() == 0 and on_screen(w.print_settings) and not on_screen(w.parts)
@@ -1045,13 +1081,14 @@ def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
     monkeypatch.setattr(w, "auto_support", fake_auto_support)
     w.select([])
     app.processEvents()
-    assert jp.generate_btn.text() == "Generate supports (1 part)"
+    assert jp.generate_btn.text() == "Generate supports" and "Supports go on the part on the plate." in jp.support_note.text()
     jp.support_type.setCurrentIndex(1)
     jp.generate_btn.click()
     assert called == [("cube", True, "")] and s.value("supportType") == BUILTIN_TREE
     w.select([w.scene.parts[0].id])
     app.processEvents()
-    assert jp.generate_btn.text() == "Generate supports (selected part)" and jp.support_type.currentIndex() == 1
+    assert jp.generate_btn.toolTip() == "Generate supports for the selected part" and jp.support_type.currentIndex() == 1
+    assert "Supports go on the selected part." in jp.support_note.text()
     jp.support_type.setCurrentIndex(0)
     jp.generate_btn.click()
     assert called[-1] == ("cube", False, "")
@@ -1059,17 +1096,12 @@ def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
     sup_box = jp.generate_btn.parentWidget()
     assert sup_box.title() == "Supports" and sup_box.isAncestorOf(jp.islands_btn)
     assert jp.remove_btn.parentWidget() is sup_box
-    row = next(sup_box.layout().itemAt(k).layout() for k in range(sup_box.layout().count())
-               if sup_box.layout().itemAt(k).layout() and sup_box.layout().itemAt(k).layout().indexOf(jp.generate_btn) >= 0)
-    assert row.direction() == row.Direction.LeftToRight
-    assert row.indexOf(jp.generate_btn) == 0 and row.indexOf(jp.remove_btn) == 1
-    items = [sup_box.layout().itemAt(k) for k in range(sup_box.layout().count())]
-    k_row = [k for k, it in enumerate(items) if it.layout() is row][0]
-    assert items[k_row + 1].layout() is not None and items[k_row + 1].layout().indexOf(jp.islands_btn) == 0
+    grid = next(sup_box.layout().itemAt(k).layout() for k in range(sup_box.layout().count())
+                if sup_box.layout().itemAt(k).layout() and sup_box.layout().itemAt(k).layout().indexOf(jp.generate_btn) >= 0)
+    pos = {b: grid.getItemPosition(grid.indexOf(b))[:2] for b in (jp.generate_btn, jp.remove_btn, jp.islands_btn, jp.fix_btn)}
+    # Generate | Remove, then Detect islands | Fix islands below them
+    assert pos == {jp.generate_btn: (0, 0), jp.remove_btn: (0, 1), jp.islands_btn: (1, 0), jp.fix_btn: (1, 1)}
     assert not jp.slice_btn.parentWidget().isAncestorOf(jp.islands_btn)
-    irow = next(sup_box.layout().itemAt(k).layout() for k in range(sup_box.layout().count())
-                if sup_box.layout().itemAt(k).layout() and sup_box.layout().itemAt(k).layout().indexOf(jp.islands_btn) >= 0)
-    assert irow.indexOf(jp.islands_btn) == 0 and irow.indexOf(jp.fix_btn) == 1          # Fix islands to its right
     assert not jp.remove_btn.isEnabled()                               # nothing to remove yet
     from gooslicer_qt.supporting import support_params
     got = []
@@ -1134,7 +1166,8 @@ def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
     assert len(w.layer_preview.goo.layers) == 60                       # View → Layers shows it
     # Export and Send to printer share a row under Slice (Send on the right), with icons
     lay = jp.slice_btn.parentWidget().layout()
-    orow = lay.itemAt(lay.indexOf(jp.slice_btn) + 1).layout()
+    assert lay.itemAt(lay.indexOf(jp.slice_btn) + 1).widget() is jp.gpu_box     # the GPU option under Slice
+    orow = lay.itemAt(lay.indexOf(jp.slice_btn) + 2).layout()
     assert orow.indexOf(jp.export_btn) == 0 and orow.indexOf(jp.send_btn) == 1
     assert not jp.export_btn.icon().isNull() and not jp.send_btn.icon().isNull()
     assert jp.export_btn.isEnabled() and jp.send_btn.isEnabled()
@@ -1183,7 +1216,7 @@ def test_log_and_layers_windows(app, tmp_path, monkeypatch):
     w.show()
     app.processEvents()
     # not part of the main window any more
-    assert set(w.docks) == {"Printer settings", "Models"}
+    assert set(w.docks) == {"Printer settings", "Models", "Flaws"}
     assert not any(d.isAncestorOf(w.log) or d.isAncestorOf(w.layer_preview) for d in w.findChildren(QDockWidget))
     assert not w.log.isVisible() and not w.layer_preview.isVisible()
     view = next(a.menu() for a in w.menuBar().actions() if a.text() == "&View")
@@ -1270,7 +1303,7 @@ def test_models_tab_remove_instance_mirror(app, tmp_path, monkeypatch):
     w.resize(1200, 800)
     w.show()
     app.processEvents()
-    bar = next(b for b in w.findChildren(QTabBar) if b.count() == 2 and b.tabText(1) == "Models")
+    bar = next(b for b in w.findChildren(QTabBar) if b.count() == 3 and b.tabText(1) == "Models")
     assert [bar.tabText(i) for i in range(2)] == ["Printer settings", "Models"]
     m = trimesh.creation.box((12, 6, 4))
     m.vertices[m.vertices[:, 1] > 0, 0] += 5                  # lopsided, so a mirror shows
@@ -1339,3 +1372,305 @@ def test_models_tab_remove_instance_mirror(app, tmp_path, monkeypatch):
     assert np.allclose(a.world_vertices(), v0) and a.supports is plan
     a.supports = None
     w.close()
+
+
+def test_flaws_tab_select_and_dismiss(app, tmp_path, monkeypatch):
+    import numpy as np
+    import trimesh
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication, QTabBar
+    from gooslicer_qt.main import MainWindow
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    w.resize(1200, 800)
+    w.show()
+    app.processEvents()
+    bar = next(b for b in w.findChildren(QTabBar) if b.count() == 3)
+    assert [bar.tabText(i) for i in range(3)] == ["Printer settings", "Models", "Flaws"]   # after Models
+    fp = w.flaws_panel
+    assert fp.list.count() == 0 and not fp.empty.isHidden()
+
+    files = []
+    for name in ("a", "b"):
+        f = tmp_path / f"{name}.stl"
+        trimesh.creation.box((8, 8, 8)).export(f)
+        files.append(str(f))
+    w.import_files(files)
+    assert _wait(app, lambda: len(w.scene.parts) == 2, 30)
+    a, b = w.scene.parts
+    a.position[:] = (-30, 0, 9)                # both float 5 mm up: two unsupported islands
+    b.position[:] = (30, 0, 9)
+    w.scene_changed()
+    isl = w.check_islands()
+    assert len(isl) == 2
+    bar.setCurrentIndex(2)
+    app.processEvents()
+    texts = [fp.list.item(i).text() for i in range(fp.list.count())]
+    assert [t.split("\n")[0] for t in texts] == ["Unsupported island 1", "Unsupported island 2"]
+    for i in range(fp.list.count()):          # the red x is in view, not past a sideways scroll
+        assert fp.list.viewport().rect().contains(fp.list.x_rect(i))
+    assert fp.empty.isHidden()
+    w.viewport.reset_view()
+    labels = sorted(lab.text for lab in w.viewport.guide_labels())
+    assert labels == ["Unsupported island 1", "Unsupported island 2"]
+    assert len(w.viewport.island_meshes) == 2
+
+    def click(pos, button=Qt.LeftButton):
+        vp_ = fp.list.viewport()
+        for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+            QApplication.sendEvent(vp_, QMouseEvent(kind, QPointF(pos), vp_.mapToGlobal(QPointF(pos)), button,
+                                                    button if kind == QEvent.MouseButtonPress else Qt.NoButton,
+                                                    Qt.NoModifier))
+        app.processEvents()
+
+    # clicking a flaw selects it, as clicking its label does; again deselects
+    row0 = fp.list.visualRect(fp.list.model().index(0, 0))
+    click(row0.center())
+    assert w.viewport.selected_guides == {("island", 1)}
+    lab = next(x for x in w.viewport.guide_labels() if x.text == "Unsupported island 1")
+    assert lab.selected
+    click(row0.center())
+    assert w.viewport.selected_guides == set()
+    # and a label click selects its row
+    lab2 = next(x for x in w.viewport.guide_labels() if x.text == "Unsupported island 2")
+    w.viewport.toggle_guide(lab2)
+    assert [fp.list.item(i).isSelected() for i in range(2)] == [False, True]
+
+    # the red x dismisses a flaw: gone from the list, the 3D view and the next check
+    click(fp.list.x_rect(0).center())
+    assert fp.list.count() == 1 and fp.list.item(0).text().startswith("Unsupported island 2")
+    assert len(w.viewport.island_meshes) == 1 and list(w.viewport.island_numbers) == [2]
+    assert [x.text for x in w.viewport.guide_labels()] == ["Unsupported island 2"]
+    assert w.viewport.selected_guides == {("island", 2)}             # the other one stays selected
+    assert "Dismissed Unsupported island 1" in w.log.toPlainText()
+    assert len(w.check_islands()) == 1 and fp.list.count() == 1       # it stays dismissed
+    assert fp.list.item(0).text().startswith("Unsupported island 1")  # renumbered by the new check
+    # until a part changes
+    a.position[0] += 1
+    w.scene_changed()
+    assert fp.list.count() == 0                                        # the plate changed: cleared
+    assert len(w.check_islands()) == 2 and fp.list.count() == 2
+    w.close()
+
+
+def test_gpu_slicing_setting(app, tmp_path, monkeypatch):
+    import trimesh
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.Yes)
+    from gooslicer_qt.main import MainWindow
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    src = tmp_path / "officialPlatform.ini"
+    src.write_bytes(FIXTURE.encode())
+    assert w.import_profiles(str(src))
+    jp = w.job_panel
+    assert not jp.gpu_box.isChecked() and not w.gpu_slicing()       # off by default
+    stl = tmp_path / "cube.stl"
+    trimesh.creation.box((10, 10, 2)).export(stl)
+    w.import_files([str(stl)])
+    assert _wait(app, lambda: len(w.scene.parts) == 1)
+
+    def slice_():
+        jp.slice_btn.click()
+        assert _wait(app, lambda: w.held_slice() is not None and not w.slicing(), 120)
+        return w.held_slice()
+    cpu = slice_()
+    assert cpu.backend == "cpu" and jp.result["Sliced on"].text().startswith("CPU, ")
+    assert jp.result["Sliced on"].text().count(",") == 1                 # just where and how long
+    # the (i) beside it pops up the hardware
+    row = jp.backend_row
+    assert row.indexOf(jp.result["Sliced on"]) == 0 and row.indexOf(jp.backend_btn) == 1 and not jp.backend_btn.isHidden()
+    jp.backend_btn.click()
+    app.processEvents()
+    assert jp.backend_details.isVisible() and jp.backend_info["Processor"].text() == "CPU"
+    assert jp.backend_info["Device"].text() and jp.backend_info["Time"].text().endswith(" layers")
+    jp.backend_details.hide()
+
+    jp.gpu_box.setChecked(True)                                      # remembered
+    assert w.gpu_slicing() and s.value("gpuSlicing") in (True, "true")
+    w.scene.parts[0].position[0] += 1                                # a new slice
+    w.scene.parts[0].position[0] -= 1
+    w.held = None
+    w.scene_changed()
+    gpu = slice_()
+    log = w.log.toPlainText()
+    assert "Slicing on the GPU (experimental)" in log
+    if gpu.backend.startswith("gpu"):
+        assert jp.result["Sliced on"].text().startswith("GPU, ")
+        assert jp.backend_info["Processor"].text() == "GPU (OpenGL)"
+        assert jp.backend_info["Device"].text() == gpu.backend[5:-1] and jp.backend_info["Device"].text() in log
+        # the same layers as the CPU made (a box: no edge pixels in doubt)
+        assert [x.data for x in gpu.goo.layers] == [x.data for x in cpu.goo.layers]
+    else:                                                            # no GL here: the CPU, and why
+        assert jp.result["Sliced on"].text().startswith("CPU, ") and "sliced on the CPU" in log
+    assert "Layers made on the " in log
+    w.close()
+    w2 = MainWindow(settings=s)
+    assert w2.job_panel.gpu_box.isChecked()
+    w2.close()
+
+
+def test_transform_collapsed(app, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.Yes)
+    from gooslicer_qt.main import MainWindow
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    w.show()
+    app.processEvents()
+    pp = w.props
+    fields = pp.pos + pp.size + pp.scale + [pp.uniform]
+    assert all(pp.transform.isAncestorOf(f) for f in fields)
+    assert not pp.transform_btn.isChecked() and not any(f.isVisible() for f in fields)
+    assert pp.transform_btn.arrowType() == Qt.RightArrow
+    pp.transform_btn.click()
+    app.processEvents()
+    if pp.isVisible():
+        assert all(f.isVisible() for f in fields)
+    assert pp.transform_btn.arrowType() == Qt.DownArrow
+    pp.transform_btn.click()
+    assert not pp.transform.isVisible() and pp.transform_btn.arrowType() == Qt.RightArrow
+    w.close()
+
+
+
+def test_preferences_window(app, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.Yes)
+    from elegoo_lan.protocol import Printer
+    from gooslicer.support_defaults import HollowSettings
+    from gooslicer_qt.main import MainWindow
+    from gooslicer_qt.preferences import AUTO_SUPPORT, PreferencesDialog
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    src = tmp_path / "officialPlatform.ini"
+    src.write_bytes(FIXTURE.encode())
+    assert w.import_profiles(str(src))
+    # Edit → Preferences… (after the other Edit items)
+    edit = next(a.menu() for a in w.menuBar().actions() if a.text() == "&Edit")
+    assert edit.actions()[-1] is w.prefs_action and w.prefs_action.text() == "&Preferences…"
+    w.prefs_action.trigger()
+    d = w._preferences
+    assert isinstance(d, PreferencesDialog) and d.isVisible() and d.isModal()
+    names = [d.categories.item(i).text() for i in range(d.categories.count())]
+    assert names == ["Appearance", "Printer", "Resin", "Slicing", "Hollowing", "Drain holes", "Supports",
+                     "Network", "Files and folders", "Windows"]
+
+    # changes apply at once, both ways
+    d.show_page("Appearance")
+    d.theme.setCurrentIndex(d.theme.findData("dark"))
+    assert w.theme.mode == "dark" and s.value("theme") == "dark" and w.theme_actions["dark"].isChecked()
+    d.reset_page()
+    assert w.theme.mode == "system"
+    d.show_page("Slicing")
+    d.gpu.setChecked(True)
+    assert w.job_panel.gpu_box.isChecked() and w.gpu_slicing()
+    d.reset_page()
+    assert not w.job_panel.gpu_box.isChecked() and not d.gpu.isChecked()
+    d.show_page("Printer")
+    assert d.printer.currentText() == w.printer_panel.combo.currentText() != ""
+    assert str(tmp_path / "data") in d.profile_path.text()
+    d.show_page("Hollowing")
+    d.hollow.thickness.setValue(3.5)
+    assert float(s.value("hollow/thickness")) == 3.5
+    from gooslicer_qt.hollowing import HollowDialog
+    assert HollowDialog(s).value().thickness == 3.5               # the Hollow dialog starts there
+    d.reset_page()
+    assert HollowDialog(s).value() == HollowSettings()
+    d.show_page("Drain holes")
+    d.drain.r1.setValue(2.25)
+    assert float(s.value("drain/radius1")) == 2.25
+    d.show_page("Supports")
+    assert d.support.itemText(0) == AUTO_SUPPORT and d.support.currentIndex() == 0
+    d.support.setCurrentIndex(2)
+    d.support.activated.emit(2)
+    pick = d.support.itemText(2)
+    assert w.job_panel.support_choice() == pick == s.value("supportType")
+    assert w.job_panel.support_type.currentText() == pick
+    d.reset_page()
+    assert w.job_panel.support_choice() is None and not s.contains("supportType")
+    d.show_page("Files and folders")
+    s.setValue("lastGooDir", str(tmp_path))
+    d.show_page("Files and folders")
+    assert d.folder_labels["lastGooDir"].text() == str(tmp_path)
+    d.reset_page()
+    assert not s.contains("lastGooDir") and d.folder_labels["lastGooDir"].text() == str(Path.home())
+    # saved printers can be forgotten
+    w.lan._remember([Printer(name="A", ip="10.0.0.5", mainboard_id="m1"),
+                     Printer(name="B", ip="10.0.0.6", mainboard_id="m2")])
+    d.show_page("Network")
+    assert d.saved.count() == 2
+    d.saved.setCurrentRow(0)
+    from PySide6.QtWidgets import QPushButton
+    forget = next(b for b in d.page("Network").widget.findChildren(QPushButton)
+                  if b.text() == "Forget printer")
+    forget.click()
+    assert d.saved.count() == 1 and [p.name for p in w.lan.known] == ["B"]
+    assert "m1" not in s.value("lan/printers")
+    # search narrows the categories
+    d.search.setText("drain radius")
+    shown = [d.categories.item(i).text() for i in range(d.categories.count()) if not d.categories.item(i).isHidden()]
+    assert shown == ["Drain holes"] and d.categories.currentItem().text() == "Drain holes"
+    d.search.setText("gpu")
+    assert not d.categories.item(names.index("Slicing")).isHidden()
+    d.search.clear()
+    assert not any(d.categories.item(i).isHidden() for i in range(d.categories.count()))
+    d.close()
+    w.close()
+
+
+def test_hollowing_and_supports_buttons_share_a_width(app, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.Yes)
+    from gooslicer_qt.main import MainWindow
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    w.resize(1500, 1000)
+    w.show()
+    app.processEvents()
+    jp = w.job_panel
+    assert jp.trapped_btn.text() == "Check for voids" and jp.islands_btn.text() == "Detect islands"
+    buttons = [jp.hollow_btn, jp.drain_btn, jp.trapped_btn, jp.seal_btn,
+               jp.generate_btn, jp.remove_btn, jp.islands_btn, jp.fix_btn]
+    for width in (jp.width(), jp.width() + 150):             # also when the panel is resized
+        w.docks["Models"].setMinimumWidth(width)
+        app.processEvents()
+        widths = {b.width() for b in buttons}
+        assert len(widths) == 1, widths
+        assert all(b.width() >= b.sizeHint().width() for b in buttons)   # no clipped labels
+    menus = {a.text(): a.menu() for a in w.menuBar().actions()}
+    assert "Check for &voids" in [a.text() for a in menus["&Edit"].actions()]
+    assert "&Detect islands" in [a.text() for a in menus["&Supports"].actions()]
+    w.close()
+
+
+def test_drain_hole_links_load(app, tmp_path):
+    from gooslicer_qt.hollowing import DrainHoleFields
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    f = DrainHoleFields(s)
+    assert f.radii_linked and f.depths_linked                         # new: linked
+    s.setValue("drain/radius1", 3.0)
+    s.setValue("drain/radius2", 2.5)                                  # saved before the padlocks
+    f = DrainHoleFields(s)
+    assert not f.radii_linked and f.depths_linked and (f.r1.value(), f.r2.value()) == (3.0, 2.5)
+    s.setValue("drain/radius2", 3.0)
+    s.setValue("drain/linkDepth", False)
+    f = DrainHoleFields(s)
+    assert f.radii_linked and not f.depths_linked
+    seen = []
+    f.changed.connect(lambda: seen.append(1))
+    f.r2.setValue(4.0)
+    assert f.r1.value() == 4.0 and len(seen) == 1                     # one change for the pair

@@ -100,10 +100,22 @@ Each phase ends with passing tests and a short demo. Specs are written before th
   - STL/OBJ/3MF import, including multi-object 3MF, run as background jobs
   - GL 3.3 viewport: plate grid, volume box, orbit/pan/zoom, view presets
   - picking (multi-select with Ctrl) and drag-move on the plate
-  - transform panel (position, size, scale %, uniform lock), rotate −45° buttons or by any angle, lay flat on a clicked face, drop to plate, centre, reset
+  - transform panel (position, size, scale %, uniform lock; folded away under "Position, size and scale" until opened), rotate −45° buttons or by any angle, lay flat on a clicked face, drop to plate, centre, reset
   - shelf auto-arrange, duplicate and delete
-  - mesh report (holes, non-manifold edges, degenerate and duplicate triangles, winding, inverted, volume) with one-click repair
+  - mesh report (holes, non-manifold edges, degenerate and duplicate triangles, winding, inverted, volume) with one-click repair. Each repair step shows in the status bar. The repair (`mesh.repair`, GooSlicer's own) runs these steps:
+    - weld vertices and drop degenerate triangles;
+    - keep one copy of each duplicate triangle; a pair facing opposite ways is a zero-thickness wall, so both go;
+    - drop debris: shells averaging under 2 µm thick, or smaller than 0.001 mm³ (a 0.1 mm cube);
+    - drop fins: on an edge with more than two triangles, keep the largest and the largest running the other way;
+    - make orientation consistent with one breadth-first walk over all shells;
+    - close every hole: a triangle for three edges, otherwise a fan from a new vertex at the loop's centre;
+    - if a crumpled patch still can't be oriented (a twist), cut it out with a ring of neighbours that widens each try, and close it again;
+    - turn each shell outwards by its signed volume.
+
+    These run up to three passes, until every edge has two triangles running opposite ways and nothing is duplicated.
+    `samples/Lisa_head_C.stl` starts with 87 shells, 171 hole edges, 60 back-to-back pairs, a fin and a twist. It ends as one closed shell with its volume unchanged (11,693 mm³), in about 4 s; trimesh's repair took 33 s and left it broken. A fan over a strongly curved or concave hole can cross itself; the slicer's non-zero fill copes with that.
   - undo/redo for every edit
+  - Edit → Preferences… (`preferences.py`): a modal window, like Resin → Manage resins…, with a searchable category list. Pages: Appearance, Printer, Resin, Slicing, Hollowing, Drain holes, Supports, Network, Files and folders, Windows. Each option is the same setting its pane or dialog uses, so changes apply straight away both ways. Pages with defaults have Restore defaults.
   - out-of-volume parts shown in red and logged
 - **Deviation:** there are no 3D gizmo handles. Moving is done by dragging on the plate plus numeric fields; rotation uses buttons, angle input and lay-flat. Gizmo handles move to P7 if wanted.
 - Tests: core tests, plus GL viewport tests run under Xvfb with `scripts/test-gui.sh`.

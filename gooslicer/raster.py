@@ -163,11 +163,33 @@ def runs_from_spans(r, L, R, width: int, height: int, value: int = 255) -> list[
     return runs
 
 
+def encode_spans(r, L, R, width: int, height: int) -> bytes:
+    """Spans (sorted by row, then left) -> encoded GOO layer image, at numpy speed. The same
+    bytes as rle.encode_runs(runs_from_spans(...))."""
+    total = width * height
+    if len(r) == 0:
+        return rle.encode_lengths([0], [total])
+    a = np.asarray(r, np.int64) * width + np.asarray(L, np.int64)
+    b = np.asarray(r, np.int64) * width + np.asarray(R, np.int64)
+    new = np.r_[True, a[1:] > b[:-1]]                # touching or overlapping spans merge
+    idx = np.flatnonzero(new)
+    a = np.minimum.reduceat(a, idx)
+    b = np.maximum.reduceat(b, idx)
+    gaps = a - np.r_[0, b[:-1]]                      # black before each lit run
+    lengths = np.empty(2 * len(a) + 1, np.int64)
+    lengths[0:-1:2] = gaps
+    lengths[1::2] = b - a
+    lengths[-1] = total - b[-1]
+    values = np.zeros(len(lengths), np.int64)
+    values[1::2] = 255
+    return rle.encode_lengths(values, lengths)
+
+
 def rasterize_rle(polys_mm: list[np.ndarray], spec: RasterSpec) -> bytes:
     """Polygons in plate mm -> encoded GOO layer image."""
     px = [spec.to_pixels(p) for p in polys_mm if len(p) >= 3]
     r, L, R = spans(px, spec.res_x, spec.res_y)
-    return rle.encode_runs(runs_from_spans(r, L, R, spec.res_x, spec.res_y))
+    return encode_spans(r, L, R, spec.res_x, spec.res_y)
 
 
 def rasterize_bitmap(polys_mm: list[np.ndarray], spec: RasterSpec) -> np.ndarray:

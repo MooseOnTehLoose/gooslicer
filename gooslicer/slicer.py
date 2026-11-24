@@ -5,6 +5,7 @@ import math
 import multiprocessing as mp
 import os
 import struct
+import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -140,6 +141,8 @@ class SliceResult:
     header: goo.Header = field(repr=False)
     goo: "goo.GooFile | None" = field(default=None, repr=False)   # the slice itself, when built in memory
     layer_height: float = 0.0
+    backend: str = "cpu"                 # "cpu", or "gpu (<renderer>)"; see SliceJob.backend_note
+    seconds: float = 0.0                 # time spent making the layers
 
 
 @dataclass
@@ -153,6 +156,8 @@ class SliceJob:
 
     def __post_init__(self):
         self._bodies = [_Body(np.asarray(m.vertices), np.asarray(m.faces)) for m in self.meshes]
+        self.backend = "cpu"
+        self.backend_note = ""               # why the GPU wasn't used, when it was asked for
 
     # -------------------------------------------------------------- layers
     @property
@@ -186,9 +191,28 @@ class SliceJob:
     # ----------------------------------------------------------- encoding
     def iter_rle(self, workers: int | None = None, chunk: int = 8,
                  progress: Callable[[int, int], None] | None = None,
-                 cancelled: Callable[[], bool] | None = None) -> Iterator[bytes]:
+                 cancelled: Callable[[], bool] | None = None, gpu: bool = False) -> Iterator[bytes]:
+        """Encoded layers in order. With gpu=True (experimental), layers are drawn by the GPU
+        (gpu_raster; needs a current OpenGL context on this thread), else, or if that can't
+        start, rasterised on the CPU across processes."""
         n = self.layer_count
         zs = self.layer_z()
+        self.backend, self.backend_note = "cpu", ""
+        if gpu:
+            from .gpu_raster import GpuRasterizer, GpuUnavailable
+            try:
+                g = GpuRasterizer(self.meshes, self.spec)
+            except GpuUnavailable as e:
+                self.backend_note = f"GPU unavailable ({e}); sliced on the CPU"
+            except Exception as e:  # noqa: BLE001 (drivers fail in many ways)
+                self.backend_note = f"GPU failed to start ({type(e).__name__}: {e}); sliced on the CPU"
+            else:
+                self.backend = f"gpu ({g.renderer})"
+                try:
+                    yield from g.iter_rle(zs, progress=progress, cancelled=cancelled, cancel_exc=SliceCancelled)
+                finally:
+                    g.close()
+                return
         workers = workers if workers is not None else max(1, (os.cpu_count() or 2) - 1)
         chunks = [list(range(s, min(n, s + chunk))) for s in range(0, n, chunk)]
         done = 0
@@ -281,11 +305,13 @@ class SliceJob:
         vol = self.volume()
         header = self.build_header(vol)
         tmpl = self.layer_template()
+        t0 = time.monotonic()
         layers = (goo.Layer(goo.default_layer_def(header, i, tmpl), data)
                   for i, data in enumerate(self.iter_rle(**kw)))
         n = goo.write(path, header, layers)
         return SliceResult(path, n, header.print_time, vol, header.weight, header.price, header,
-                           layer_height=self.settings.layer_height)
+                           layer_height=self.settings.layer_height, backend=self.backend,
+                           seconds=time.monotonic() - t0)
 
     def build(self, **kw) -> SliceResult:
         """Slice into memory: the result carries the complete .goo (`result.goo`), ready to save
@@ -295,11 +321,13 @@ class SliceJob:
         vol = self.volume()
         header = self.build_header(vol)
         tmpl = self.layer_template()
+        t0 = time.monotonic()
         layers = [goo.Layer(goo.default_layer_def(header, i, tmpl), data)
                   for i, data in enumerate(self.iter_rle(**kw))]
         header.layer_count = len(layers)
         return SliceResult("", len(layers), header.print_time, vol, header.weight, header.price, header,
-                           goo=goo.GooFile(header, layers), layer_height=self.settings.layer_height)
+                           goo=goo.GooFile(header, layers), layer_height=self.settings.layer_height,
+                           backend=self.backend, seconds=time.monotonic() - t0)
 
 
 def estimate_print_time(s: PrintSettings, layers: int) -> int:

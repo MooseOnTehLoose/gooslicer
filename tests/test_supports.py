@@ -223,3 +223,21 @@ def test_island_faces_mark_only_the_floating_underside():
     ball.apply_translation((0, 0, 8))
     (sel,) = S.island_faces([ball], S.unsupported_islands([ball]))
     assert sel.any() and (ball.face_normals[sel][:, 2] < 0).all()
+
+
+def test_island_faces_each_keeps_islands_apart():
+    import trimesh
+    from gooslicer import supports as S
+    a = trimesh.creation.box((4, 4, 2))
+    a.apply_translation((-10, 0, 4))
+    b = trimesh.creation.box((4, 4, 2))
+    b.apply_translation((10, 0, 6))
+    isl = S.unsupported_islands([a, b])
+    assert len(isl) == 2
+    each = S.island_faces_each([a, b], isl)
+    assert len(each) == 2
+    for per_mesh in each:                          # each island marks one box's underside only
+        assert sum(int(m.any()) for m in per_mesh) == 1
+    combined = S.island_faces([a, b], isl)
+    for k in range(2):
+        assert (combined[k] == (each[0][k] | each[1][k])).all()

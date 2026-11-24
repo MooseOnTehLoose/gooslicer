@@ -7,10 +7,11 @@ A native Linux slicer and printer controller for ELEGOO Saturn 4 MSLA resin prin
 GooSlicer is an independent project. It is not affiliated with or endorsed by ELEGOO.
 
 ## Features
-- **Models:** STL, OBJ and 3MF import; mesh checks and one-click repair; move, rotate (rings around the selection in 5° steps, −45° buttons or any angle), scale, mirror, add instances (right-click a model), lay flat, auto-arrange; undo/redo.
-- **Hollowing:** inside, outside, centre and open-bottom shells; drain holes placed by clicking; a trapped-resin check before slicing.
-- **Supports:** automatic EVO-style supports (tips, pillars, bracing, raft with holes) and tree supports, using SatelLite's template parameters; manual add/remove; an unsupported-island check (islands shown in red) before slicing.
-- **Slicing:** native-resolution rasterising (non-square pixels on the 16K), parallel across all cores, `.goo` output checked against SatelLite's (a 10 mm cube is byte-identical; curved models differ by a few edge pixels per layer), plus print time, volume and cost estimates. Slices are held in memory to export or send to the printer.
+- **Models:** STL, OBJ and 3MF import; mesh checks and one-click repair; move, rotate (rings around the selection in 5° steps, −45° buttons or any angle), scale, mirror, add instances (right-click a model), lay flat, Auto Position (turns a part to the angle that needs the fewest supports), auto-arrange; undo/redo.
+- **Hollowing:** inside, outside, centre and open-bottom shells; drain holes placed by clicking; a trapped-resin check before slicing (sealed cavities shown in red, with a labelled guide line), and one-click sealing of cavities back to solid.
+- **Supports:** automatic EVO-style supports (tips, pillars, bracing, raft with holes) and tree supports, using SatelLite's template parameters; manual add/remove; an unsupported-island check (islands shown in red) before slicing. Every island and sealed cavity found is numbered and listed in the Flaws tab, where a false positive can be dismissed.
+- **Slicing:** native-resolution rasterising (non-square pixels on the 16K), parallel across all cores, `.goo` output checked against SatelLite's (a 10 mm cube is byte-identical; curved models differ by a few edge pixels per layer), plus print time, volume and cost estimates. Slices are held in memory to export or send to the printer. Experimental GPU slicing (OpenGL) is several times faster.
+- **Preferences:** Edit → Preferences… (Ctrl+,) lists every option by category: appearance, printer and profile folders, resin, slicing, hollowing, drain holes, supports, saved network printers, file folders and windows. It's searchable, and changes apply straight away.
 - **Printer control:** discovery, live status, upload, start/pause/stop and file management over SDCP V3 (WebSocket and HTTP).
 
 ## Printer profiles

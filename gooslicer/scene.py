@@ -8,6 +8,7 @@ local mesh, which is centred on its bounding-box centre at import.
 from __future__ import annotations
 
 import itertools
+import weakref
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -239,18 +240,73 @@ class Scene:
             lo, hi = p.bounds()
             if not _ray_hits_box(o[0], d[0], lo, hi):
                 continue
-            # intersect in local space so the mesh's cached ray index is reused
+            # intersect in local space, where the mesh's triangle arrays are cached
             inv = np.linalg.inv(p.matrix())
             lo_o = (inv @ np.append(o[0], 1.0))[:3]
             lo_d = inv[:3, :3] @ d[0]
-            locs, _, tri = p.mesh.ray.intersects_location(lo_o[None], lo_d[None], multiple_hits=False)
-            M = p.matrix()
-            for loc, t in zip(locs, tri):
-                w = (M @ np.append(loc, 1.0))[:3]
-                dist = float(np.linalg.norm(w - o[0]))
-                if dist < best[3]:
-                    best = (p, int(t), w, dist)
+            hit = ray_triangles(p.mesh, lo_o, lo_d)
+            if hit is None:
+                continue
+            t, loc = hit
+            w = (p.matrix() @ np.append(loc, 1.0))[:3]
+            dist = float(np.linalg.norm(w - o[0]))
+            if dist < best[3]:
+                best = (p, int(t), w, dist)
         return best[0], best[1], best[2]
+
+
+_TRI: dict[int, tuple] = {}
+
+
+def _triangles(mesh: trimesh.Trimesh):
+    """(v0, edge1, edge2, centre, radius²) of every face, float32, cached per mesh object
+    (meshes are replaced, not edited)."""
+    k = id(mesh)
+    c = _TRI.get(k)
+    if c is None or c[0]() is not mesh or len(c[1]) != len(mesh.faces):
+        tri = np.asarray(mesh.vertices, np.float32)[np.asarray(mesh.faces)]
+        v0 = tri[:, 0]
+        centre = tri.mean(axis=1)
+        r2 = ((tri - centre[:, None]) ** 2).sum(axis=2).max(axis=1)
+        c = (weakref.ref(mesh), v0, tri[:, 1] - v0, tri[:, 2] - v0, centre, r2 * 1.0001 + 1e-12)
+        _TRI[k] = c
+        weakref.finalize(mesh, _TRI.pop, k, None)
+    return c[1:]
+
+
+def ray_triangles(mesh: trimesh.Trimesh, origin, direction):
+    """The first face a ray hits: (face index, point), or None. Every face's bounding sphere is
+    tested against the ray at once, then Möller–Trumbore runs on the few left: a few ms for 300k
+    faces, with no index to build first (trimesh's ray index takes about a second, which stalled
+    picking right after a mesh changed)."""
+    if not len(mesh.faces):
+        return None
+    v0, e1, e2, centre, r2 = _triangles(mesh)
+    o = np.asarray(origin, np.float64)
+    d = np.asarray(direction, np.float64)
+    dn = d / np.linalg.norm(d)
+    # squared distance from each face centre to the ray's line, against the face's radius
+    w = centre - o.astype(np.float32)
+    along = w @ dn.astype(np.float32)
+    near = np.flatnonzero(((w * w).sum(axis=1) - along * along <= r2) & (along >= -np.sqrt(r2)))
+    if not len(near):
+        return None
+    v0, e1, e2 = v0[near].astype(np.float64), e1[near].astype(np.float64), e2[near].astype(np.float64)
+    p = np.cross(d, e2)
+    det = np.einsum("ij,ij->i", e1, p)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv = 1.0 / det
+        s = o - v0
+        u = np.einsum("ij,ij->i", s, p) * inv
+        q = np.cross(s, e1)
+        v = (q @ d) * inv
+        t = np.einsum("ij,ij->i", e2, q) * inv
+        ok = (np.abs(det) > 1e-12) & (u >= -1e-6) & (v >= -1e-6) & (u + v <= 1 + 1e-6) & (t > 1e-9)
+    idx = np.flatnonzero(ok)
+    if not len(idx):
+        return None
+    i = int(idx[np.argmin(t[idx])])
+    return int(near[i]), o + d * t[i]
 
 
 def _ray_hits_box(o, d, lo, hi) -> bool:
