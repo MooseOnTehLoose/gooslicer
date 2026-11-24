@@ -453,7 +453,7 @@ def test_parts_import_button(app, tmp_path, monkeypatch):
     stl = tmp_path / "cube.stl"
     trimesh.creation.box((5, 5, 5)).export(stl)
     monkeypatch.setattr(QFileDialog, "getOpenFileNames", lambda *a, **k: ([str(stl)], ""))
-    assert w.docks["Properties"].isAncestorOf(w.import_btn) and w.docks["Properties"].isAncestorOf(w.parts)
+    assert w.docks["Models"].isAncestorOf(w.import_btn) and w.docks["Models"].isAncestorOf(w.parts)
     w.import_btn.click()
     assert _wait(app, lambda: len(w.scene.parts) == 1)
     assert w.parts.count() == 1 and w.parts.item(0).text().startswith("cube")
@@ -613,9 +613,9 @@ def test_printer_row_and_details_popup(app, tmp_path, monkeypatch):
     from gooslicer_qt.main import MainWindow
     from gooslicer_qt.panels import InfoButton
     w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
-    assert "Printer" not in w.docks and "Print settings" in w.docks           # one merged tab
+    assert "Printer" not in w.docks and "Printer settings" in w.docks           # one merged tab
     pp, ps = w.printer_panel, w.print_settings
-    assert w.docks["Print settings"].isAncestorOf(ps) and ps.isAncestorOf(pp)
+    assert w.docks["Printer settings"].isAncestorOf(ps) and ps.isAncestorOf(pp)
     top = ps._top
     assert top.itemAt(0, QFormLayout.LabelRole).widget().text() == "Printer"
     assert top.itemAt(0, QFormLayout.FieldRole).widget() is pp
@@ -687,7 +687,7 @@ def test_import_resin_profile(app, tmp_path, monkeypatch):
         return ev.isAccepted()
 
     # dropped on the Print settings dock: several profiles are added, the selection stays
-    assert drop(w.docks["Print settings"], many)
+    assert drop(w.docks["Printer settings"], many)
     names = [r.name for r in ps.resins]
     assert {"Siraya Blu", "Maker A", "Maker B"} <= set(names) and "Other printer" not in names
     assert ps.current_resin().name == "Siraya Blu"
@@ -719,17 +719,17 @@ def test_restore_windows_to_default(app, tmp_path, monkeypatch):
     w.show()
     app.processEvents()
     areas = {t: w.dockWidgetArea(d) for t, d in w.docks.items()}
-    assert areas["Properties"] == Qt.RightDockWidgetArea
-    w.docks["Properties"].close()                             # closed, as the user did
-    w.docks["Log"].setFloating(True)
-    w.removeDockWidget(w.docks["Print settings"])             # gone from the layout entirely
+    assert areas["Models"] == Qt.RightDockWidgetArea
+    w.docks["Models"].close()                             # closed, as the user did
+    w.docks["Printer settings"].setFloating(True)
+    w.removeDockWidget(w.docks["Printer settings"])             # gone from the layout entirely
     w.close()                                                 # the broken layout is saved
 
     w = MainWindow(settings=s)
     w.resize(1200, 800)
     w.show()
     app.processEvents()
-    assert not w.docks["Properties"].isVisible()              # stays closed after a restart
+    assert not w.docks["Models"].isVisible()              # stays closed after a restart
     view = next(a.menu() for a in w.menuBar().actions() if a.text() == "&View")
     act = next(a for a in view.actions() if a.text().replace("&", "") == "Restore all windows to default")
     act.trigger()
@@ -737,14 +737,13 @@ def test_restore_windows_to_default(app, tmp_path, monkeypatch):
     assert all(d.isVisible() or w.tabifiedDockWidgets(d) for d in w.docks.values())
     assert not any(d.isFloating() for d in w.docks.values())
     assert {t: w.dockWidgetArea(d) for t, d in w.docks.items()} == areas
-    assert w.docks["Print settings"].isVisible() and w.docks["Log"].isVisible()
-    assert set(w.tabifiedDockWidgets(w.docks["Log"])) == {w.docks["Layers"]}
-    assert set(w.tabifiedDockWidgets(w.docks["Print settings"])) == {w.docks["Properties"]}
+    assert w.docks["Printer settings"].isVisible()
+    assert set(w.tabifiedDockWidgets(w.docks["Printer settings"])) == {w.docks["Models"]}
     w.close()
     w = MainWindow(settings=s)                                # and the restored layout is kept
     w.show()
     app.processEvents()
-    assert set(w.tabifiedDockWidgets(w.docks["Print settings"])) == {w.docks["Properties"]}
+    assert set(w.tabifiedDockWidgets(w.docks["Printer settings"])) == {w.docks["Models"]}
     w.close()
 
 
@@ -954,7 +953,7 @@ def test_printer_control_in_print_settings(app, tmp_path, monkeypatch):
     app.processEvents()
     assert "Printer control" not in w.docks
     ps, lan = w.print_settings, w.lan
-    assert w.docks["Print settings"].isAncestorOf(lan) and ps.isAncestorOf(lan)
+    assert w.docks["Printer settings"].isAncestorOf(lan) and ps.isAncestorOf(lan)
     # printer control comes first, then the Printer / Resin rows
     lay = ps.layout()
     assert lay.itemAt(0).widget() is lan
@@ -963,14 +962,14 @@ def test_printer_control_in_print_settings(app, tmp_path, monkeypatch):
     assert lan.mapTo(ps, lan.rect().bottomLeft()).y() < w.printer_panel.mapTo(ps, w.printer_panel.rect().topLeft()).y()
     assert lan.isVisible() and lan.find_btn.isVisible() and lan.files.isVisible()
     # it fits the column: nothing wider than the dock
-    assert ps.minimumSizeHint().width() <= w.docks["Print settings"].width() + 2
+    assert ps.minimumSizeHint().width() <= w.docks["Printer settings"].width() + 2
     # the Printer menu actions bring the tab forward
-    w.docks["Log"].raise_()
-    w.docks["Print settings"].close()
+    w.docks["Models"].raise_()
+    w.docks["Printer settings"].close()
     called = []
     w._show_lan(lambda: called.append(1))()                    # what the Printer menu items do
     app.processEvents()
-    assert called and w.docks["Print settings"].isVisible()
+    assert called and w.docks["Printer settings"].isVisible()
     w.close()
 
 
@@ -990,19 +989,19 @@ def test_right_hand_tabs(app, tmp_path, monkeypatch):
     w.show()
     app.processEvents()
     assert "Parts" not in w.docks
-    ps, pr = w.docks["Print settings"], w.docks["Properties"]
+    ps, pr = w.docks["Printer settings"], w.docks["Models"]
     assert w.dockWidgetArea(ps) == w.dockWidgetArea(pr) == Qt.RightDockWidgetArea
     assert w.tabifiedDockWidgets(ps) == [pr]
     def right_bar():
         return next((b for b in w.findChildren(QTabBar) if b.isVisible()
-                     and "Properties" in [b.tabText(i) for i in range(b.count())]), None)
+                     and "Models" in [b.tabText(i) for i in range(b.count())]), None)
     assert _wait(app, right_bar, 5)
     bar = right_bar()
-    assert [bar.tabText(i) for i in range(bar.count())] == ["Print settings", "Properties"]
+    assert [bar.tabText(i) for i in range(bar.count())] == ["Printer settings", "Models"]
     def on_screen(wid):                          # a dock behind another tab still reports isVisible()
         return wid.isVisible() and not wid.visibleRegion().isEmpty()
     assert bar.currentIndex() == 0 and on_screen(w.print_settings) and not on_screen(w.parts)
-    # Properties tab: the Parts box with Import model above the list, then the part's properties
+    # Models tab: the Parts box with Import model above the list, then the part's properties
     bar.setCurrentIndex(1)
     app.processEvents()
     assert on_screen(w.parts) and on_screen(w.import_btn) and on_screen(w.props) and not on_screen(w.print_settings)
@@ -1012,6 +1011,7 @@ def test_right_hand_tabs(app, tmp_path, monkeypatch):
 
 
 def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
+    import numpy as np
     import trimesh
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
@@ -1030,16 +1030,19 @@ def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
     w.import_files([str(stl)])
     assert _wait(app, lambda: len(w.scene.parts) == 1)
     jp = w.job_panel
-    # Supports and Slicing come right after Mesh in the Properties tab
+    # Supports and Slicing come right after Mesh in the Models tab
     box = w.props.parentWidget()
     assert box.layout().indexOf(w.props) == 0 and box.layout().indexOf(jp) == 1
-    assert w.docks["Properties"].isAncestorOf(jp)
+    assert w.docks["Models"].isAncestorOf(jp)
 
     # ---- supports: the type shown is what Generate uses; a pick is remembered
     types = [jp.support_type.itemText(i) for i in range(jp.support_type.count())]
     assert types[:2] == [BUILTIN, BUILTIN_TREE]
     called = []
-    monkeypatch.setattr(w, "auto_support", lambda p, params, name: called.append((p.name, params.style == "tree", name)))
+    def fake_auto_support(p, params, name):            # records the call; reports back later, as the real one
+        called.append((p.name, params.style == "tree", name))
+        QtCore.QTimer.singleShot(0, lambda: w.supportsFinished.emit(0))
+    monkeypatch.setattr(w, "auto_support", fake_auto_support)
     w.select([])
     app.processEvents()
     assert jp.generate_btn.text() == "Generate supports (1 part)"
@@ -1052,33 +1055,97 @@ def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
     jp.support_type.setCurrentIndex(0)
     jp.generate_btn.click()
     assert called[-1] == ("cube", False, "")
+    # Remove supports sits right of Generate; the island check below them, in Supports
+    sup_box = jp.generate_btn.parentWidget()
+    assert sup_box.title() == "Supports" and sup_box.isAncestorOf(jp.islands_btn)
+    assert jp.remove_btn.parentWidget() is sup_box
+    row = next(sup_box.layout().itemAt(k).layout() for k in range(sup_box.layout().count())
+               if sup_box.layout().itemAt(k).layout() and sup_box.layout().itemAt(k).layout().indexOf(jp.generate_btn) >= 0)
+    assert row.direction() == row.Direction.LeftToRight
+    assert row.indexOf(jp.generate_btn) == 0 and row.indexOf(jp.remove_btn) == 1
+    items = [sup_box.layout().itemAt(k) for k in range(sup_box.layout().count())]
+    k_row = [k for k, it in enumerate(items) if it.layout() is row][0]
+    assert items[k_row + 1].layout() is not None and items[k_row + 1].layout().indexOf(jp.islands_btn) == 0
+    assert not jp.slice_btn.parentWidget().isAncestorOf(jp.islands_btn)
+    irow = next(sup_box.layout().itemAt(k).layout() for k in range(sup_box.layout().count())
+                if sup_box.layout().itemAt(k).layout() and sup_box.layout().itemAt(k).layout().indexOf(jp.islands_btn) >= 0)
+    assert irow.indexOf(jp.islands_btn) == 0 and irow.indexOf(jp.fix_btn) == 1          # Fix islands to its right
+    assert not jp.remove_btn.isEnabled()                               # nothing to remove yet
+    from gooslicer_qt.supporting import support_params
+    got = []
+    w.supportsFinished.connect(got.append)
+    MainWindow.auto_support(w, w.scene.parts[0], *support_params(None))   # real supports this time
+    assert _wait(app, lambda: w.scene.parts[0].supports is not None, 120)
+    w.supportsFinished.disconnect()
+    assert jp.remove_btn.isEnabled()
+    jp.remove_btn.click()                                              # removes them (undoable)
+    assert w.scene.parts[0].supports is None and not jp.remove_btn.isEnabled()
+    w.undo.undo()
+    assert w.scene.parts[0].supports is not None and jp.remove_btn.isEnabled()
+    jp.remove_btn.click()
+    assert w.scene.parts[0].supports is None
 
     # ---- unsupported islands: a part floating above the plate is one
     w.scene.parts[0].position[2] += 4
     w.scene_changed()
     jp.islands_btn.click()
     assert _wait(app, lambda: jp.islands_btn.isEnabled(), 60)
-    assert "1 unsupported island" in jp.islands_result.text()
+    assert "1 unsupported island" in jp.islands_result.text() and "red" in jp.islands_result.text()
+    n_called = len(called)
+    jp.fix_btn.click()                                  # a part without supports gets a full set
+    assert _wait(app, lambda: jp.fix_btn.isEnabled() and len(called) > n_called, 60)
+    assert called[-1][0] == "cube" and "Generating supports for cube" in jp.islands_result.text()
+    assert "remains (shown in red)" in jp.islands_result.text()      # re-checked after (the fake adds none)
+    jp.islands_btn.click()                              # show the red again for the checks below
+    assert _wait(app, lambda: jp.islands_btn.isEnabled(), 60)
+    # a white guide from the island out to the edge of the build area
+    g = w.viewport.island_lines
+    assert g.shape == (2, 3) and np.isclose(g[0, 2], g[1, 2])
+    assert np.isclose(abs(g[1, 0]), w.scene.size[0] / 2) or np.isclose(abs(g[1, 1]), w.scene.size[1] / 2)
+    # its unsupported surface (the cube's underside, 4 mm up) is shown in red
+    red = w.viewport.island_meshes
+    assert len(red) == 1 and len(red[0].faces) >= 2
+    assert np.allclose(red[0].vertices[:, 2], 4.0, atol=1e-6) and (red[0].face_normals[:, 2] < 0).all()
     w.scene.parts[0].position[2] = 1.5
-    w.scene_changed()
+    w.scene_changed()                                                  # moving it clears the red
+    assert w.viewport.island_meshes == [] and "changed since the island check" in jp.islands_result.text()
+    assert len(w.viewport.island_lines) == 0
     jp.islands_btn.click()
     assert _wait(app, lambda: jp.islands_btn.isEnabled(), 60)
-    assert "No unsupported islands" in jp.islands_result.text()
+    assert "No unsupported islands" in jp.islands_result.text() and w.viewport.island_meshes == []
 
     # ---- slice into memory: progress, then the estimates
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.Yes)
-    assert jp.results.isHidden()
+    assert jp.results.isHidden() and not jp.export_btn.isEnabled() and not jp.send_btn.isEnabled()
+    assert not hasattr(jp, "progress") and w._progress.isHidden()     # progress: status bar, only while slicing
+    seen = []
+    w._progress.valueChanged.connect(lambda v: seen.append((v, w._progress.isHidden(), w._progress.text())))
     jp.slice_btn.click()
     assert _wait(app, lambda: w.held is not None and not w.slicing(), 120)
     res = w.held[0]
     assert res.goo is not None and res.layers == 60 == len(res.goo.layers)
-    assert jp.progress.value() == jp.progress.maximum() == 60 and jp.slice_btn.text() == "Slice"
+    assert seen and not any(hidden for v, hidden, _ in seen if v > 0) and seen[-1][0] == 60 and seen[-1][2] == "100%"
+    assert w._progress.isHidden() and jp.slice_btn.text() == "Slice"
     assert not jp.results.isHidden()
     assert jp.result["Layers"].text() == "60" and jp.result["Layer thickness"].text() == "50 µm (0.05 mm)"
     assert jp.result["Volume"].text() == f"{res.volume / 1000:.2f} ml" == "0.11 ml"
     assert jp.result["Weight"].text() == f"{res.weight:.2f} g" and jp.result["Print time"].text().endswith(" s")
     assert "held in memory" in jp.status.text() and w.held_slice() is res
-    assert len(w.layer_preview.goo.layers) == 60                       # the Layers tab shows it
+    assert len(w.layer_preview.goo.layers) == 60                       # View → Layers shows it
+    # Export and Send to printer share a row under Slice (Send on the right), with icons
+    lay = jp.slice_btn.parentWidget().layout()
+    orow = lay.itemAt(lay.indexOf(jp.slice_btn) + 1).layout()
+    assert orow.indexOf(jp.export_btn) == 0 and orow.indexOf(jp.send_btn) == 1
+    assert not jp.export_btn.icon().isNull() and not jp.send_btn.icon().isNull()
+    assert jp.export_btn.isEnabled() and jp.send_btn.isEnabled()
+    exp = tmp_path / "exported"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(exp), ""))
+    jp.export_btn.click()
+    assert [x.data for x in goo.read(str(exp) + ".goo").layers] == [x.data for x in res.goo.layers]
+    sent = []
+    monkeypatch.setattr(w.lan, "send_file", lambda path, start=None: (sent.append((path, start)), True)[1])
+    jp.send_btn.click()
+    assert len(sent) == 1 and sent[0][1] is True and goo.read(sent[0][0]).header.layer_count == 60
 
     # File → Slice and save writes what is held, without slicing again
     out = tmp_path / "held.goo"
@@ -1094,11 +1161,181 @@ def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
     w.scene.parts[0].position[0] += 5
     w.scene_changed()
     assert w.held_slice() is None and "changed since this slice" in jp.status.text()
+    assert not jp.export_btn.isEnabled() and not jp.send_btn.isEnabled()
     w.scene.parts[0].position[0] -= 5
     w.scene_changed()
-    assert w.held_slice() is res
+    assert w.held_slice() is res and jp.export_btn.isEnabled()
     w.print_settings.widgets["exposure"].setValue(w.print_settings.widgets["exposure"].value() + 1)
     assert w.held_slice() is None and "changed since this slice" in jp.status.text()
     w.slice_dialog()
     assert _wait(app, lambda: started, 60)                             # now it slices again (after the island check)
+    w.close()
+
+
+def test_log_and_layers_windows(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    from PySide6.QtWidgets import QDockWidget
+    from gooslicer_qt.main import MainWindow
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    w.resize(1200, 800)
+    w.show()
+    app.processEvents()
+    # not part of the main window any more
+    assert set(w.docks) == {"Printer settings", "Models"}
+    assert not any(d.isAncestorOf(w.log) or d.isAncestorOf(w.layer_preview) for d in w.findChildren(QDockWidget))
+    assert not w.log.isVisible() and not w.layer_preview.isVisible()
+    view = next(a.menu() for a in w.menuBar().actions() if a.text() == "&View")
+    acts = {a.text().replace("&", ""): a for a in view.actions()}
+    acts["Logs"].trigger()
+    app.processEvents()
+    assert w.log_window.isVisible() and w.log_window.isWindow() and w.log.isVisible()
+    assert w.log_window.isAncestorOf(w.log) and "Logs" in w.log_window.windowTitle()
+    acts["Layers"].trigger()
+    app.processEvents()
+    assert w.layers_window.isVisible() and w.layers_window.isWindow() and w.layer_preview.isVisible()
+    w.log_window.move(140, 120)
+    w.log_window.resize(700, 300)
+    app.processEvents()
+    size = w.log_window.size()
+    w.close()                                                 # closes them too, remembering the size
+    assert not w.log_window.isVisible() and not w.layers_window.isVisible()
+    w = MainWindow(settings=s)
+    w.log_window.popup()
+    app.processEvents()
+    assert w.log_window.size() == size
+    w.close()
+
+
+def test_fix_islands_adds_a_support_under_each(app, tmp_path, monkeypatch):
+    import numpy as np
+    import trimesh
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    from gooslicer import supports as S
+    from gooslicer.scene import Part
+    from gooslicer_qt.main import MainWindow
+    from gooslicer_qt.supporting import SupportsCommand
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    # one part: a base block, and a block hanging 3 mm above it (not connected)
+    base = trimesh.creation.box((10, 10, 2))
+    base.apply_translation((0, 0, 1))
+    hang = trimesh.creation.box((3, 3, 2))
+    hang.apply_translation((0, 0, 6))
+    stl = tmp_path / "two.stl"
+    trimesh.util.concatenate([base, hang]).export(stl)
+    w.import_files([str(stl)])
+    assert _wait(app, lambda: len(w.scene.parts) == 1)
+    p = w.scene.parts[0]
+    # supports under the base only, as a user could leave them
+    params = S.SupportParams()
+    st = p.state()
+    dz = params.lift - p.bounds()[0][2]
+    st.position[2] += dz
+    lo = p.bounds()[0]
+    hits = [S.Contact(np.array([x, y, lo[2] + dz]), np.array([0, 0, -1.0]), S.MANUAL)
+            for x in (-3, 3) for y in (-3, 3)]
+    frame = Part(p.name, p.mesh, st.position, st.rotation, st.scale)
+    plan = S.SupportPlan.from_world(frame, hits, params)
+    w.undo.push(SupportsCommand(w, p.id, SupportsCommand.snapshot(p), (plan, params.lift, st), "Add"))
+    assert _wait(app, lambda: w.supports.world_mesh(p) is not None, 60)
+    isl = w.unsupported_islands()
+    assert len(isl) == 1 and isl[0].point[2] > lo[2] + dz + 4                   # the hanging block
+    n0, undo0 = len(p.supports), w.undo.index()
+    added, full, missed = w.support_islands(isl, params)
+    assert (added, full, missed) == (1, [], 0) and len(p.supports) == n0 + 1
+    new = p.supports.world_contacts(p)[-1]
+    assert new.kind == S.ISLAND and new.point[2] <= isl[0].point[2] and isl[0].point[2] - new.point[2] < 0.1
+    assert abs(new.point[0]) < 1.6 and abs(new.point[1]) < 1.6 and new.normal[2] < 0
+    assert w.undo.index() == undo0 + 1                                           # one undo step
+    assert _wait(app, lambda: w.supports.world_mesh(p) is not None, 60)
+    assert _wait(app, lambda: not w.unsupported_islands(), 60)                   # fixed
+    w.undo.undo()
+    assert len(p.supports) == n0
+    w.close()
+
+
+def test_models_tab_remove_instance_mirror(app, tmp_path, monkeypatch):
+    import numpy as np
+    import trimesh
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QTabBar
+    from gooslicer import supports as S
+    from gooslicer_qt.main import MainWindow
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    w.resize(1200, 800)
+    w.show()
+    app.processEvents()
+    bar = next(b for b in w.findChildren(QTabBar) if b.count() == 2 and b.tabText(1) == "Models")
+    assert [bar.tabText(i) for i in range(2)] == ["Printer settings", "Models"]
+    m = trimesh.creation.box((12, 6, 4))
+    m.vertices[m.vertices[:, 1] > 0, 0] += 5                  # lopsided, so a mirror shows
+    stl = tmp_path / "wedge.stl"
+    m.export(stl)
+    w.import_files([str(stl), str(stl)])
+    assert _wait(app, lambda: len(w.scene.parts) == 2)
+    w.arrange_all()
+    bar.setCurrentIndex(1)
+    app.processEvents()
+    a, b = w.scene.parts
+
+    # the red x of a row removes that model (undoable); clicking the name still selects
+    lst = w.parts
+    lst.setCurrentRow(-1)
+
+    def click(pt):
+        for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+            QApplication.sendEvent(lst.viewport(), QMouseEvent(kind, QPointF(pt), QPointF(lst.viewport().mapToGlobal(pt)),
+                                                               Qt.LeftButton,
+                                                               Qt.LeftButton if kind == QEvent.MouseButtonPress else Qt.NoButton,
+                                                               Qt.NoModifier))
+        app.processEvents()
+    name_pt = lst.visualRect(lst.model().index(0, 0)).center()
+    name_pt.setX(10)
+    click(name_pt)
+    assert w.selected_ids() == [a.id]
+    click(lst.x_rect(1).center())
+    assert [p.id for p in w.scene.parts] == [a.id]
+    w.undo.undo()
+    assert [p.id for p in w.scene.parts] == [a.id, b.id]
+
+    # Add instance: a copy beside the original, overlapping nothing, on the plate
+    n0 = w.undo.index()
+    w.part_menu(a.id).actions()[0].trigger()
+    assert len(w.scene.parts) == 3 and w.undo.index() == n0 + 1
+    new = w.scene.parts[-1]
+    assert new.mesh is a.mesh and w.scene.in_volume(new) and w.selected_ids() == [new.id]
+    for o in (a, b):
+        lo1, hi1 = new.bounds()
+        lo2, hi2 = o.bounds()
+        assert (hi1[:2] < lo2[:2]).any() or (hi2[:2] < lo1[:2]).any()      # footprints apart
+    w.undo.undo()
+    assert len(w.scene.parts) == 2
+
+    # Mirror: front to back (Y), around the model's own centre; supports follow; undoable
+    plan = S.SupportPlan.from_world(a, [S.Contact(a.world_vertices()[0], np.array([0, 0, -1.0]), S.MANUAL)],
+                                    S.SupportParams())
+    a.supports = plan
+    v0 = a.world_vertices().copy()
+    c0 = a.supports.world_contacts(a)[0].point.copy()
+    st0 = a.state()
+    w.part_menu(a.id).actions()[1].trigger()
+    exp = v0.copy()
+    exp[:, 1] = 2 * st0.position[1] - exp[:, 1]
+    def rows(v):                                              # the vertex set, order-free
+        return np.array(sorted(map(tuple, np.round(v, 6))))
+    got = a.world_vertices()
+    assert np.allclose(rows(got), rows(exp)) and not np.allclose(rows(got), rows(v0))
+    assert np.all(a.scale > 0) and np.isclose(np.linalg.det(a.rotation), 1)
+    assert a.world_mesh().volume > 0                          # faces still point out
+    c1 = a.supports.world_contacts(a)[0].point
+    assert np.allclose(c1, [c0[0], 2 * st0.position[1] - c0[1], c0[2]])
+    assert w.undo.text(w.undo.index() - 1) == "Mirror Y"
+    w.undo.undo()
+    assert np.allclose(a.world_vertices(), v0) and a.supports is plan
+    a.supports = None
     w.close()

@@ -271,3 +271,188 @@ def test_front_label(app, win):
     pump(app)
     q = vp.front_label_quad()
     assert q[0].x() > q[1].x() and max(p.y() for p in q) < project(vp, [0, -sy / 2, 0]).y()
+
+
+def test_islands_drawn_red(app, win, tmp_path):
+    import trimesh
+    m = trimesh.creation.box((20, 20, 4))
+    m.apply_translation((0, 0, 12))
+    vp = win.viewport
+    vp.set_view(-90, 89)                       # from above, onto a red surface (no part in the scene)
+    pump(app)
+    pt = project(vp, [0, 0, 10])
+
+    def px():
+        img = vp.grabFramebuffer()
+        dpr = img.devicePixelRatio()
+        return img.pixelColor(int(pt.x() * dpr), int(pt.y() * dpr))
+    vp.island_meshes = [m.submesh([np.flatnonzero(m.face_normals[:, 2] > 0.5)], append=True)]
+    vp.update()
+    pump(app)
+    c = px()
+    assert c.red() > 120 and c.red() > 2 * c.green() and c.red() > 2 * c.blue()
+    vp.island_meshes = []
+    vp.update()
+    pump(app)
+    assert px().red() < 120
+
+
+def test_island_guides_reach_the_edge():
+    from gooslicer_qt.viewport import island_guides
+    seg = island_guides([[10, 0, 5], [0, 0, 2], [-30, 20, 7], [80, 0, 1]], (100, 60, 200))
+    assert seg.shape == (6, 3)                      # the point outside the build area gets none
+    assert np.allclose(seg[0:2], [[10, 0, 5], [50, 0, 5]])
+    assert np.allclose(seg[2:4], [[0, 0, 2], [0, -30, 2]])   # at the centre: toward the front
+    a, b = seg[4:6]
+    assert np.isclose(b[2], 7) and (np.isclose(abs(b[0]), 50) or np.isclose(abs(b[1]), 30))
+    assert np.isclose(a[0] * b[1] - a[1] * b[0], 0) and b[0] < a[0] < 0   # straight out from the centre
+
+
+def test_plate_see_through_and_supports_half_transparent(app, win):
+    import trimesh
+    from gooslicer_qt.viewport import island_guides
+    vp = win.viewport
+    vp.set_view(-90, 89)
+    pump(app)
+    sy = float(win.scene.size[1])
+    # the plate between grid lines shows the background: no solid floor
+    img = vp.grabFramebuffer()
+    dpr = img.devicePixelRatio()
+    pt = project(vp, [2.5, 2.5, 0])
+    c = img.pixelColor(int(pt.x() * dpr), int(pt.y() * dpr))
+    assert abs(c.redF() - 0.16) < 0.03 and abs(c.greenF() - 0.17) < 0.03 and abs(c.blueF() - 0.19) < 0.03
+
+    # a support over the grid: blended with what is behind it
+    sup = trimesh.creation.box((30, 30, 2))
+    sup.apply_translation((0, 0, 1))
+    vp.extra_meshes = lambda: [(sup, np.eye(4))]
+    vp.update()
+    pump(app)
+    pt = project(vp, [2.5, 2.5, 2])
+
+    def at(p):
+        im = vp.grabFramebuffer()
+        return im.pixelColor(int(p.x() * dpr), int(p.y() * dpr))
+    half = at(pt)
+    assert half.alpha() == 255          # blending keeps the view opaque (the window must not show through)
+    import gooslicer_qt.viewport as V
+    old = V.SUPPORT_ALPHA
+    V.SUPPORT_ALPHA = 1.0
+    vp.update()
+    pump(app)
+    solid = at(pt)
+    V.SUPPORT_ALPHA = old
+    # half of the support's colour plus half of the dark background behind it
+    assert abs(half.blueF() - (solid.blueF() + 0.19) / 2) < 0.04 and half.blueF() < solid.blueF() - 0.15
+    assert solid.blueF() > solid.redF() + 0.3 and solid.blueF() > solid.greenF() + 0.2      # blue supports
+    vp.extra_meshes = lambda: []
+
+    # guide lines: white where nothing hides them
+    vp.island_lines = island_guides([[0, 0, 5]], win.scene.size)
+    vp.update()
+    pump(app)
+    mid = project(vp, [0, -sy / 4, 5])
+    img = vp.grabFramebuffer()
+    best = max(min(img.pixelColor(int(mid.x() * dpr) + dx, int(mid.y() * dpr) + dy).getRgb()[:3])
+               for dx in range(-2, 3) for dy in range(-2, 3))
+    assert best > 220
+    vp.island_lines = np.zeros((0, 3))
+
+
+def _ring_point(vp, axis, deg):
+    from gooslicer_qt.viewport import RING_BASIS
+    c, r = vp.rings()
+    u, w = RING_BASIS[axis]
+    t = np.radians(deg)
+    return project(vp, c + r * (np.cos(t) * u + np.sin(t) * w))
+
+
+def test_rotation_rings(app, win, tmp_path):
+    from gooslicer.scene import rotation_matrix
+    assert wait_import(app, win, [box_file(tmp_path, (30, 10, 6))]) == 1
+    vp = win.viewport
+    p = win.scene.parts[0]
+    win.select([])
+    pump(app)
+    assert vp.rings() is None                                   # only around a selection
+    win.select([p.id])
+    vp.set_view(-90, 89)                                        # top view: the Z ring is a circle
+    pump(app)
+    c, r = vp.rings()
+    assert r >= 0.5 * np.linalg.norm(p.size())
+    assert vp.ring_at(_ring_point(vp, 2, 45)) == 2
+    assert vp.ring_at(QPointF(4, vp.height() - 4)) is None      # away from every ring
+    # hovering shows it can be grabbed
+    mouse(vp, QEvent.MouseMove, _ring_point(vp, 2, 45), Qt.NoButton, Qt.NoButton)
+    assert vp._ring_hover == 2
+    # drag 47° round the Z ring: turns 45° (5° steps) about Z, one undo step
+    before = p.state()
+    n0 = win.undo.index()
+    mouse(vp, QEvent.MouseButtonPress, _ring_point(vp, 2, 45))
+    pts = [_ring_point(vp, 2, 45 + k) for k in range(0, 48, 4)] + [_ring_point(vp, 2, 92)]
+    for q in pts:
+        mouse(vp, QEvent.MouseMove, q)
+    assert vp._rot["deg"] == 45.0
+    mouse(vp, QEvent.MouseButtonRelease, pts[-1])
+    assert vp._rot is None and win.undo.index() == n0 + 1 and win.undo.text(n0) == "Rotate Z +45°"
+    assert np.allclose(p.rotation, rotation_matrix([0, 0, 1], 45) @ before.rotation)
+    assert np.allclose(p.position[:2], before.position[:2])     # turned about its own centre
+    assert abs(p.bounds()[0][2]) < 1e-6                         # still on the plate
+    win.undo.undo()
+    assert p.state() == before
+    # backwards past zero
+    mouse(vp, QEvent.MouseButtonPress, _ring_point(vp, 2, 45))
+    for k in range(0, 31, 3):
+        mouse(vp, QEvent.MouseMove, _ring_point(vp, 2, 45 - k))
+    mouse(vp, QEvent.MouseButtonRelease, _ring_point(vp, 2, 15))
+    assert win.undo.text(win.undo.index() - 1) == "Rotate Z -30°"
+    win.undo.undo()
+    # from above, the X and Y rings are edge-on (lines across the part): hidden, and the middle
+    # of the part moves it as before
+    assert not vp.ring_visible(0, c) and not vp.ring_visible(1, c) and vp.ring_visible(2, c)
+    assert vp.ring_at(project(vp, c)) is None
+    # from an angle the X ring can be grabbed; it turns in 5° steps about X
+    vp.set_view(-60, 25)
+    pump(app)
+    a = _ring_point(vp, 0, 60)
+    assert vp.ring_visible(0, c) and vp.ring_at(a) == 0
+    mouse(vp, QEvent.MouseButtonPress, a)
+    for k in range(0, 33, 4):
+        mouse(vp, QEvent.MouseMove, _ring_point(vp, 0, 60 + k))
+    deg = vp._rot["deg"]
+    mouse(vp, QEvent.MouseButtonRelease, _ring_point(vp, 0, 92))
+    assert 25 <= deg <= 35 and deg % 5 == 0
+    assert np.allclose(p.rotation, rotation_matrix([1, 0, 0], deg) @ before.rotation)
+    win.undo.undo()
+    # a part's support mode hides the rings
+    vp.start_support_mode()
+    assert vp.rings() is None
+    vp.stop_support_mode()
+
+
+def test_right_click_menu_on_a_part(app, win, tmp_path, monkeypatch):
+    assert wait_import(app, win, [box_file(tmp_path, (16, 8, 6))]) == 1
+    vp = win.viewport
+    p = win.scene.parts[0]
+    win.select([])
+    vp.set_view(-90, 89)
+    pump(app)
+    asked = []
+    vp.partContextMenu.connect(lambda pid, gpos: asked.append(pid))
+    shown = []
+    monkeypatch.setattr(win, "_popup_menu", lambda menu, pos: shown.append([x.text() for x in menu.actions()]))
+    at = project(vp, p.bounds().mean(axis=0))
+    mouse(vp, QEvent.MouseButtonPress, at, Qt.RightButton)
+    mouse(vp, QEvent.MouseButtonRelease, at, Qt.RightButton, Qt.NoButton)
+    assert asked == [p.id] and win.selected_ids() == [p.id]
+    assert shown == [["Add instance", "Mirror"]]
+    # a right drag orbits and opens nothing
+    yaw = vp.camera.yaw
+    mouse(vp, QEvent.MouseButtonPress, at, Qt.RightButton)
+    mouse(vp, QEvent.MouseMove, QPointF(at.x() + 30, at.y()), Qt.RightButton)
+    mouse(vp, QEvent.MouseButtonRelease, QPointF(at.x() + 30, at.y()), Qt.RightButton, Qt.NoButton)
+    assert len(asked) == 1 and vp.camera.yaw != yaw
+    # off the parts: nothing
+    mouse(vp, QEvent.MouseButtonPress, QPointF(5, 5), Qt.RightButton)
+    mouse(vp, QEvent.MouseButtonRelease, QPointF(5, 5), Qt.RightButton, Qt.NoButton)
+    assert len(asked) == 1

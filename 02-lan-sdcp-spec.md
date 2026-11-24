@@ -266,7 +266,7 @@ Printer: Saturn 4 Ultra 16K, firmware V1.5.6, ProtocolVersion V3.0.0. Raw captur
   - A cancel flag is polled before each 1 MiB chunk.
   - On cancel, the session sends Cmd 255 with the transfer `Uuid` so the printer drops the partial file. [INFERRED from §3; not exercised on hardware]
 - **`gooslicer_qt/printers.py`**:
-  - Printer control, at the top of the Print settings tab: find printers or add one by IP, with a red banner and connection refused for printers below V3.
+  - Printer control, at the top of the Printer settings tab: find printers or add one by IP, with a red banner and connection refused for printers below V3.
   - Live state, layer, progress, remaining time and temperatures.
   - Pause/Resume and Stop; a file list with Print and Delete; "Send .goo…" with progress and Cancel.
   - The File menu has "Slice and send to printer" (Ctrl+Shift+R).

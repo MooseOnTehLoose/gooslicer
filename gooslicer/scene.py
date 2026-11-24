@@ -204,6 +204,32 @@ class Scene:
             self.drop_to_plate(p)
         return bool(np.all(total <= self.size[:2] + 1e-9))
 
+    def place_free(self, part: Part, near=None, spacing: float = 3.0, step: float = 1.0) -> bool:
+        """Move `part` (XY only) to the free spot on the plate nearest `near` (default: where it
+        is), keeping `spacing` mm from the other parts' footprints. False if none fits."""
+        lo, hi = part.bounds()
+        half = (hi - lo)[:2] / 2
+        centre = (lo + hi)[:2] / 2
+        target = centre if near is None else np.asarray(near, float)[:2]
+        others = [o.bounds() for o in self.parts if o is not part]
+        lim = self.size[:2] / 2 - half
+        if np.any(lim < 0):
+            return False
+        xs = np.arange(-lim[0], lim[0] + 1e-9, step)
+        ys = np.arange(-lim[1], lim[1] + 1e-9, step)
+        gx, gy = np.meshgrid(xs, ys)
+        cand = np.column_stack([gx.ravel(), gy.ravel()])
+        ok = np.ones(len(cand), bool)
+        for olo, ohi in others:
+            ok &= ~((np.abs(cand[:, 0] - (olo[0] + ohi[0]) / 2) < half[0] + (ohi[0] - olo[0]) / 2 + spacing)
+                    & (np.abs(cand[:, 1] - (olo[1] + ohi[1]) / 2) < half[1] + (ohi[1] - olo[1]) / 2 + spacing))
+        if not ok.any():
+            return False
+        cand = cand[ok]
+        best = cand[np.argmin(np.linalg.norm(cand - target, axis=1))]
+        part.position[:2] += best - centre
+        return True
+
     def pick(self, origin, direction) -> tuple[Part | None, int, np.ndarray | None]:
         """Nearest part hit by a world-space ray: (part, local face index, world point)."""
         best = (None, -1, None, np.inf)

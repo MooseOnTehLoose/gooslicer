@@ -761,6 +761,9 @@ class Island:
     point: np.ndarray       # a point inside it on that layer (x, y, z)
     area: float             # largest area (mm²) while still unconnected
     height: float = 0.0     # how far it hangs (mm) before joining grounded material
+    # where it is, for showing it: (x0, y0, pixel, mask) — mask[r, c] covers the pixel centred
+    # at (x0 + (c + 0.5) * pixel, y0 + (r + 0.5) * pixel), every layer it hangs on together
+    footprint: tuple | None = field(default=None, repr=False, compare=False)
 
 
 # An island is only reported when it hangs longer or grows larger than this. Below both, the
@@ -807,6 +810,7 @@ def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.0
     ground = None                   # grounded pixels of the previous layer
     ids = None                      # island id per ungrounded pixel of the previous layer (0 = none)
     found: list[Island] = []        # every ungrounded region, indexed by id - 1
+    cells: list[list[np.ndarray]] = []   # flat pixel indices per island, every layer
     while z < zmax:
         polys = [np.asarray(q, float) for q in body.slice(z).to_polygons() if len(q) >= 3]
         cur = rasterize_bitmap(polys, spec) > 0 if polys else np.zeros((spec.res_y, spec.res_x), bool)
@@ -833,19 +837,66 @@ def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.0
                         x = spec.ox + (cc[j] + 0.5) * pixel
                         y = spec.oy + (rr[j] + 0.5) * pixel
                         found.append(Island(float(z), np.array([x, y, z]), 0.0))
+                        cells.append([])
                         i = len(found)
                     else:
                         continue
                     isl = found[i - 1]
                     isl.area = max(isl.area, float(sz * px2))
                     isl.height = float(z - isl.z + h)
+                    cells[i - 1].append(np.flatnonzero(m))
                     new_ids[m] = i
             ground, ids = np.isin(lab, g), new_ids
         z += h
         if z < zmin - h:            # skip empty air below the body (nothing to ground or track)
             n_skip = int((zmin - h - z) / h)
             z += n_skip * h
-    return [i for i in found if i.height > max_hang + 1e-9 or i.area >= max_area]
+    out = []
+    for isl, cl in zip(found, cells):
+        if not (isl.height > max_hang + 1e-9 or isl.area >= max_area):
+            continue
+        rr, cc = np.divmod(np.unique(np.concatenate(cl)), spec.res_x)
+        mask = np.zeros((rr.max() - rr.min() + 1, cc.max() - cc.min() + 1), bool)
+        mask[rr - rr.min(), cc - cc.min()] = True
+        isl.footprint = (spec.ox + cc.min() * pixel, spec.oy + rr.min() * pixel, pixel, mask)
+        out.append(isl)
+    return out
+
+
+def island_faces(meshes: list[trimesh.Trimesh], islands: list[Island],
+                 layer_height: float = 0.05) -> list[np.ndarray]:
+    """Per mesh (world coordinates), the faces that make up the islands' unsupported surface:
+    downward-facing faces over each island's footprint (two pixels of slack) within the height
+    it hangs. An island too small to catch such a face gets the faces nearest its point."""
+    from scipy import ndimage
+    sels = [np.zeros(len(m.faces), bool) for m in meshes]
+    cens = [m.triangles_center if len(m.faces) else np.zeros((0, 3)) for m in meshes]
+    for isl in islands:
+        hits = []
+        for m, cen in zip(meshes, cens):
+            hit = np.zeros(len(cen), bool)
+            if isl.footprint is not None and len(cen):
+                x0, y0, px, mask = isl.footprint
+                grown = ndimage.binary_dilation(mask, iterations=2, border_value=0)
+                grown = np.pad(grown, 2)
+                c = np.floor((cen[:, 0] - x0) / px).astype(int) + 2
+                r = np.floor((cen[:, 1] - y0) / px).astype(int) + 2
+                ok = ((cen[:, 2] >= isl.z - 2 * layer_height)
+                      & (cen[:, 2] <= isl.z + isl.height + layer_height)
+                      & (m.face_normals[:, 2] < -0.05)
+                      & (c >= 0) & (r >= 0) & (c < grown.shape[1]) & (r < grown.shape[0]))
+                hit[ok] = grown[r[ok], c[ok]]
+            hits.append(hit)
+        if not any(h.any() for h in hits):
+            ds = [np.linalg.norm(cen - isl.point, axis=1) for cen in cens]
+            reach = max(np.sqrt(isl.area), 0.5) + 2 * layer_height
+            hits = [d <= reach for d in ds]
+            if not any(h.any() for h in hits) and any(len(d) for d in ds):
+                best = min(float(d.min()) for d in ds if len(d))
+                hits = [d == best for d in ds]
+        for sel, hit in zip(sels, hits):
+            sel |= hit
+    return sels
 
 
 # ------------------------------------------------------------------------- auto support

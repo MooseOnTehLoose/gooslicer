@@ -89,3 +89,52 @@ class MeshCommand(QUndoCommand):
 
     def undo(self):
         self._apply(*self.old)
+
+
+def mirrored(part: Part, axis: int = 1):
+    """(mesh, state, supports) of `part` mirrored across the world plane through its position
+    perpendicular to `axis`. The stored mesh is mirrored along local Y and the rotation becomes
+    Mw·R·My (a proper rotation again), so scale stays positive: Mw·(R·S·v) = (Mw·R·My)·S·(My·v)."""
+    import dataclasses
+
+    import numpy as np
+    import trimesh
+    my = np.array([1.0, -1.0, 1.0])
+    mw = np.ones(3)
+    mw[axis] = -1.0
+    v = np.asarray(part.mesh.vertices) * my
+    mesh = trimesh.Trimesh(v, np.asarray(part.mesh.faces)[:, ::-1], process=False)  # keep outward faces
+    st = part.state()
+    st.rotation = np.diag(mw) @ part.rotation @ np.diag(my)
+    sup = part.supports
+    if sup is not None:
+        sup = dataclasses.replace(sup, points=np.asarray(sup.points) * my, normals=np.asarray(sup.normals) * my)
+    return mesh, st, sup
+
+
+class MirrorCommand(QUndoCommand):
+    """Mirror a part (geometry, placement and supports) across a world axis plane."""
+
+    def __init__(self, win, pid: int, axis: int = 1, text: str = "Mirror"):
+        super().__init__(text)
+        p = win.scene.get(pid)
+        self.win, self.pid = win, pid
+        self.old = (p.mesh, p.state(), p.supports)
+        self.new = mirrored(p, axis)
+        rep = win.reports.get(id(p.mesh))
+        if rep is not None:                       # same checks result: a mirror image
+            win.reports[id(self.new[0])] = rep
+
+    def _apply(self, mesh, state, supports):
+        p = self.win.scene.get(self.pid)
+        if p is None:
+            return
+        p.mesh, p.supports = mesh, supports
+        p.set_state(state)
+        self.win.scene_changed(mesh_changed=self.pid)
+
+    def redo(self):
+        self._apply(*self.new)
+
+    def undo(self):
+        self._apply(*self.old)

@@ -14,7 +14,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF, QSurfaceForm
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from gooslicer.camera import OrbitCamera, axis_gizmo, ray_plane
-from gooslicer.scene import Part, PartState, Scene
+from gooslicer.scene import Part, PartState, Scene, rotation_matrix
 
 MESH_VS = """#version 330 core
 layout(location=0) in vec3 pos;
@@ -25,12 +25,12 @@ void main(){ vN = normalize(nmat * nrm); gl_Position = mvp * vec4(pos, 1.0); }
 """
 MESH_FS = """#version 330 core
 in vec3 vN; out vec4 frag;
-uniform vec3 color; uniform vec3 lightA; uniform vec3 lightB;
+uniform vec3 color; uniform vec3 lightA; uniform vec3 lightB; uniform float alpha;
 void main(){
   vec3 n = normalize(vN);
-  if (!gl_FrontFacing) { frag = vec4(0.85, 0.15, 0.55, 1.0); return; }  // inside/back faces
+  if (!gl_FrontFacing) { frag = vec4(0.85, 0.15, 0.55, alpha); return; }  // inside/back faces
   float d = 0.30 + 0.55 * max(dot(n, lightA), 0.0) + 0.25 * max(dot(n, lightB), 0.0);
-  frag = vec4(color * d, 1.0);
+  frag = vec4(color * d, alpha);
 }
 """
 LINE_VS = """#version 330 core
@@ -45,7 +45,28 @@ void main(){ frag = color; }
 COL_PART = (0.55, 0.70, 0.78)
 COL_SELECTED = (0.98, 0.62, 0.20)
 COL_OUTSIDE = (0.90, 0.25, 0.22)
-COL_SUPPORT = (0.78, 0.78, 0.70)
+COL_SUPPORT = (0.22, 0.48, 0.96)       # blue, drawn half transparent
+COL_ISLAND = (0.92, 0.16, 0.14)       # unsupported islands, after the island check
+SUPPORT_ALPHA = 0.5                    # supports are see-through, so the model shows behind them
+GUIDE_DIM = 0.35                       # island guide lines where something is in front of them
+
+
+def island_guides(points, size) -> np.ndarray:
+    """Line segments (2 rows each) from each island point outward to the edge of the build
+    area, level with the island: away from the plate centre (an island at the centre points to
+    the front, −Y), so a small island can be found from any side."""
+    hx, hy = float(size[0]) / 2, float(size[1]) / 2
+    out = []
+    for p in points:
+        p = np.asarray(p, float)
+        d = p[:2].copy()
+        n = float(np.hypot(*d))
+        d = d / n if n > 1e-6 else np.array([0.0, -1.0])
+        t = min(hx / abs(d[0]) if abs(d[0]) > 1e-9 else np.inf, hy / abs(d[1]) if abs(d[1]) > 1e-9 else np.inf)
+        end = np.array([d[0] * t, d[1] * t, p[2]])
+        if t > n:                       # inside the build area: draw it
+            out += [p, end]
+    return np.array(out, float).reshape(-1, 3)
 
 
 def default_format() -> QSurfaceFormat:
@@ -141,6 +162,20 @@ COMPASS_RADIUS = 42      # px, logical
 COMPASS_MARGIN = 10
 COMPASS_COLORS = {"X": "#e5534b", "Y": "#7ac74f", "Z": "#4c9be8"}   # the usual red/green/blue
 
+# Rotation rings around the selection: drag one to turn about that axis in ROTATE_STEP steps.
+ROTATE_STEP = 5.0         # degrees
+RING_GRAB_PX = 8.0        # how close to a ring a press must be to grab it
+RING_SEGMENTS = 120
+RING_EDGE_ON = 0.17       # |cos| between view and axis below which a ring (seen edge-on) is hidden
+# per axis: the plane the ring lies in (u, w), with u × w = the axis (positive turn takes u to w)
+RING_BASIS = {0: (np.array([0.0, 1, 0]), np.array([0.0, 0, 1])),
+              1: (np.array([0.0, 0, 1]), np.array([1.0, 0, 0])),
+              2: (np.array([1.0, 0, 0]), np.array([0.0, 1, 0]))}
+
+
+def snap_angle(deg: float, step: float = ROTATE_STEP) -> float:
+    return float(np.round(deg / step) * step) + 0.0
+
 
 class Viewport(QOpenGLWidget):
     selectionChanged = Signal(list)                # [part ids]
@@ -151,6 +186,8 @@ class Viewport(QOpenGLWidget):
     supportClicked = Signal(object, object, bool)  # ray origin, ray direction, remove (Ctrl)
     supportModeEnded = Signal()
     filesDropped = Signal(list)
+    rotateFinished = Signal(object, str)           # {id: (before, after)}, undo text
+    partContextMenu = Signal(int, object)          # part id, global QPoint (right click on a part)
 
     def __init__(self, scene: Scene, parent=None):
         super().__init__(parent)
@@ -166,7 +203,16 @@ class Viewport(QOpenGLWidget):
         self.support_mode = False
         self.show_compass = True
         self.show_front = True
+        self.show_rings = True                     # rotation rings around the selection
+        self._rot = None                           # an active ring drag
+        self._ring_hover = None                    # axis index under the mouse
+        self._rpress = None                        # right-button press: a click opens the part menu
+        self.setMouseTracking(True)
         self.extra_meshes = lambda: []             # [(trimesh, 4x4 world matrix)] drawn as supports
+        self.island_meshes: list = []              # world-space trimeshes drawn red over the model
+        self.island_lines = np.zeros((0, 3))       # segments from each island to the build area's edge
+        self._guide_buf = None
+        self._guide_src = None
         self._buffers: dict[int, tuple[object, _Buffer]] = {}  # id(mesh) -> (mesh, buffer)
         self._plate: tuple | None = None
         self._plate_size = None
@@ -217,6 +263,9 @@ class Viewport(QOpenGLWidget):
         for _, b in self._buffers.values():
             b.delete()
         self._buffers.clear()
+        if self._guide_buf is not None:
+            self._guide_buf.delete()
+            self._guide_buf, self._guide_src = None, None
         if self._plate:
             for b in self._plate:
                 b.delete()
@@ -227,6 +276,7 @@ class Viewport(QOpenGLWidget):
         live = {id(p.mesh): p.mesh for p in self.scene.parts}
         self._extras = list(self.extra_meshes())
         live.update({id(m): m for m, _ in self._extras})
+        live.update({id(m): m for m in self.island_meshes})
         for k in [k for k in self._buffers if k not in live]:
             self._buffers.pop(k)[1].delete()
         for k, m in live.items():
@@ -257,10 +307,7 @@ class Viewport(QOpenGLWidget):
         GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._line_prog, "mvp"), 1, GL.GL_TRUE,
                               vp.astype(np.float32))
         loc = GL.glGetUniformLocation(self._line_prog, "color")
-        quad, grid, box = self._plate
-        GL.glUniform4f(loc, 0.24, 0.25, 0.28, 1.0)
-        GL.glBindVertexArray(quad.vao)
-        GL.glDrawArrays(GL.GL_TRIANGLES, 0, quad.count)
+        _quad, grid, box = self._plate                # the plate itself is see-through: grid only
         GL.glUniform4f(loc, 0.33, 0.35, 0.39, 1.0)
         GL.glBindVertexArray(grid.vao)
         GL.glDrawArrays(GL.GL_LINES, 0, grid.count)
@@ -276,6 +323,8 @@ class Viewport(QOpenGLWidget):
         u_mvp = GL.glGetUniformLocation(self._mesh_prog, "mvp")
         u_n = GL.glGetUniformLocation(self._mesh_prog, "nmat")
         u_c = GL.glGetUniformLocation(self._mesh_prog, "color")
+        u_alpha = GL.glGetUniformLocation(self._mesh_prog, "alpha")
+        GL.glUniform1f(u_alpha, 1.0)
         for p in self.scene.parts:
             M = p.matrix()
             GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
@@ -290,13 +339,44 @@ class Viewport(QOpenGLWidget):
             GL.glBindVertexArray(b.vao)
             GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
         GL.glFrontFace(GL.GL_CCW)
-        GL.glUniform3f(u_c, *COL_SUPPORT)
-        for m, M in self._extras:
-            GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
+        if self.island_meshes:
+            # the unsupported surface, drawn over the part's own faces (same depth): pulled forward
+            GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, vp.astype(np.float32))
             GL.glUniformMatrix3fv(u_n, 1, GL.GL_TRUE, np.eye(3, dtype=np.float32))
-            b = self._buffers[id(m)][1]
-            GL.glBindVertexArray(b.vao)
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
+            GL.glUniform3f(u_c, *COL_ISLAND)
+            GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
+            GL.glPolygonOffset(-1.0, -2.0)
+            GL.glDepthFunc(GL.GL_LEQUAL)
+            for m in self.island_meshes:
+                b = self._buffers[id(m)][1]
+                GL.glBindVertexArray(b.vao)
+                GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
+            GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
+            GL.glDepthFunc(GL.GL_LESS)
+        self._draw_guides(vp)
+        if self._extras:
+            # supports: half transparent, front faces only (no inside faces showing through),
+            # without writing depth so the model and other supports stay visible behind them
+            GL.glUseProgram(self._mesh_prog)
+            GL.glUniform3f(u_c, *COL_SUPPORT)
+            GL.glUniform1f(u_alpha, SUPPORT_ALPHA)
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)  # stays opaque
+            GL.glEnable(GL.GL_CULL_FACE)
+            GL.glCullFace(GL.GL_BACK)
+            GL.glDepthMask(GL.GL_FALSE)
+            for m, M in self._extras:
+                GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
+                GL.glUniformMatrix3fv(u_n, 1, GL.GL_TRUE, np.linalg.inv(M[:3, :3]).T.astype(np.float32))
+                GL.glFrontFace(GL.GL_CW if np.linalg.det(M[:3, :3]) < 0 else GL.GL_CCW)
+                b = self._buffers[id(m)][1]
+                GL.glBindVertexArray(b.vao)
+                GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
+            GL.glFrontFace(GL.GL_CCW)
+            GL.glDepthMask(GL.GL_TRUE)
+            GL.glDisable(GL.GL_CULL_FACE)
+            GL.glDisable(GL.GL_BLEND)
+            GL.glUniform1f(u_alpha, 1.0)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
         painter = QPainter(self)
@@ -305,8 +385,42 @@ class Viewport(QOpenGLWidget):
                 self._draw_front(painter, vp, w, h)
             if self.show_compass:
                 self._draw_compass(painter)
+            self._draw_rings(painter, vp, w, h)
         finally:
             painter.end()
+
+    def _draw_guides(self, vp) -> None:
+        """White lines from each unsupported island to the edge of the build area: solid where
+        visible, dimmer where the model is in front, so they can always be followed."""
+        if self._guide_src is not self.island_lines:
+            if self._guide_buf is not None:
+                self._guide_buf.delete()
+            self._guide_buf = _Buffer(self.island_lines, False) if len(self.island_lines) else None
+            self._guide_src = self.island_lines
+        if self._guide_buf is None:
+            return
+        GL.glUseProgram(self._line_prog)
+        u_mvp = GL.glGetUniformLocation(self._line_prog, "mvp")
+        loc = GL.glGetUniformLocation(self._line_prog, "color")
+        GL.glBindVertexArray(self._guide_buf.vao)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)  # stays opaque
+        GL.glDepthMask(GL.GL_FALSE)
+        # core GL draws 1 px lines only: thicken by drawing again shifted a pixel on screen
+        px, py = 2.0 / max(self.width(), 1), 2.0 / max(self.height(), 1)
+        shifts = [np.eye(4) for _ in range(5)]
+        for T, (dx, dy) in zip(shifts, ((0, 0), (px, 0), (-px, 0), (0, py), (0, -py))):
+            T[0, 3], T[1, 3] = dx, dy        # clip-space shift by w·d = a constant NDC shift
+        for func, alpha in ((GL.GL_GREATER, GUIDE_DIM), (GL.GL_LEQUAL, 1.0)):   # hidden part dimmed
+            GL.glDepthFunc(func)
+            GL.glUniform4f(loc, 1.0, 1.0, 1.0, alpha)
+            for T in (shifts if alpha == 1.0 else shifts[:1]):
+                GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (T @ vp).astype(np.float32))
+                GL.glDrawArrays(GL.GL_LINES, 0, self._guide_buf.count)
+        GL.glDepthFunc(GL.GL_LESS)
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glDisable(GL.GL_BLEND)
+        GL.glUseProgram(self._mesh_prog)
 
     def front_label_quad(self, vp=None, w=None, h=None) -> list[QPointF] | None:
         """Screen corners (top-left, top-right, bottom-right, bottom-left) of the FRONT label,
@@ -355,6 +469,174 @@ class Viewport(QOpenGLWidget):
         p.drawText(src, Qt.AlignCenter, FRONT_TEXT)
         p.restore()
 
+    # ------------------------------------------------------------ rotation rings
+    def rings(self):
+        """(centre, radius) of the rotation rings around the selection, or None."""
+        if not self.show_rings or self.support_mode or self.hole_mode or self.lay_flat_mode:
+            return None
+        parts = [p for p in (self.scene.get(i) for i in self.selected) if p]
+        if not parts:
+            return None
+        if self._rot is not None:
+            return self._rot["centre"], self._rot["radius"]
+        b = np.array([p.bounds() for p in parts])
+        lo, hi = b[:, 0].min(axis=0), b[:, 1].max(axis=0)
+        return (lo + hi) / 2, max(0.55 * float(np.linalg.norm(hi - lo)), 4.0)
+
+    def ring_visible(self, axis: int, centre) -> bool:
+        """Seen nearly edge-on a ring is a line across the part: hidden, so it neither hides the
+        part nor takes the clicks meant for moving it (turn about that axis from another view)."""
+        to_eye = self.camera.eye() - centre
+        n = float(np.linalg.norm(to_eye))
+        return n < 1e-9 or abs(float(to_eye[axis])) / n >= RING_EDGE_ON
+
+    def ring_points(self, axis: int, centre, radius, n: int = RING_SEGMENTS) -> np.ndarray:
+        t = np.linspace(0, 2 * np.pi, n + 1)
+        u, w = RING_BASIS[axis]
+        return centre + radius * (np.cos(t)[:, None] * u + np.sin(t)[:, None] * w)
+
+    def _screen(self, pts, vp=None):
+        """Screen positions (N, 2) of world points, and which are in front of the camera."""
+        w, h = max(self.width(), 1), max(self.height(), 1)
+        if vp is None:
+            vp = self.camera.projection(w / h) @ self.camera.view()
+        c = np.c_[pts, np.ones(len(pts))] @ vp.T
+        ok = c[:, 3] > 1e-6
+        ww = np.where(ok, c[:, 3], 1.0)
+        xy = np.c_[(c[:, 0] / ww + 1) * w / 2, (1 - c[:, 1] / ww) * h / 2]
+        return xy, ok
+
+    def ring_at(self, pos) -> int | None:
+        """The ring (axis index) within RING_GRAB_PX of a screen position, nearest first."""
+        g = self.rings()
+        if g is None:
+            return None
+        q = np.array([pos.x(), pos.y()])
+        best = None
+        for axis in range(3):
+            if not self.ring_visible(axis, g[0]):
+                continue
+            xy, ok = self._screen(self.ring_points(axis, *g))
+            a, b = xy[:-1], xy[1:]
+            keep = ok[:-1] & ok[1:]
+            if not keep.any():
+                continue
+            a, b = a[keep], b[keep]
+            ab = b - a
+            t = np.clip(np.einsum("ij,ij->i", q - a, ab) / np.maximum(np.einsum("ij,ij->i", ab, ab), 1e-9), 0, 1)
+            d = float(np.min(np.linalg.norm(a + ab * t[:, None] - q, axis=1)))
+            if d <= RING_GRAB_PX and (best is None or d < best[0]):
+                best = (d, axis)
+        return None if best is None else best[1]
+
+    def _ring_angle(self, axis: int, pos):
+        """Angle (deg) of the mouse around the ring's axis, in the ring's plane; None when the
+        ring is seen edge-on (then dragging along it is used instead)."""
+        centre = self._rot["centre"]
+        o, d = self._ray(pos)
+        n = np.eye(3)[axis]
+        if abs(float(np.dot(d, n))) < 0.12:
+            return None
+        hit = ray_plane(o, d, centre, n)
+        if hit is None:
+            return None
+        u, w = RING_BASIS[axis]
+        v = hit - centre
+        return float(np.degrees(np.arctan2(np.dot(v, w), np.dot(v, u))))
+
+    def _start_rotate(self, axis: int, pos) -> None:
+        centre, radius = self.rings()
+        parts = [p for p in (self.scene.get(i) for i in self.selected) if p]
+        self._rot = {"axis": axis, "centre": centre, "radius": radius, "parts": parts,
+                     "before": {p.id: p.state() for p in parts}, "press": np.array([pos.x(), pos.y()]),
+                     "raw": 0.0, "deg": 0.0, "pos": pos}
+        a = self._ring_angle(axis, pos)
+        self._rot["last"] = a
+        if a is None:
+            # edge-on: degrees from dragging along the ring's on-screen direction at the grab point
+            pts = self.ring_points(axis, centre, radius, 720)
+            xy, _ = self._screen(pts)
+            i = int(np.argmin(np.linalg.norm(xy - self._rot["press"], axis=1)))
+            tan = (xy[(i + 1) % 720] - xy[i]) * 2.0                    # px per degree (0.5° steps)
+            self._rot["tangent"] = tan if np.dot(tan, tan) > 1e-6 else np.array([1.0, 0.0])
+        self.setCursor(Qt.ClosedHandCursor)
+
+    def _drag_rotate(self, pos) -> None:
+        r = self._rot
+        r["pos"] = pos
+        if r["last"] is None:
+            t = r["tangent"]
+            r["raw"] = float(np.dot(np.array([pos.x(), pos.y()]) - r["press"], t) / np.dot(t, t))
+        else:
+            a = self._ring_angle(r["axis"], pos)
+            if a is not None:
+                r["raw"] += (a - r["last"] + 180.0) % 360.0 - 180.0      # unwrapped
+                r["last"] = a
+        deg = snap_angle(r["raw"])
+        if deg == r["deg"]:
+            return
+        r["deg"] = deg
+        R = rotation_matrix(np.eye(3)[r["axis"]], deg)
+        for p in r["parts"]:
+            b = r["before"][p.id]
+            p.rotation = R @ b.rotation
+            p.position = r["centre"] + R @ (b.position - r["centre"])
+            self.scene.drop_to_plate(p)
+        self.update()
+
+    def _end_rotate(self) -> None:
+        r, self._rot = self._rot, None
+        self.unsetCursor()
+        changes = {p.id: (r["before"][p.id], p.state()) for p in r["parts"]
+                   if p.state() != r["before"][p.id]}
+        self.update()
+        if changes:
+            self.rotateFinished.emit(changes, f"Rotate {'XYZ'[r['axis']]} {r['deg']:+g}°")
+
+    def _draw_rings(self, p: QPainter, vp, w, h) -> None:
+        g = self.rings()
+        if g is None:
+            return
+        centre, radius = g
+        eye = self.camera.eye()
+        to_eye = (eye - centre) / max(np.linalg.norm(eye - centre), 1e-9)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        active = self._rot["axis"] if self._rot else None
+        for back in (True, False):                      # the far half first, dimmer
+            for axis in range(3):
+                if active is not None and axis != active:
+                    continue
+                if active is None and not self.ring_visible(axis, centre):
+                    continue
+                pts = self.ring_points(axis, centre, radius)
+                xy, ok = self._screen(pts, vp)
+                facing = (pts - centre) @ to_eye >= 0
+                col = QColor(COMPASS_COLORS["XYZ"[axis]])
+                hot = axis == active or axis == self._ring_hover
+                if back:
+                    col.setAlpha(110)
+                width = (4.0 if hot else 2.6) if not back else (2.4 if hot else 1.6)
+                p.setPen(QPen(col, width, Qt.SolidLine, Qt.RoundCap))
+                for i in range(len(pts) - 1):
+                    if ok[i] and ok[i + 1] and bool(facing[i]) != back:
+                        p.drawLine(QPointF(*xy[i]), QPointF(*xy[i + 1]))
+        if self._rot is not None:                       # the angle so far, by the cursor
+            r = self._rot
+            font = QFont(self.font())
+            font.setBold(True)
+            p.setFont(font)
+            text = f"{'XYZ'[r['axis']]} {r['deg']:+g}°"
+            at = r["pos"] + QPointF(16, -12)
+            box = p.fontMetrics().boundingRect(text).adjusted(-6, -3, 6, 3)
+            box.moveTopLeft(at.toPoint() - QPointF(6, box.height() - 3).toPoint())
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0x15, 0x17, 0x1a, 215))
+            p.drawRoundedRect(box, 4, 4)
+            p.setPen(QColor(COMPASS_COLORS["XYZ"[r["axis"]]]).lighter(130))
+            p.drawText(box, Qt.AlignCenter, text)
+        p.restore()
+
     def compass_rect(self) -> QRectF:
         """Where the orientation compass sits: the top-right corner."""
         d = 2 * COMPASS_RADIUS
@@ -398,6 +680,13 @@ class Viewport(QOpenGLWidget):
 
     def mousePressEvent(self, e):
         self._last = e.position()
+        if e.button() == Qt.RightButton and not (e.modifiers() & Qt.ShiftModifier):
+            self._rpress = e.position()
+        if e.button() == Qt.LeftButton and not e.modifiers() and self._rot is None:
+            axis = self.ring_at(e.position())
+            if axis is not None:
+                self._start_rotate(axis, e.position())
+                return
         if e.button() == Qt.LeftButton and not (e.modifiers() & Qt.ShiftModifier):
             o, d = self._ray(e.position())
             part, face, hit = self.scene.pick(o, d)
@@ -433,6 +722,21 @@ class Viewport(QOpenGLWidget):
         pos = e.position()
         dx, dy = pos.x() - self._last.x(), pos.y() - self._last.y()
         self._last = pos
+        if self._rot is not None and e.buttons() & Qt.LeftButton:
+            self._drag_rotate(pos)
+            return
+        if not e.buttons():
+            hover = self.ring_at(pos)
+            if hover != self._ring_hover:
+                self._ring_hover = hover
+                if hover is None:
+                    self.unsetCursor()
+                else:
+                    self.setCursor(Qt.OpenHandCursor)
+                self.update()
+            return
+        if self._rpress is not None and (pos - self._rpress).manhattanLength() > 4:
+            self._rpress = None                     # a drag: orbit, not a click
         if self._drag and e.buttons() & Qt.LeftButton:
             o, d = self._ray(pos)
             p = ray_plane(o, d, [0, 0, self._drag["z"]], [0, 0, 1])
@@ -451,6 +755,16 @@ class Viewport(QOpenGLWidget):
             self.update()
 
     def mouseReleaseEvent(self, e):
+        if self._rot is not None and e.button() == Qt.LeftButton:
+            self._end_rotate()
+            return
+        if e.button() == Qt.RightButton and self._rpress is not None:
+            pos, self._rpress = self._rpress, None
+            part, _, _ = self.scene.pick(*self._ray(pos))
+            if part is not None:
+                self.set_selection([part.id])
+                self.partContextMenu.emit(part.id, self.mapToGlobal(pos.toPoint()))
+            return
         if self._drag and e.button() == Qt.LeftButton:
             changes = {p.id: (self._drag["before"][p.id], p.state()) for p in self._drag["parts"]
                        if p.state() != self._drag["before"][p.id]}

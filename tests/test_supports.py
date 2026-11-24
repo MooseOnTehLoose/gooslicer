@@ -201,3 +201,25 @@ def test_tree_arc_reference():
     ground = sum(not pl.on_model for pl in res.pillars)
     assert res.trunks < ground / 2 and res.braces > 0
     assert S.unsupported_islands([arc, res.mesh], 0.05) == []
+
+
+def test_island_faces_mark_only_the_floating_underside():
+    import trimesh
+    from gooslicer import supports as S
+    ground = trimesh.creation.box((10, 10, 2))
+    ground.apply_translation((0, 0, 1))
+    floating = trimesh.creation.box((4, 4, 2))
+    floating.apply_translation((12, 3, 4))
+    isl = S.unsupported_islands([ground, floating])
+    assert len(isl) == 1 and isl[0].footprint is not None
+    x0, y0, px, mask = isl[0].footprint
+    assert abs(mask.sum() * px * px - 16) < 1.5                 # the 4 x 4 mm footprint
+    sel_ground, sel_float = S.island_faces([ground, floating], isl)
+    assert not sel_ground.any()
+    assert sel_float.sum() == 2                                   # the two underside triangles
+    assert np.allclose(floating.triangles_center[sel_float][:, 2], 3.0)
+    # a hanging ball: its whole underside hangs, the top half does not count
+    ball = trimesh.creation.icosphere(3, radius=5)
+    ball.apply_translation((0, 0, 8))
+    (sel,) = S.island_faces([ball], S.unsupported_islands([ball]))
+    assert sel.any() and (ball.face_normals[sel][:, 2] < 0).all()

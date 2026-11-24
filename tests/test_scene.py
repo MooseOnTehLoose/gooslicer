@@ -216,3 +216,19 @@ def test_axis_gizmo_follows_camera_rotation():
     assert front[("Y", 1)][2] < -0.99                                     # +Y points away
     order = [d for *_, d in camera.axis_gizmo(camera.OrbitCamera(yaw=35, pitch=55).view())]
     assert order == sorted(order) and len(order) == 6                    # drawn far to near
+
+
+def test_place_free_finds_the_nearest_gap():
+    import trimesh
+    from gooslicer.scene import Part, Scene
+    sc = Scene(size=(100, 60, 100))
+    a = sc.add(Part.from_mesh("a", trimesh.creation.box((20, 20, 10))))
+    b = Part.from_mesh("b", trimesh.creation.box((20, 20, 10)))
+    sc.add(b)                                         # on top of a, at the centre
+    assert sc.place_free(b, near=[0, 0])
+    (alo, ahi), (blo, bhi) = a.bounds(), b.bounds()
+    gap = np.maximum(blo[:2] - ahi[:2], alo[:2] - bhi[:2]).max()
+    assert 3 - 1e-6 <= gap <= 4 + 1e-6 and sc.in_volume(b)      # right next to it, 3 mm apart
+    big = Part.from_mesh("big", trimesh.creation.box((95, 50, 5)))
+    sc.add(big)
+    assert not sc.place_free(big)                     # no room anywhere

@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QFont, QPainter, QPalette, QPen
+from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QPushButton, QVBoxLayout, QWidget)
+                               QListWidgetItem, QPushButton, QStyle, QStyledItemDelegate,
+                               QStyleOptionViewItem, QVBoxLayout, QWidget)
 
 from gooslicer.mesh import MeshReport
 
@@ -56,12 +57,64 @@ class InfoButton(QAbstractButton):
         p.end()
 
 
+REMOVE_COLOR = "#e5484d"
+REMOVE_SIZE = 16        # px: the clickable square of the red x at the right of each row
+
+
+class _RemoveDelegate(QStyledItemDelegate):
+    """Each row: the model's name, and a red x at the right that removes it."""
+
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+
+    @staticmethod
+    def x_rect(row_rect) -> QRect:
+        r = REMOVE_SIZE
+        return QRect(row_rect.right() - r - 4, row_rect.center().y() - r // 2 + 1, r, r)
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        opt.rect = option.rect.adjusted(0, 0, -(REMOVE_SIZE + 8), 0)   # the name stops short of the x
+        super().paint(painter, opt, index)
+        if option.state & QStyle.State_Selected:                      # carry the highlight under the x
+            painter.fillRect(option.rect.adjusted(option.rect.width() - REMOVE_SIZE - 8, 0, 0, 0),
+                             option.palette.highlight())
+        r = QRectF(self.x_rect(option.rect)).adjusted(4, 4, -4, -4)
+        hot = self.view.hover_row == index.row()
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(REMOVE_COLOR).lighter(125 if hot else 100), 2.4 if hot else 2.0,
+                            Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(r.topLeft(), r.bottomRight())
+        painter.drawLine(r.topRight(), r.bottomLeft())
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        sz = super().sizeHint(option, index)
+        return QSize(sz.width() + REMOVE_SIZE + 8, max(sz.height(), REMOVE_SIZE + 4))
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick) and \
+                self.x_rect(option.rect).contains(event.position().toPoint()):
+            return True                         # not a selection click
+        if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton and \
+                self.x_rect(option.rect).contains(event.position().toPoint()):
+            self.view.removeRequested.emit(index.data(Qt.UserRole))
+            return True
+        return super().editorEvent(event, model, option, index)
+
+
 class PartsList(QListWidget):
     selectionChangedIds = Signal(list)
+    removeRequested = Signal(int)               # part id, from the red x of its row
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setSelectionMode(QListWidget.ExtendedSelection)
+        self.hover_row = -1
+        self.setMouseTracking(True)
+        self.setItemDelegate(_RemoveDelegate(self))
         self.itemSelectionChanged.connect(
             lambda: self.selectionChangedIds.emit([i.data(Qt.UserRole) for i in self.selectedItems()]))
 
@@ -72,9 +125,30 @@ class PartsList(QListWidget):
             warn = "" if scene.in_volume(p) else "  ⚠ outside build volume"
             it = QListWidgetItem(f"{p.name}{warn}")
             it.setData(Qt.UserRole, p.id)
+            it.setToolTip(f"{p.name}{warn}\nThe red x removes it from the build plate")
             self.addItem(it)
             it.setSelected(p.id in selected)
         self.blockSignals(False)
+
+
+    def x_rect(self, row: int) -> QRect:
+        return _RemoveDelegate.x_rect(self.visualRect(self.model().index(row, 0)))
+
+    def mouseMoveEvent(self, e):
+        idx = self.indexAt(e.position().toPoint())
+        row = idx.row() if idx.isValid() and self.x_rect(idx.row()).contains(e.position().toPoint()) else -1
+        if row != self.hover_row:
+            self.hover_row = row
+            self.viewport().setCursor(Qt.PointingHandCursor if row >= 0 else Qt.ArrowCursor)
+            self.viewport().update()
+        super().mouseMoveEvent(e)
+
+    def leaveEvent(self, e):
+        if self.hover_row != -1:
+            self.hover_row = -1
+            self.viewport().unsetCursor()
+            self.viewport().update()
+        super().leaveEvent(e)
 
 
 def _spin(lo, hi, dec=2, suffix=" mm", step=1.0):

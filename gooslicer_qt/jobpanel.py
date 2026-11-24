@@ -1,11 +1,12 @@
-"""Supports and Slicing sections of the Properties tab (below Mesh): pick the support type and
+"""Supports and Slicing sections of the Models tab (below Mesh): pick the support type and
 generate supports, check for unsupported islands, and slice the build area into memory with the
 estimates shown underneath."""
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QComboBox, QFormLayout, QGroupBox, QLabel, QProgressBar, QPushButton,
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
                                QVBoxLayout, QWidget)
 
 from .supporting import recommended_choice, support_choices, support_note, support_params
@@ -34,26 +35,41 @@ class JobPanel(QWidget):
         self.support_note = QLabel()
         self.support_note.setWordWrap(True)
         self.generate_btn = QPushButton("Generate supports")
+        self.remove_btn = QPushButton("Remove supports")
+        self.remove_btn.setToolTip("Remove the supports of the selected parts (all parts if none "
+                                   "is selected); Edit → Undo brings them back")
+        self.islands_btn = QPushButton("Check for unsupported islands")
+        self.fix_btn = QPushButton("Fix islands")
+        self.fix_btn.setToolTip("Check for unsupported islands and add a support under each one "
+                                "(parts without supports get a full set of the type above)")
+        self.islands_result = QLabel()
+        self.islands_result.setWordWrap(True)
+        self.islands_result.hide()
         form = QFormLayout()
         form.addRow("Support type", self.support_type)
         sl.addLayout(form)
         sl.addWidget(self.support_note)
-        sl.addWidget(self.generate_btn)
+        row = QHBoxLayout()
+        row.addWidget(self.generate_btn, 1)
+        row.addWidget(self.remove_btn)
+        sl.addLayout(row)
+        irow = QHBoxLayout()
+        irow.addWidget(self.islands_btn, 1)
+        irow.addWidget(self.fix_btn)
+        sl.addLayout(irow)
+        sl.addWidget(self.islands_result)
 
         # ---- Slicing
         sli = QGroupBox("Slicing")
         vl = QVBoxLayout(sli)
-        self.islands_btn = QPushButton("Check for unsupported islands")
-        self.islands_result = QLabel()
-        self.islands_result.setWordWrap(True)
-        self.islands_result.hide()
         self.slice_btn = QPushButton("Slice")
-        self.slice_btn.setToolTip("Slice everything on the build plate and keep the result in memory: "
-                                  "File → Slice and save, and Slice and send, then use it without slicing again")
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
-        self.progress.setFormat("%p%")
+        self.slice_btn.setToolTip("Slice everything on the build plate and keep the result in memory "
+                                  "for Export and Send to printer")
+        self.export_btn = QPushButton("Export…")
+        self.export_btn.setToolTip("Save the sliced plate held in memory as a .goo file")
+        self.send_btn = QPushButton("Send to printer")
+        self.send_btn.setToolTip("Upload the sliced plate held in memory to the connected printer "
+                                 "and start the print")
         self.status = QLabel()
         self.status.setWordWrap(True)
         self.status.hide()
@@ -66,10 +82,12 @@ class JobPanel(QWidget):
             w.setTextInteractionFlags(Qt.TextSelectableByMouse)
             rf.addRow(k, w)
         self.results.hide()
-        vl.addWidget(self.islands_btn)
-        vl.addWidget(self.islands_result)
         vl.addWidget(self.slice_btn)
-        vl.addWidget(self.progress)
+        out = QHBoxLayout()                      # progress is in the status bar while slicing
+        out.addWidget(self.export_btn, 1)
+        out.addWidget(self.send_btn, 1)
+        vl.addLayout(out)
+        self._update_icons()
         vl.addWidget(self.status)
         vl.addWidget(self.results)
 
@@ -80,8 +98,13 @@ class JobPanel(QWidget):
 
         self.support_type.currentIndexChanged.connect(self._type_picked)
         self.generate_btn.clicked.connect(self.generate)
+        self.remove_btn.clicked.connect(lambda: self.win.clear_supports())
         self.islands_btn.clicked.connect(self.check_islands)
+        self.fix_btn.clicked.connect(self.fix_islands)
         self.slice_btn.clicked.connect(self._slice_clicked)
+        self.export_btn.clicked.connect(lambda: self.win.export_held())
+        self.send_btn.clicked.connect(lambda: self.win.send_held())
+        self._set_held(False)
         self.refresh(reload=True)
 
     # ---------------------------------------------------------------- supports
@@ -129,6 +152,9 @@ class JobPanel(QWidget):
             target = " (1 part)" if n == 1 else f" (all {n} parts)"
         self.generate_btn.setText("Generate supports" + target)
         self.generate_btn.setEnabled(n > 0)
+        if self.islands_btn.isEnabled():
+            self.fix_btn.setEnabled(bool(self.win.scene.parts))
+        self.remove_btn.setEnabled(any(p.supports is not None for p in parts))
 
     def _type_picked(self, *_):
         self._user_choice = self.support_type.currentText()
@@ -157,11 +183,48 @@ class JobPanel(QWidget):
                 self.islands_result.setText("✓ No unsupported islands: every region connects to the layer below.")
             else:
                 self.islands_result.setText(f"⚠ {len(isl)} unsupported island{'s' if len(isl) != 1 else ''} "
-                                            "would print in mid-air. Details are in the Log; add supports "
-                                            "there (Supports → Edit supports).")
+                                            "would print in mid-air, shown in red. Details are in the "
+                                            "Log (View → Logs); add supports there (Supports → Edit "
+                                            "supports).")
         self.win.check_islands_async(done)
 
+    def fix_islands(self) -> None:
+        self.islands_btn.setEnabled(False)
+        self.fix_btn.setEnabled(False)
+        self.islands_result.setText("Checking for islands…")
+        self.islands_result.show()
+        params, name = support_params(self.support_type.currentData())
+
+        def done(msg: str):
+            self.islands_btn.setEnabled(True)
+            self.fix_btn.setEnabled(bool(self.win.scene.parts))
+            self.islands_result.setText(msg)
+            self.islands_result.show()
+        self.win.fix_islands(params, name, done)
+
+    def islands_out_of_date(self) -> None:
+        if not self.islands_result.isHidden():
+            self.islands_result.setText("The plate changed since the island check. Check again.")
+
+    # ---------------------------------------------------------------- icons
+    def _update_icons(self) -> None:
+        from .icons import floppy_icon, printer_icon
+        pal = self.palette()
+        dark = pal.color(pal.ColorRole.Window).lightness() < 128
+        color = QColor("white") if dark else pal.color(pal.ColorRole.ButtonText)
+        self.export_btn.setIcon(floppy_icon(color, dpr=self.devicePixelRatioF() or 1.0))
+        self.send_btn.setIcon(printer_icon(color, dpr=self.devicePixelRatioF() or 1.0))
+
+    def changeEvent(self, e):
+        if e.type() == QEvent.PaletteChange and hasattr(self, "send_btn"):
+            self._update_icons()               # theme switched
+        super().changeEvent(e)
+
     # ---------------------------------------------------------------- slicing
+    def _set_held(self, ok: bool) -> None:
+        """Export and Send work on a slice held in memory that still matches the plate."""
+        self.export_btn.setEnabled(ok)
+        self.send_btn.setEnabled(ok)
     def _slice_clicked(self):
         if self.win.slicing():
             self.win.cancel_slice()
@@ -170,27 +233,22 @@ class JobPanel(QWidget):
 
     def slicing_started(self, layers: int) -> None:
         self.slice_btn.setText("Cancel slicing")
-        self.progress.setRange(0, max(1, layers))
-        self.progress.setValue(0)
         self.status.setText(f"Slicing {layers} layers…")
         self.status.show()
         self.results.hide()
+        self._set_held(False)
 
     def slicing_progress(self, done: int, total: int) -> None:
-        self.progress.setRange(0, max(1, total))
-        self.progress.setValue(done)
+        self.status.setText(f"Slicing… {done} / {total} layers")
 
     def slicing_finished(self) -> None:
         self.slice_btn.setText("Slice")
 
     def slicing_failed(self, msg: str) -> None:
-        self.progress.setValue(0)
         self.status.setText("Slicing cancelled." if msg == "cancelled" else f"Slicing failed: {msg}")
         self.status.show()
 
     def show_result(self, res, held: bool = True) -> None:
-        self.progress.setRange(0, max(1, res.layers))
-        self.progress.setValue(res.layers)
         r = self.result
         r["Print time"].setText(format_duration(res.print_time))
         r["Volume"].setText(f"{res.volume / 1000:.2f} ml")
@@ -201,11 +259,13 @@ class JobPanel(QWidget):
         if held:
             self.set_stale(False)
         else:
+            self._set_held(False)
             self.status.setText(f"Saved to {res.path}")
             self.status.show()
 
     def set_stale(self, stale: bool) -> None:
         """The plate or settings changed since the held slice was made."""
+        self._set_held(not stale and not self.win.slicing())
         if self.results.isHidden() and not stale:
             self.status.hide()
             return
@@ -213,6 +273,6 @@ class JobPanel(QWidget):
             self.status.setText("The plate or print settings changed since this slice. Slice again "
                                 "to update it.")
         else:
-            self.status.setText("Sliced and held in memory: File → Slice and save, and Slice and "
-                                "send, use it without slicing again.")
+            self.status.setText("Sliced and held in memory: Export saves it, Send to printer uploads "
+                                "it and starts the print.")
         self.status.show()

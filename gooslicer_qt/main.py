@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QEvent, QObject, QSettings, QStandardPaths, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QSurfaceFormat, QUndoStack
-from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QMenu,
                                QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
                                QGroupBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
                                QSplitter, QStyle, QVBoxLayout, QWidget)
@@ -25,7 +25,7 @@ from gooslicer.raster import RasterSpec
 from gooslicer.scene import Part, Scene
 
 from . import workers
-from .commands import AddPartsCommand, MeshCommand, RemovePartsCommand, StateCommand
+from .commands import AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, StateCommand
 from .hollowing import DrainHoleDialog, HollowDialog, drill_part, hollow_part
 from .jobpanel import JobPanel
 from .panels import InfoButton, PartsList, PropertiesPanel
@@ -33,12 +33,12 @@ from .printers import PrinterControlPanel
 from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
 from .supporting import SupportDialog, SupportManager, SupportsCommand
 from .theme import THEMES, ThemeManager
-from .viewport import Viewport, default_format
+from .viewport import Viewport, default_format, island_guides
 
 APP = "GooSlicer"
 # Bumped when the dock layout changes enough that an older saved layout should be dropped
 # (2: Parts inside Properties; Print settings and Properties are tabs).
-LAYOUT_VERSION = 2
+LAYOUT_VERSION = 4          # 3: Log and Layers became own windows; 4: tabs renamed
 MODEL_FILTER = "3D models (*.stl *.STL *.obj *.OBJ *.3mf *.3MF);;All files (*)"
 
 
@@ -50,7 +50,7 @@ def data_dir() -> Path:
 
 
 class PrinterPanel(QWidget):
-    """The printer row of the Print settings tab: model dropdown plus an (i) button that pops up
+    """The printer row of the Printer settings tab: model dropdown plus an (i) button that pops up
     the printer's build volume, resolution, pixel pitch and mirroring."""
 
     def __init__(self, parent=None):
@@ -140,6 +140,43 @@ class _DropForwarder(QObject):
         return False
 
 
+class ToolWindow(QWidget):
+    """A panel in its own top-level window (View → Logs, View → Layers): it stays out of the
+    main window and remembers where it was."""
+
+    def __init__(self, title: str, widget: QWidget, settings, key: str, parent):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle(f"{title} — {APP}")
+        self.setObjectName(f"window{title}")
+        self._settings, self._key = settings, f"{key}Geometry"
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(widget)
+        self.resize(900, 460)
+        if settings.value(self._key):
+            self.restoreGeometry(settings.value(self._key))
+
+    def popup(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def hideEvent(self, e):
+        self._settings.setValue(self._key, self.saveGeometry())
+        super().hideEvent(e)
+
+
+def _islands_and_faces(meshes, layer_height):
+    """The island check, plus the unsupported surface of each island as red meshes for the 3D view."""
+    isl = supportmod.unsupported_islands(meshes, layer_height=layer_height)
+    red = []
+    if isl:
+        for m, sel in zip(meshes, supportmod.island_faces(meshes, isl, layer_height)):
+            if sel.any():
+                red.append(m.submesh([np.flatnonzero(sel)], append=True))
+    return isl, red
+
+
 def _warm(part_mesh):
     """Build the ray-picking index off the GUI thread (seconds for 1M+ triangles)."""
     part_mesh.triangles_tree  # noqa: B018 (cached property)
@@ -202,7 +239,7 @@ class MainWindow(QMainWindow):
         pbl.addWidget(self.job_panel)
         pbl.addStretch(1)
         props_scroll.setWidget(props_box)
-        # the Properties tab: parts on top, the selected part's properties below (resizable)
+        # the Models tab: parts on top, the selected part's properties below (resizable)
         self.properties_split = QSplitter(Qt.Vertical)
         self.properties_split.addWidget(self.parts_box)
         self.properties_split.addWidget(props_scroll)
@@ -238,12 +275,10 @@ class MainWindow(QMainWindow):
         self._send_after_slice = False
         self.docks = {}
         self._drops = _DropForwarder(self)
-        # the right column (Properties, Print settings) runs the full height, beside the Log
+        # the right column (Printer settings, Models) runs the full height
         self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
-        for title, w, area in (("Print settings", self.settings_scroll, Qt.RightDockWidgetArea),
-                               ("Properties", self.properties_split, Qt.RightDockWidgetArea),
-                               ("Log", self.log, Qt.BottomDockWidgetArea),
-                               ("Layers", self.layer_preview, Qt.BottomDockWidgetArea)):
+        for title, w, area in (("Printer settings", self.settings_scroll, Qt.RightDockWidgetArea),
+                               ("Models", self.properties_split, Qt.RightDockWidgetArea)):
             d = QDockWidget(title, self)
             d.setObjectName(f"dock{title.replace(' ', '')}")
             d.setWidget(w)
@@ -251,10 +286,18 @@ class MainWindow(QMainWindow):
             self.docks[title] = d
             d.setAcceptDrops(True)      # also when floated out as its own window
             d.installEventFilter(self._drops)
+        # the Log and the layer preview open in their own windows (View → Logs, View → Layers)
+        self.log_window = ToolWindow("Logs", self.log, self.settings, "logWindow", self)
+        self.layers_window = ToolWindow("Layers", self.layer_preview, self.settings, "layersWindow", self)
+        for tw in (self.log_window, self.layers_window):
+            tw.setAcceptDrops(True)
+            tw.installEventFilter(self._drops)
+        self._islands_fp = None          # plate fingerprint of the island check shown in red
         self._layout_done = False
         self._slice_thread = None
-        self._progress = QProgressBar()
+        self._progress = QProgressBar()             # only shown while slicing
         self._progress.setMaximumWidth(260)
+        self._progress.setFormat("%p%")
         self._progress.hide()
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.hide()
@@ -265,6 +308,8 @@ class MainWindow(QMainWindow):
         self._menus()
         self.viewport.selectionChanged.connect(self._on_viewport_selection)
         self.viewport.moveFinished.connect(lambda ch: self.undo.push(StateCommand(self, ch, "Move")))
+        self.viewport.rotateFinished.connect(lambda ch, text: self.undo.push(StateCommand(self, ch, text)))
+        self.viewport.partContextMenu.connect(self._part_context)
         self.viewport.layFlatPicked.connect(self._lay_flat)
         self.viewport.holePicked.connect(self._hole_picked)
         self.viewport.holeModeEnded.connect(lambda: self.statusBar().clearMessage())
@@ -275,6 +320,7 @@ class MainWindow(QMainWindow):
         self.viewport.filesDropped.connect(self.open_files)
         self.setAcceptDrops(True)       # drops anywhere in the window, not only on the 3D view
         self.parts.selectionChangedIds.connect(lambda ids: self.select(ids))
+        self.parts.removeRequested.connect(self.remove_part)
         self.printer_panel.combo.currentIndexChanged.connect(self._printer_changed)
         self.load_profiles()
         if self.settings.value("geometry"):
@@ -295,12 +341,9 @@ class MainWindow(QMainWindow):
             self.restoreState(self.settings.value("windowState"), LAYOUT_VERSION)   # older: ignored
 
     def _default_layout(self) -> None:
-        self.tabifyDockWidget(self.docks["Log"], self.docks["Layers"])
-        self.docks["Log"].raise_()
-        self.resizeDocks([self.docks["Log"]], [280], Qt.Vertical)
-        # right-hand tabs: Print settings first, then Properties (with the parts list)
-        self.tabifyDockWidget(self.docks["Print settings"], self.docks["Properties"])
-        self.docks["Print settings"].raise_()
+        # right-hand tabs: Printer settings first, then Models (with the parts list)
+        self.tabifyDockWidget(self.docks["Printer settings"], self.docks["Models"])
+        self.docks["Printer settings"].raise_()
 
     def restore_default_windows(self) -> None:
         """Bring back every panel (closed or floated out) in its default place."""
@@ -309,8 +352,7 @@ class MainWindow(QMainWindow):
             d.show()
         if getattr(self, "_default_state", None) is None or not self.restoreState(self._default_state, LAYOUT_VERSION):
             self._default_layout()
-        self.docks["Log"].raise_()
-        self.docks["Print settings"].raise_()
+        self.docks["Printer settings"].raise_()
         self.settings.setValue("windowState", self.saveState(LAYOUT_VERSION))
 
     # ----------------------------------------------------------------- setup
@@ -380,6 +422,10 @@ class MainWindow(QMainWindow):
         self._act(v, "F&ront", lambda: self.viewport.set_view(-90, 0), "1")
         self._act(v, "&Side", lambda: self.viewport.set_view(0, 0), "3")
         v.addSeparator()
+        self._act(v, "&Logs", self.log_window.popup, None, "Open the log in its own window")
+        self._act(v, "&Layers", self.layers_window.popup, None,
+                  "Open the layer preview of the sliced or opened .goo in its own window")
+        v.addSeparator()
         self._act(v, "Restore all &windows to default", self.restore_default_windows, None,
                   "Reopen closed panels and put every panel back in its default place")
         tm = v.addMenu("T&heme")
@@ -407,8 +453,8 @@ class MainWindow(QMainWindow):
 
     def _show_lan(self, fn):
         def go():
-            self.docks["Print settings"].show()
-            self.docks["Print settings"].raise_()
+            self.docks["Printer settings"].show()
+            self.docks["Printer settings"].raise_()
             self.settings_scroll.ensureWidgetVisible(self.lan, 0, 0)
             fn()
         return go
@@ -468,6 +514,48 @@ class MainWindow(QMainWindow):
             new.append(d)
         if new:
             self.undo.push(AddPartsCommand(self, new, "Duplicate"))
+
+    def remove_part(self, pid: int) -> None:
+        """Take one model off the build plate (the red x in the list); undoable."""
+        if self.scene.get(pid) is not None:
+            self.undo.push(RemovePartsCommand(self, [pid]))
+
+    def add_instance(self, pid: int) -> None:
+        """Another copy of a model, placed beside it on the plate (where it fits)."""
+        if self.scene.get(pid) is None:
+            return
+        src = self.scene.get(pid)
+        d = self.scene.duplicate(pid)
+        # the free spot nearest the right of the original (a little apart), else anywhere free
+        lo, hi = src.bounds()
+        if not self.scene.place_free(d, near=[hi[0] + (hi[0] - lo[0]) / 2 + 3, (lo[1] + hi[1]) / 2]):
+            self.log_msg(f"Add instance: no free room on the plate for another {src.name}.")
+        self.scene.remove(d.id)
+        self.undo.push(AddPartsCommand(self, [d], "Add instance"))
+
+    def mirror_part(self, pid: int, axis: int = 1) -> None:
+        """Mirror a model across the plane through its centre perpendicular to `axis` (1 = Y:
+        front to back). Its supports are mirrored with it; undoable."""
+        p = self.scene.get(pid)
+        if p is None:
+            return
+        self.undo.push(MirrorCommand(self, pid, axis, f"Mirror {'XYZ'[axis]}"))
+
+    def part_menu(self, pid: int) -> QMenu:
+        """The right-click menu of a model in the 3D view."""
+        m = QMenu(self)
+        a = m.addAction("Add instance", lambda: self.add_instance(pid))
+        a.setToolTip("Duplicate the model")
+        a = m.addAction("Mirror", lambda: self.mirror_part(pid, 1))
+        a.setToolTip("Mirror the model along Y (front to back)")
+        return m
+
+    def _part_context(self, pid: int, global_pos) -> None:
+        self.select([pid])
+        self._popup_menu(self.part_menu(pid), global_pos)
+
+    def _popup_menu(self, menu: QMenu, global_pos) -> None:
+        menu.exec(global_pos)
 
     def delete_selected(self):
         ids = self.selected_ids()
@@ -737,8 +825,32 @@ class MainWindow(QMainWindow):
         h = self.print_settings.settings().layer_height if self.printer_panel.current() else 0.05
         return supportmod.unsupported_islands(meshes, layer_height=max(h, 0.05))
 
+    def _island_meshes(self):
+        meshes = [p.world_mesh() for p in self.scene.parts]
+        meshes += [m for m in (self.supports.world_mesh(p) for p in self.scene.parts) if m is not None]
+        return meshes
+
+    def show_islands(self, isl, red, fp) -> None:
+        """Show the islands' unsupported surface in red until the plate changes."""
+        self.viewport.island_meshes = list(red) if isl else []
+        self.viewport.island_lines = island_guides([i.point for i in isl or []], self.scene.size)
+        self._islands_fp = fp if isl else None
+        self.viewport.update()
+
+    def _check_islands_shown(self) -> None:
+        if self._islands_fp is None:
+            return
+        now = self._plate_fingerprint()
+        if not self._same_plate((None, None, self._islands_fp[2]), (None, None, now[2])):
+            self.show_islands([], [], None)
+            self.job_panel.islands_out_of_date()
+
     def check_islands(self) -> list:
-        isl = self.unsupported_islands()
+        fp = self._plate_fingerprint()
+        meshes = self._island_meshes()
+        h = self.print_settings.settings().layer_height if self.printer_panel.current() else 0.05
+        isl, red = _islands_and_faces(meshes, max(h, 0.05)) if meshes else ([], [])
+        self.show_islands(isl, red, fp)
         if not isl:
             self.log_msg("No unsupported islands: every region connects to the layer below.")
             self.statusBar().showMessage("No unsupported islands", 5000)
@@ -749,14 +861,17 @@ class MainWindow(QMainWindow):
     def check_islands_async(self, on_done) -> None:
         """The island check in the background (seconds on detailed models); reports to the Log and
         calls on_done(islands), or on_done(None) if it failed."""
-        meshes = [p.world_mesh() for p in self.scene.parts]
-        meshes += [m for m in (self.supports.world_mesh(p) for p in self.scene.parts) if m is not None]
+        meshes = self._island_meshes()
+        fp = self._plate_fingerprint()
         if not meshes:
+            self.show_islands([], [], None)
             on_done([])
             return
         h = self.print_settings.settings().layer_height if self.printer_panel.current() else 0.05
 
-        def done(isl):
+        def done(res):
+            isl, red = res
+            self.show_islands(isl, red, fp)
             if isl:
                 self._report_islands(isl)
             else:
@@ -766,8 +881,89 @@ class MainWindow(QMainWindow):
         def failed(msg):
             self.log_msg("Island check failed: " + msg.splitlines()[0])
             on_done(None)
-        workers.submit(supportmod.unsupported_islands, meshes, layer_height=max(h, 0.05),
-                       on_done=done, on_failed=failed)
+        workers.submit(_islands_and_faces, meshes, max(h, 0.05), on_done=done, on_failed=failed)
+
+    def fix_islands(self, params, template: str, on_done) -> None:
+        """Check for islands, then support each one: a contact under it for a part that already
+        has supports; a full set of supports (`params`) for a part that has none, since lifting a
+        bare part onto a single support would leave its base hanging. on_done(message)."""
+        def checked(isl):
+            if isl is None:
+                on_done("The island check failed; see the Log.")
+                return
+            if not isl:
+                on_done("✓ No unsupported islands: nothing to fix.")
+                return
+            added, full, missed = self.support_islands(isl, params, template)
+            bits = []
+            if added:
+                bits.append(f"Added {added} support{'s' if added != 1 else ''} under islands")
+            if full:
+                bits.append("generating supports for " + ", ".join(p.name for p in full))
+            if missed:
+                bits.append(f"{missed} island{'s' if missed != 1 else ''} could not be reached "
+                            "(add those by hand: Supports → Edit supports)")
+            msg = "; ".join(bits) + "." if bits else "Nothing could be added."
+            msg = msg[0].upper() + msg[1:]
+            self.log_msg("Fix islands: " + msg)
+
+            def rechecked(left):
+                if left is None:
+                    on_done(msg + " The check afterwards failed; see the Log.")
+                elif not left:
+                    on_done(msg + " ✓ No unsupported islands remain.")
+                else:
+                    on_done(msg + f" ⚠ {len(left)} island{'s' if len(left) != 1 else ''} remain"
+                            f"{'s' if len(left) == 1 else ''} (shown in red).")
+            if not full:
+                self.check_islands_async(rechecked)
+                return
+            waiting = {"n": len(full)}             # check again once every new support set is built
+
+            def one_done(_n):
+                waiting["n"] -= 1
+                if waiting["n"] <= 0:
+                    self.supportsFinished.disconnect(one_done)
+                    self.check_islands_async(rechecked)
+            self.supportsFinished.connect(one_done)
+        self.check_islands_async(checked)
+
+    def support_islands(self, isl, params, template: str = ""):
+        """Add supports for `isl`. Returns (contacts added, parts given full supports, missed)."""
+        meshes = {p.id: p.world_mesh() for p in self.scene.parts}
+        per_part: dict[int, list] = {}
+        missed = 0
+        for i in isl:
+            best = None
+            for p in self.scene.parts:
+                c = supportmod.island_contact(meshes[p.id], i.point)
+                if c is None:
+                    continue
+                gap = float(i.point[2] - c.point[2])        # the underside straight below it
+                if gap >= -1e-6 and (best is None or gap < best[0]):
+                    best = (gap, p.id, c)
+            if best is None:
+                missed += 1
+                continue
+            per_part.setdefault(best[1], []).append(best[2])
+        added, full = 0, []
+        self.undo.beginMacro("Fix islands")
+        try:
+            for pid, cs in per_part.items():
+                p = self.scene.get(pid)
+                if p.supports is None:
+                    full.append(p)
+                    continue
+                before = SupportsCommand.snapshot(p)
+                plan = p.supports.with_contacts(p, p.supports.world_contacts(p) + cs)
+                self.undo.push(SupportsCommand(self, pid, before, (plan, p.elevation, p.state()),
+                                               "Fix islands"))
+                added += len(cs)
+        finally:
+            self.undo.endMacro()
+        for p in full:
+            self.auto_support(p, params, template)
+        return added, full, missed
 
     def _report_islands(self, isl) -> list[str]:
         lines = [f"• z {i.z:.2f} mm at ({i.point[0]:.1f}, {i.point[1]:.1f}): up to {i.area:.2f} mm², "
@@ -901,7 +1097,7 @@ class MainWindow(QMainWindow):
         return slicermod.SliceJob(meshes, RasterSpec.from_profile(p), self.print_settings.settings(),
                                   p.name, machine_z=p.size_z, preview_rgb=rgb)
 
-    # ---- the slice held in memory (Properties → Slicing → Slice)
+    # ---- the slice held in memory (Models → Slicing → Slice)
     def _plate_fingerprint(self):
         """What a slice depends on. Meshes and support plans are compared by identity: every edit
         replaces them (MeshCommand, SupportPlan.with_contacts) rather than changing them in place."""
@@ -924,7 +1120,10 @@ class MainWindow(QMainWindow):
         return None
 
     def _check_held(self) -> None:
-        if self.held is not None and hasattr(self, "job_panel"):
+        if not hasattr(self, "job_panel"):
+            return
+        self._check_islands_shown()
+        if self.held is not None:
             self.job_panel.set_stale(self.held_slice() is None)
 
     def slicing(self) -> bool:
@@ -948,6 +1147,34 @@ class MainWindow(QMainWindow):
             self.start_slice(job, None)
         self._island_check_then(job, go)
 
+    def export_held(self) -> bool:
+        """Save the slice held in memory to a .goo file of the user's choice."""
+        held = self.held_slice()
+        if held is None:
+            return False
+        default = Path(self.settings.value("lastGooDir", str(Path.home()))) / f"{self.scene.parts[0].name}.goo"
+        path, _ = QFileDialog.getSaveFileName(self, "Export sliced file", str(default), "ELEGOO GOO (*.goo)")
+        if not path:
+            return False
+        if not path.lower().endswith(".goo"):
+            path += ".goo"
+        self.settings.setValue("lastGooDir", str(Path(path).parent))
+        return self._save_held(held, path)
+
+    def send_held(self) -> bool:
+        """Upload the slice held in memory to the connected printer and start the print."""
+        held = self.held_slice()
+        if held is None:
+            return False
+        out = Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / "sent"
+        out.mkdir(parents=True, exist_ok=True)
+        name = "".join(c if c.isalnum() or c in "-_." else "_" for c in self.scene.parts[0].name) or "model"
+        path = str(out / f"{name}.goo")
+        if not self._save_held(held, path):
+            return False
+        self._show_lan(lambda: None)()
+        return bool(self.lan.send_file(path, start=True))
+
     def _save_held(self, res, path: str) -> bool:
         try:
             goo.write(path, res.goo.header, res.goo.layers)
@@ -964,15 +1191,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP, "Connect to a printer first (Printer → Find printers).")
             self._show_lan(lambda: None)()
             return
-        held = self.held_slice()
-        if held is not None:                 # already sliced: send what is in memory
-            out = Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / "sent"
-            out.mkdir(parents=True, exist_ok=True)
-            name = "".join(c if c.isalnum() or c in "-_." else "_" for c in self.scene.parts[0].name) or "model"
-            path = str(out / f"{name}.goo")
-            if self._save_held(held, path):
-                self._show_lan(lambda: None)()
-                self.lan.send_file(path, start=True)
+        if self.held_slice() is not None:    # already sliced: send what is in memory
+            self.send_held()
             return
         try:
             job = self.make_slice_job()
@@ -991,15 +1211,8 @@ class MainWindow(QMainWindow):
         self._island_check_then(job, go)
 
     def slice_dialog(self):
-        held = self.held_slice()
-        if held is not None:                 # already sliced: just save what is in memory
-            default = Path(self.settings.value("lastGooDir", str(Path.home()))) / f"{self.scene.parts[0].name}.goo"
-            path, _ = QFileDialog.getSaveFileName(self, "Save sliced file", str(default), "ELEGOO GOO (*.goo)")
-            if path:
-                if not path.lower().endswith(".goo"):
-                    path += ".goo"
-                self.settings.setValue("lastGooDir", str(Path(path).parent))
-                self._save_held(held, path)
+        if self.held_slice() is not None:    # already sliced: just save what is in memory
+            self.export_held()
             return
         try:
             job = self.make_slice_job()
@@ -1026,16 +1239,20 @@ class MainWindow(QMainWindow):
         self._set_slicing_enabled(False)
         self.statusBar().showMessage("Checking for unsupported islands…")
         h = max(job.settings.layer_height, 0.01)
+        fp = self._plate_fingerprint()
 
-        def done(isl):
+        def done(res):
+            isl, red = res
             self._set_slicing_enabled(True)
             self.statusBar().clearMessage()
+            self.show_islands(isl, red, fp)
             if isl:
                 lines = self._report_islands(isl)
                 if QMessageBox.warning(
                         self, APP, f"{len(isl)} unsupported island{'' if len(isl) == 1 else 's'} would "
                         "print in mid-air (they stick to the film and the print fails there):\n\n"
-                        + "\n".join(lines) + "\n\nAdd supports there (Supports → Edit supports). Slice anyway?",
+                        + "\n".join(lines) + "\n\nThey are shown in red. Add supports there "
+                        "(Supports → Edit supports). Slice anyway?",
                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
                     return
             proceed()
@@ -1044,8 +1261,7 @@ class MainWindow(QMainWindow):
             self._set_slicing_enabled(True)
             self.log_msg("Island check failed (slicing anyway): " + msg.splitlines()[0])
             proceed()
-        workers.submit(supportmod.unsupported_islands, job.meshes, layer_height=h,
-                       on_done=done, on_failed=failed)
+        workers.submit(_islands_and_faces, job.meshes, h, on_done=done, on_failed=failed)
 
     def _set_slicing_enabled(self, on: bool) -> None:
         self.slice_action.setEnabled(on)
@@ -1115,6 +1331,7 @@ class MainWindow(QMainWindow):
         self.slice_action.setEnabled(True)
         self.send_action.setEnabled(True)
         self._slice_thread = None
+        self._check_held()                   # Export / Send become available
 
     def open_goo_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open .goo", self.settings.value("lastGooDir", str(Path.home())),
@@ -1129,12 +1346,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP, f"Cannot read {Path(path).name}: {e}")
             return
         self.layer_preview.set_file(g)
-        self.docks["Layers"].raise_()
+        self.layers_window.popup()
         h = g.header
         self.log_msg(f"Opened {Path(path).name}: {h.machine_type}, {h.layer_count} layers, "
                      f"{h.resolution_x}×{h.resolution_y}, resin '{h.resin_profile}'")
 
     def closeEvent(self, e):
+        for tw in (self.log_window, self.layers_window):
+            if tw.isVisible():
+                tw.close()                   # saves where it was
         if self._slice_thread:
             self._slice_thread.cancel()
             self._slice_thread.wait(10000)
