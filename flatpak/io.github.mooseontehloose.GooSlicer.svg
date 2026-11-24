@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3a4a"/><stop offset="1" stop-color="#16202b"/>
+    </linearGradient>
+    <linearGradient id="resin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb347"/><stop offset="1" stop-color="#ff7a1a"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)"/>
+  <!-- build plate -->
+  <rect x="24" y="22" width="80" height="10" rx="3" fill="#c9d3dc"/>
+  <rect x="58" y="12" width="12" height="12" rx="2" fill="#c9d3dc"/>
+  <!-- printed part hanging from the plate, drawn as layers -->
+  <g fill="url(#resin)">
+    <rect x="36" y="34" width="56" height="7" rx="2"/>
+    <rect x="40" y="43" width="48" height="7" rx="2"/>
+    <rect x="44" y="52" width="40" height="7" rx="2"/>
+    <rect x="48" y="61" width="32" height="7" rx="2"/>
+    <rect x="52" y="70" width="24" height="7" rx="2"/>
+  </g>
+  <!-- vat -->
+  <path d="M22 86 h84 v14 a8 8 0 0 1 -8 8 h-68 a8 8 0 0 1 -8 -8z" fill="#3c8dbc" opacity="0.9"/>
+  <rect x="22" y="84" width="84" height="5" rx="2" fill="#7cc4ef"/>
+</svg>

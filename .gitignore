@@ -1,0 +1,19 @@
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Flatpak build state and bundles
+build/
+dist/
+.flatpak-builder/
+
+# Kept local, not published:
+# captures/  runtime captures from the owner's printer (mainboard ID, LAN IP, name)
+# evidence/  reverse-engineering evidence bundles (decompiled ELEGOO code)
+# samples/   SatelLite-sliced reference files and a third-party model
+captures/
+evidence/
+samples/

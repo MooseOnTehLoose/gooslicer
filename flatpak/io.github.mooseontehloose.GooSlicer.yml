@@ -1,0 +1,49 @@
+app-id: io.github.mooseontehloose.GooSlicer
+runtime: org.kde.Platform
+runtime-version: '6.11'
+sdk: org.kde.Sdk
+base: io.qt.PySide.BaseApp
+base-version: '6.11'
+command: gooslicer
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri              # OpenGL viewport
+  - --share=network           # printer discovery (UDP broadcast), WebSocket and HTTP upload
+  # SatelLite's printer, resin and support profiles are read in place from the user's own
+  # install (never shipped). This is the default Wine location; other locations:
+  #   flatpak override --user --filesystem=/path/to/SatelLite:ro io.github.mooseontehloose.GooSlicer
+  - --filesystem=~/.wine:ro
+build-options:
+  env:
+    BASEAPP_REMOVE_WEBENGINE: '1'   # GooSlicer uses no QtWebEngine/QtPdf/QtWebView
+cleanup-commands:
+  - /app/cleanup-BaseApp.sh
+  # libclang/LLVM and the generator are only needed to build PySide bindings, not to run them
+  - rm -rfv /app/lib/libLLVM*.so* /app/lib/libclang*.so* /app/lib/python3*/site-packages/shiboken6_generator*
+modules:
+  - python3-deps.json
+
+  - name: gooslicer
+    buildsystem: simple
+    build-commands:
+      - pip3 install --verbose --no-index --no-deps --no-build-isolation --prefix=${FLATPAK_DEST} .
+      - install -Dm644 flatpak/${FLATPAK_ID}.desktop -t ${FLATPAK_DEST}/share/applications
+      - install -Dm644 flatpak/${FLATPAK_ID}.metainfo.xml -t ${FLATPAK_DEST}/share/metainfo
+      - install -Dm644 flatpak/${FLATPAK_ID}.svg -t ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .venv
+          - .pytest_cache
+          - .flatpak-builder
+          - build
+          - dist
+          - gooslicer.egg-info
+          - samples
+          - captures
+          - evidence
+          - tests
+          - scripts

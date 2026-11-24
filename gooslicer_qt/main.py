@@ -1,0 +1,944 @@
+"""GooSlicer main window: scene, 3D viewport, panels, undo/redo, import and repair."""
+from __future__ import annotations
+
+import shutil
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+from PySide6.QtCore import QSettings, QStandardPaths, Qt, Signal
+from PySide6.QtGui import QAction, QKeySequence, QSurfaceFormat, QUndoStack
+from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout,
+                               QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+                               QPushButton, QScrollArea, QWidget)
+
+from elegoo_goo import goo
+from gooslicer import __version__, mesh as meshmod, preview, profiles
+from gooslicer import hollow as hollowmod
+from gooslicer import settings as settingsmod
+from gooslicer import slicer as slicermod
+from gooslicer import support_defaults
+from gooslicer import supports as supportmod
+from gooslicer.raster import RasterSpec
+from gooslicer.scene import Part, Scene
+
+from . import workers
+from .commands import AddPartsCommand, MeshCommand, RemovePartsCommand, StateCommand
+from .hollowing import DrainHoleDialog, HollowDialog, drill_part, hollow_part
+from .panels import PartsList, PropertiesPanel
+from .printers import PrinterControlPanel
+from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
+from .supporting import SupportDialog, SupportManager, SupportsCommand
+from .viewport import Viewport, default_format
+
+APP = "GooSlicer"
+MODEL_FILTER = "3D models (*.stl *.STL *.obj *.OBJ *.3mf *.3MF);;All files (*)"
+
+
+def data_dir() -> Path:
+    """XDG data dir (~/.local/share/GooSlicer)."""
+    p = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+class PrinterPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.combo = QComboBox()
+        self.info = {k: QLabel("–") for k in ("Build volume", "Resolution", "Pixel pitch", "Mirror")}
+        lay = QFormLayout(self)
+        lay.addRow("Printer", self.combo)
+        for k, w in self.info.items():
+            w.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lay.addRow(k, w)
+        self.combo.currentIndexChanged.connect(self._show)
+        self._profiles: dict[str, profiles.PrinterProfile] = {}
+
+    def set_profiles(self, ps: dict[str, profiles.PrinterProfile], current: str | None = None):
+        self._profiles = ps
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        self.combo.addItems(sorted(ps))
+        if current in ps:
+            self.combo.setCurrentText(current)
+        self.combo.blockSignals(False)
+        self._show()
+        self.combo.currentIndexChanged.emit(self.combo.currentIndex())
+
+    def current(self) -> profiles.PrinterProfile | None:
+        return self._profiles.get(self.combo.currentText())
+
+    def _show(self, *_):
+        p = self.current()
+        if not p:
+            for w in self.info.values():
+                w.setText("–")
+            return
+        self.info["Build volume"].setText(f"{p.size_x:g} × {p.size_y:g} × {p.size_z:g} mm")
+        self.info["Resolution"].setText(f"{p.res_x} × {p.res_y} px")
+        self.info["Pixel pitch"].setText(f"{p.pixel_x_mm * 1000:.1f} × {p.pixel_y_mm * 1000:.1f} µm")
+        self.info["Mirror"].setText(", ".join(a for a, m in (("X", p.mirror_x), ("Y", p.mirror_y)) if m) or "none")
+
+
+def _warm(part_mesh):
+    """Build the ray-picking index off the GUI thread (seconds for 1M+ triangles)."""
+    part_mesh.triangles_tree  # noqa: B018 (cached property)
+    return part_mesh
+
+
+def _load_and_analyze(path: str):
+    out = []
+    for name, m in meshmod.load_meshes(path):
+        part = Part.from_mesh(name, m)
+        _warm(part.mesh)
+        out.append((part, meshmod.analyze(m)))
+    return out
+
+
+def _repair_and_analyze(m):
+    fixed = meshmod.repair(m)
+    return fixed, meshmod.analyze(fixed)
+
+
+class MainWindow(QMainWindow):
+    importFinished = Signal(int)  # number of parts added (for tests / status)
+    hollowFinished = Signal(bool)
+    supportsFinished = Signal(int)      # islands left (-1 = failed)
+
+    def __init__(self, settings: QSettings | None = None, lan_ports: dict | None = None):
+        super().__init__()
+        self.settings = settings or QSettings(APP, APP)
+        self.setWindowTitle(f"{APP} {__version__}")
+        self.resize(1400, 900)
+        self.scene = Scene()
+        self.reports: dict[int, meshmod.MeshReport] = {}   # id(mesh) -> report
+        self.undo = QUndoStack(self)
+        self.supports = SupportManager(self.scene)
+        self._pending = 0
+
+        self.viewport = Viewport(self.scene)
+        self.setCentralWidget(self.viewport)
+
+        self.printer_panel = PrinterPanel()
+        self.parts = PartsList()
+        self.props = PropertiesPanel(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.props)
+        self.log = QPlainTextEdit(readOnly=True)
+        self.log.setMaximumBlockCount(5000)
+        self.print_settings = PrintSettingsPanel()
+        self.layer_preview = LayerPreview()
+        self.lan = PrinterControlPanel(self.settings, ports=lan_ports)
+        self.lan.log.connect(self.log_msg)
+        self._send_after_slice = False
+        self.docks = {}
+        for title, w, area in (("Parts", self.parts, Qt.LeftDockWidgetArea),
+                               ("Properties", scroll, Qt.RightDockWidgetArea),
+                               ("Printer", self.printer_panel, Qt.RightDockWidgetArea),
+                               ("Print settings", self.print_settings, Qt.RightDockWidgetArea),
+                               ("Log", self.log, Qt.BottomDockWidgetArea),
+                               ("Layers", self.layer_preview, Qt.BottomDockWidgetArea),
+                               ("Printer control", self.lan, Qt.BottomDockWidgetArea)):
+            d = QDockWidget(title, self)
+            d.setObjectName(f"dock{title.replace(' ', '')}")
+            d.setWidget(w)
+            self.addDockWidget(area, d)
+            self.docks[title] = d
+        self._layout_done = False
+        self._slice_thread = None
+        self._progress = QProgressBar()
+        self._progress.setMaximumWidth(260)
+        self._progress.hide()
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.hide()
+        self._cancel_btn.clicked.connect(self.cancel_slice)
+        self.statusBar().addPermanentWidget(self._progress)
+        self.statusBar().addPermanentWidget(self._cancel_btn)
+
+        self._menus()
+        self.viewport.selectionChanged.connect(self._on_viewport_selection)
+        self.viewport.moveFinished.connect(lambda ch: self.undo.push(StateCommand(self, ch, "Move")))
+        self.viewport.layFlatPicked.connect(self._lay_flat)
+        self.viewport.holePicked.connect(self._hole_picked)
+        self.viewport.holeModeEnded.connect(lambda: self.statusBar().clearMessage())
+        self.viewport.extra_meshes = self.supports.display
+        self.supports.updated.connect(self._supports_updated)
+        self.viewport.supportClicked.connect(self._support_click)
+        self.viewport.supportModeEnded.connect(lambda: self.statusBar().clearMessage())
+        self.viewport.filesDropped.connect(self.import_files)
+        self.parts.selectionChangedIds.connect(lambda ids: self.select(ids))
+        self.printer_panel.combo.currentIndexChanged.connect(self._printer_changed)
+        self.load_profiles()
+        if self.settings.value("geometry"):
+            self.restoreGeometry(self.settings.value("geometry"))
+        self.statusBar().showMessage("Import a model (Ctrl+I) or drop STL/OBJ/3MF files here")
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._layout_done:
+            return
+        self._layout_done = True
+        # Dock tab groups are formed only after the first show: with two groups created before
+        # the first layout, Qt 6.12 leaves a stale, visible QTabBar behind (plain-Qt repro).
+        if not (self.settings.value("windowState") and self.restoreState(self.settings.value("windowState"))):
+            self.tabifyDockWidget(self.docks["Printer"], self.docks["Print settings"])
+            self.tabifyDockWidget(self.docks["Log"], self.docks["Layers"])
+            self.tabifyDockWidget(self.docks["Layers"], self.docks["Printer control"])
+            self.docks["Log"].raise_()
+            self.resizeDocks([self.docks["Log"]], [280], Qt.Vertical)
+
+    # ----------------------------------------------------------------- setup
+    def _act(self, menu, text, slot, shortcut=None, tip=None):
+        a = QAction(text, self)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        if tip:
+            a.setStatusTip(tip)
+        a.triggered.connect(slot)
+        menu.addAction(a)
+        return a
+
+    def _menus(self):
+        mb = self.menuBar()
+        m = mb.addMenu("&File")
+        self._act(m, "&Import model…", self.import_dialog, "Ctrl+I")
+        self.slice_action = self._act(m, "&Slice and save .goo…", self.slice_dialog, "Ctrl+R")
+        self.send_action = self._act(m, "Slice and sen&d to printer…", self.slice_and_send, "Ctrl+Shift+R")
+        self._act(m, "&Open .goo for inspection…", self.open_goo_dialog, "Ctrl+Shift+O")
+        self._act(m, "Locate SatelLite &profiles…", self.locate_profiles)
+        m.addSeparator()
+        self._act(m, "&Quit", self.close, QKeySequence.Quit)
+
+        e = mb.addMenu("&Edit")
+        u = self.undo.createUndoAction(self, "&Undo")
+        u.setShortcut(QKeySequence.Undo)
+        r = self.undo.createRedoAction(self, "&Redo")
+        r.setShortcut(QKeySequence.Redo)
+        e.addActions([u, r])
+        e.addSeparator()
+        self._act(e, "Select &all", lambda: self.select([p.id for p in self.scene.parts]), QKeySequence.SelectAll)
+        self._act(e, "&Duplicate", self.duplicate_selected, "Ctrl+D")
+        self._act(e, "De&lete", self.delete_selected, QKeySequence.Delete)
+        e.addSeparator()
+        self._act(e, "&Arrange all", self.arrange_all, "A")
+        self._act(e, "Lay &flat (pick face)", self.start_lay_flat, "L")
+        self._act(e, "&Repair mesh", self.repair_selected)
+        e.addSeparator()
+        self._act(e, "&Hollow…", self.hollow_dialog, "Ctrl+Shift+H")
+        self._act(e, "Add drain &holes…", self.drain_hole_mode, "Ctrl+Shift+D")
+        self._act(e, "Check for &trapped resin", self.check_trapped_resin)
+
+        sm = mb.addMenu("&Supports")
+        self._act(sm, "&Auto-support…", self.auto_support_dialog, "Ctrl+Shift+A")
+        self._act(sm, "&Edit supports (click to add, Ctrl+click to remove)", self.support_edit_mode, "S")
+        self._act(sm, "&Clear supports of selected", self.clear_supports)
+        sm.addSeparator()
+        self._act(sm, "Check for &unsupported islands", self.check_islands)
+
+        pm = mb.addMenu("&Printer")
+        self._act(pm, "&Find printers on network", self._show_lan(self.lan.find_printers))
+        self._act(pm, "&Add printer by IP…", self._show_lan(self.lan.add_by_ip_dialog))
+        self._act(pm, "&Connect / disconnect", self._show_lan(self.lan.toggle_connection))
+        self._act(pm, "&Send .goo file…", self._show_lan(self.lan.send_dialog))
+
+        v = mb.addMenu("&View")
+        self._act(v, "&Reset view", self.viewport.reset_view, "Home")
+        self._act(v, "&Frame selection", self.viewport.frame_selection, "F")
+        self._act(v, "&Top", lambda: self.viewport.set_view(-90, 89), "7")
+        self._act(v, "F&ront", lambda: self.viewport.set_view(-90, 0), "1")
+        self._act(v, "&Side", lambda: self.viewport.set_view(0, 0), "3")
+
+        h = mb.addMenu("&Help")
+        self._act(h, "&About GooSlicer", lambda: QMessageBox.about(
+            self, APP, f"<b>{APP} {__version__}</b><p>Native Linux slicer for ELEGOO Saturn 4 "
+                       "printers (.goo, SDCP v3 LAN).</p><p>Not affiliated with ELEGOO.</p>"
+                       "<p>Mouse: left = select/drag on plate, right = orbit, middle or "
+                       "Shift+drag = pan, wheel = zoom.</p>"))
+
+    def _show_lan(self, fn):
+        def go():
+            self.docks["Printer control"].show()
+            self.docks["Printer control"].raise_()
+            fn()
+        return go
+
+    def log_msg(self, text: str):
+        self.log.appendPlainText(text)
+
+    # ------------------------------------------------------------ selection
+    def selected_ids(self) -> list[int]:
+        return list(self.viewport.selected)
+
+    def primary(self) -> Part | None:
+        ids = self.selected_ids()
+        return self.scene.get(ids[0]) if ids else None
+
+    def select(self, ids: list[int]):
+        self.viewport.set_selection(ids, emit=False)
+        self._sync_panels()
+
+    def _on_viewport_selection(self, ids):
+        self._sync_panels()
+
+    def _sync_panels(self):
+        self.parts.refresh(self.scene, self.selected_ids())
+        p = self.primary()
+        self.props.set_part(p, self.reports.get(id(p.mesh)) if p else None)
+
+    def scene_changed(self, select=None, mesh_changed=None):
+        self.supports.sync()
+        if select is not None:
+            self.viewport.set_selection(select, emit=False)
+        else:
+            self.viewport.set_selection(self.selected_ids(), emit=False)
+        self._sync_panels()
+        self.viewport.update()
+
+    # ---------------------------------------------------------------- edits
+    def edit_parts(self, ids: list[int], text: str, fn) -> None:
+        parts = [self.scene.get(i) for i in ids if self.scene.get(i)]
+        before = {p.id: p.state() for p in parts}
+        for p in parts:
+            fn(p)
+        changes = {p.id: (before[p.id], p.state()) for p in parts if p.state() != before[p.id]}
+        if changes:
+            self.undo.push(StateCommand(self, changes, text))
+        else:
+            self._sync_panels()
+
+    def duplicate_selected(self):
+        new = []
+        for pid in self.selected_ids():
+            d = self.scene.duplicate(pid)
+            self.scene.remove(d.id)
+            new.append(d)
+        if new:
+            self.undo.push(AddPartsCommand(self, new, "Duplicate"))
+
+    def delete_selected(self):
+        ids = self.selected_ids()
+        if ids:
+            self.undo.push(RemovePartsCommand(self, ids))
+
+    def arrange_all(self):
+        if not self.scene.parts:
+            return
+        before = {p.id: p.state() for p in self.scene.parts}
+        fits = self.scene.arrange()
+        changes = {p.id: (before[p.id], p.state()) for p in self.scene.parts if p.state() != before[p.id]}
+        if changes:
+            self.undo.push(StateCommand(self, changes, "Arrange"))
+        if not fits:
+            self.log_msg("Arrange: the parts do not all fit on the build plate.")
+
+    def start_lay_flat(self):
+        if self.scene.parts:
+            self.viewport.start_lay_flat()
+            self.statusBar().showMessage("Lay flat: click the face that should rest on the plate (Esc cancels)")
+
+    def _lay_flat(self, pid: int, face: int):
+        self.edit_parts([pid], "Lay flat", lambda p: self.scene.lay_flat(p, face))
+        self.statusBar().clearMessage()
+
+    # ------------------------------------------------------- hollow / drain holes
+    def _replace_mesh(self, pid, mesh, text):
+        if self.scene.get(pid) is None:
+            return
+        self.reports.pop(id(self.scene.get(pid).mesh), None)
+        self.undo.push(MeshCommand(self, pid, mesh, text))
+        new = self.scene.get(pid).mesh
+        self.reports[id(new)] = meshmod.analyze(new)
+        workers.submit(_warm, new)
+        self._sync_panels()
+
+    def hollow_dialog(self):
+        p = self.primary()
+        if not p:
+            QMessageBox.information(self, APP, "Select a part to hollow.")
+            return
+        dlg = HollowDialog(self.settings, self)
+        if dlg.exec() != HollowDialog.Accepted:
+            return
+        dlg.save()
+        self.hollow_selected(dlg.value())
+
+    def hollow_selected(self, hs):
+        p = self.primary()
+        if not p:
+            return
+        pid, name = p.id, p.name
+        self.log_msg(f"Hollowing {name} ({hs.hollow_type}, wall {hs.thickness} mm, accuracy {hs.accuracy} mm)…")
+        self.statusBar().showMessage(f"Hollowing {name}…")
+
+        def done(res):
+            mesh, r = res
+            self._replace_mesh(pid, mesh, "Hollow")
+            self.log_msg(f"Hollowed {name}: {r.cavities} cavit{'y' if r.cavities == 1 else 'ies'}, "
+                         f"volume {r.original_volume:.1f} → {mesh.volume * float(np.prod(np.abs(self.scene.get(pid).scale))):.1f} mm³. "
+                         "Add drain holes (Ctrl+Shift+D) so resin can escape.")
+            self.statusBar().showMessage("Hollowed — add drain holes", 8000)
+            self.hollowFinished.emit(True)
+
+        def failed(msg):
+            self.log_msg("Hollow failed: " + msg.splitlines()[0])
+            QMessageBox.warning(self, APP, "Hollow failed: " + msg.splitlines()[0])
+            self.statusBar().clearMessage()
+            self.hollowFinished.emit(False)
+        workers.submit(hollow_part, p, hs, on_done=done, on_failed=failed)
+
+    def drain_hole_mode(self):
+        if not self.scene.parts:
+            return
+        dlg = DrainHoleDialog(self.settings, self)
+        if dlg.exec() != DrainHoleDialog.Accepted:
+            return
+        dlg.save()
+        self._hole_settings = dlg.value()
+        self.viewport.start_hole_mode()
+        self.statusBar().showMessage("Drain holes: click on a part to drill (Esc to finish)")
+
+    def _hole_picked(self, pid, face, hit):
+        p = self.scene.get(pid)
+        s, direction = getattr(self, "_hole_settings", None) or DrainHoleDialog(self.settings).value()
+        try:
+            mesh = drill_part(p, face, hit, s, direction)
+        except (hollowmod.HollowError, ValueError) as e:
+            self.log_msg(f"Drain hole failed: {e}")
+            return
+        self._replace_mesh(pid, mesh, "Drain hole")
+        self.log_msg(f"Drain hole in {p.name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
+                     f"Ø{2 * s.radius1:.1f} mm")
+
+    def trapped_resin(self) -> list:
+        return hollowmod.sealed_cavities([x.world_mesh() for x in self.scene.parts])
+
+    def check_trapped_resin(self) -> bool:
+        cav = self.trapped_resin()
+        if not cav:
+            self.log_msg("No sealed cavities: resin can drain from every part.")
+            self.statusBar().showMessage("No trapped resin", 5000)
+            return True
+        self._report_cavities(cav)
+        return False
+
+    def _report_cavities(self, cav):
+        lines = [f"• {c.volume:.0f} mm³, lowest point ({c.lowest[0]:.1f}, {c.lowest[1]:.1f}, {c.lowest[2]:.1f})"
+                 for c in cav[:8]]
+        self.log_msg(f"{len(cav)} sealed cavit{'y' if len(cav) == 1 else 'ies'} will trap resin:\n" + "\n".join(lines))
+        return lines
+
+    def _confirm_no_trapped_resin(self) -> bool:
+        cav = self.trapped_resin()
+        if not cav:
+            return True
+        lines = self._report_cavities(cav)
+        return QMessageBox.warning(
+            self, APP, f"{len(cav)} sealed cavit{'y' if len(cav) == 1 else 'ies'} will trap uncured resin "
+            "(it can crack the print or burst during curing):\n\n" + "\n".join(lines) +
+            "\n\nAdd a drain hole near each lowest point (Edit → Add drain holes). Slice anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+    # ------------------------------------------------------------------- supports
+    def template_dir(self) -> Path | None:
+        saved = self.settings.value("scriptDir", "")
+        if saved and Path(saved).is_dir():
+            return Path(saved)
+        ini = getattr(self, "_profile_ini", None)
+        return support_defaults.script_dir_for(ini) if ini else None
+
+    def support_templates(self) -> list:
+        d = self.template_dir()
+        p = self.printer_panel.current()
+        return support_defaults.load_templates(d, p.name if p else None) if d else []
+
+    def auto_support_dialog(self):
+        if not self.scene.parts:
+            return
+        sel = [self.scene.get(i) for i in self.selected_ids()]
+        h = max(float(np.ptp(p.world_vertices()[:, 2])) for p in (sel or self.scene.parts))
+        dlg = SupportDialog(self.support_templates(), h, bool(sel), self)
+        if dlg.exec() != SupportDialog.Accepted:
+            return
+        params, name = dlg.params()
+        targets = self.scene.parts if dlg.apply_to_all() else sel
+        for p in targets:
+            self.auto_support(p, params, name)
+
+    def auto_support(self, part, params, template: str = ""):
+        """Lift the part to params.lift, generate supports in the background, push one undo step."""
+        pid = part.id
+        before = SupportsCommand.snapshot(part)
+        lifted = part.state()
+        lifted.position[2] += params.lift - part.bounds()[0][2]
+        model = part.world_mesh()
+        model.apply_translation([0, 0, lifted.position[2] - part.position[2]])
+        frame = Part(part.name, part.mesh, lifted.position.copy(), lifted.rotation.copy(), lifted.scale.copy())
+        self.log_msg(f"Generating supports for {part.name} ({template or 'built-in values'})…")
+        self.statusBar().showMessage(f"Generating supports for {part.name}…")
+
+        def done(res):
+            contacts, result, islands = res
+            p = self.scene.get(pid)
+            if p is None:
+                return
+            plan = supportmod.SupportPlan.from_world(frame, contacts, params, template)
+            frame.supports = plan
+            frame.mesh = p.mesh
+            self.supports.prime(pid, frame, result)      # reuse the geometry just built
+            self.undo.push(SupportsCommand(self, pid, before, (plan, params.lift, lifted), "Auto-support"))
+            ground = sum(not x.on_model for x in result.pillars)
+            raft = f"{ground} to the raft" + (f" on {result.trunks} trunks" if result.trunks else "")
+            self.log_msg(f"Supports for {p.name}: {len(result.pillars)} ({raft}, "
+                         f"{len(result.pillars) - ground} on the model), {len(result.rejected)} contact(s) "
+                         f"skipped, raft holes {result.raft_holes}"
+                         + (f"; {len(islands)} island(s) still unsupported — add supports by hand (S)" if islands else ""))
+            self.statusBar().showMessage("Supports generated", 5000)
+            self.viewport.update()
+            self.supportsFinished.emit(len(islands))
+
+        def failed(msg):
+            self.log_msg("Auto-support failed: " + msg.splitlines()[0])
+            self.statusBar().clearMessage()
+            self.supportsFinished.emit(-1)
+        workers.submit(supportmod.auto_support, model, params, on_done=done, on_failed=failed)
+
+    def clear_supports(self):
+        for pid in self.selected_ids() or [p.id for p in self.scene.parts]:
+            p = self.scene.get(pid)
+            if p is None or p.supports is None:
+                continue
+            before = SupportsCommand.snapshot(p)
+            st = p.state()
+            st.position[2] -= p.bounds()[0][2]
+            self.undo.push(SupportsCommand(self, pid, before, (None, 0.0, st), "Clear supports"))
+
+    def support_edit_mode(self):
+        if not self.scene.parts:
+            return
+        self.viewport.start_support_mode()
+        self.statusBar().showMessage("Supports: click a part to add a support, Ctrl+click a support "
+                                     "to remove it (Esc to finish)")
+
+    def _support_hit(self, o, d):
+        """Nearest support hit: (distance, part, world point) or None."""
+        best = None
+        for p in self.scene.parts:
+            e = self.supports.entry(p) or self.supports.cache.get(p.id)
+            if e is None or e.result.mesh is None:
+                continue
+            off = self.supports.offset(p, e)
+            loc, _, _ = e.result.mesh.ray.intersects_location((np.asarray(o) - off)[None], np.asarray(d)[None],
+                                                             multiple_hits=False)
+            if len(loc):
+                dist = float(np.linalg.norm(loc[0] + off - o))
+                if best is None or dist < best[0]:
+                    best = (dist, p, loc[0])
+        return best
+
+    def _support_click(self, o, d, remove: bool):
+        o, d = np.asarray(o, float), np.asarray(d, float)
+        part, face, hit = self.scene.pick(o, d)
+        sup = self._support_hit(o, d)
+        if remove:
+            if sup is None:
+                return
+            _, p, local_hit = sup
+            e = self.supports.cache.get(p.id)
+            i = supportmod.nearest_pillar(e.result.pillars, local_hit)
+            if i is None:
+                return
+            target = e.result.pillars[i].contact.point + self.supports.offset(p, e)
+            cs = p.supports.world_contacts(p)
+            j = int(np.argmin([np.linalg.norm(c.point - target) for c in cs]))
+            before = SupportsCommand.snapshot(p)
+            plan = p.supports.with_contacts(p, cs[:j] + cs[j + 1:])
+            self.undo.push(SupportsCommand(self, p.id, before, (plan, p.elevation, p.state()), "Remove support"))
+            return
+        if part is None or (sup is not None and sup[0] < float(np.linalg.norm(hit - o))):
+            return
+        n_local = part.mesh.face_normals[face]
+        nw = part.rotation @ (n_local / part.scale)
+        nw /= np.linalg.norm(nw)
+        before = SupportsCommand.snapshot(part)
+        if part.supports is None:
+            params = supportmod.SupportParams()
+            st = part.state()
+            dz = params.lift - part.bounds()[0][2]
+            st.position[2] += dz
+            contact = supportmod.Contact(np.asarray(hit) + [0, 0, dz], nw, supportmod.MANUAL)
+            frame = Part(part.name, part.mesh, st.position, st.rotation, st.scale)
+            plan = supportmod.SupportPlan.from_world(frame, [contact], params)
+            self.undo.push(SupportsCommand(self, part.id, before, (plan, params.lift, st), "Add support"))
+            return
+        cs = part.supports.world_contacts(part) + [supportmod.Contact(np.asarray(hit), nw, supportmod.MANUAL)]
+        plan = part.supports.with_contacts(part, cs)
+        self.undo.push(SupportsCommand(self, part.id, before, (plan, part.elevation, part.state()), "Add support"))
+
+    def _supports_updated(self):
+        self.viewport.update()
+
+    def unsupported_islands(self) -> list:
+        meshes = [p.world_mesh() for p in self.scene.parts]
+        meshes += [m for m in (self.supports.world_mesh(p) for p in self.scene.parts) if m is not None]
+        h = self.print_settings.settings().layer_height if self.printer_panel.current() else 0.05
+        return supportmod.unsupported_islands(meshes, layer_height=max(h, 0.05))
+
+    def check_islands(self) -> list:
+        isl = self.unsupported_islands()
+        if not isl:
+            self.log_msg("No unsupported islands: every region connects to the layer below.")
+            self.statusBar().showMessage("No unsupported islands", 5000)
+        else:
+            self._report_islands(isl)
+        return isl
+
+    def _report_islands(self, isl) -> list[str]:
+        lines = [f"• z {i.z:.2f} mm at ({i.point[0]:.1f}, {i.point[1]:.1f}): up to {i.area:.2f} mm², "
+                 f"hangs {i.height:.2f} mm" for i in isl[:10]]
+        if len(isl) > 10:
+            lines.append(f"• … and {len(isl) - 10} more")
+        self.log_msg(f"{len(isl)} unsupported island(s) would print in mid-air:\n" + "\n".join(lines))
+        return lines
+
+    def repair_selected(self):
+        p = self.primary()
+        if not p:
+            return
+        pid = p.id
+        self.log_msg(f"Repairing {p.name}…")
+
+        def done(res):
+            fixed, rep = res
+            if self.scene.get(pid) is None:
+                return
+            self.reports[id(fixed)] = rep
+            self.undo.push(MeshCommand(self, pid, fixed))
+            # MeshCommand.set_mesh copies the mesh; register the stored one too
+            self.reports[id(self.scene.get(pid).mesh)] = rep
+            workers.submit(_warm, self.scene.get(pid).mesh)
+            self.log_msg(f"Repaired {self.scene.get(pid).name}: "
+                         + ("OK" if rep.ok else "; ".join(rep.problems())))
+            self._sync_panels()
+        workers.submit(_repair_and_analyze, p.mesh, on_done=done,
+                       on_failed=lambda m: self.log_msg(f"Repair failed: {m}"))
+
+    # --------------------------------------------------------------- import
+    def import_dialog(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Import models", self.settings.value("lastDir", str(Path.home())),
+                                                MODEL_FILTER)
+        if files:
+            self.settings.setValue("lastDir", str(Path(files[0]).parent))
+            self.import_files(files)
+
+    def import_files(self, files: list[str]):
+        for f in files:
+            self._pending += 1
+            self.log_msg(f"Loading {f}…")
+            workers.submit(_load_and_analyze, f,
+                           on_done=lambda res, f=f: self._imported(f, res),
+                           on_failed=lambda msg, f=f: self._import_failed(f, msg))
+
+    def _import_failed(self, f, msg):
+        self._pending -= 1
+        self.log_msg(f"Import failed for {Path(f).name}: {msg.splitlines()[0]}")
+        QMessageBox.warning(self, APP, f"Could not import {Path(f).name}:\n{msg.splitlines()[0]}")
+        self.importFinished.emit(0)
+
+    def _imported(self, f, res):
+        self._pending -= 1
+        new = []
+        for part, rep in res:
+            part.position[:2] = 0.0
+            self.reports[id(part.mesh)] = rep
+            new.append(part)
+            self.log_msg(f"Imported {part.name}: {rep.triangles:,} triangles, "
+                         f"{' × '.join(f'{x:.2f}' for x in part.mesh.extents)} mm"
+                         + ("" if rep.ok else f" — ⚠ {'; '.join(rep.problems())}"))
+        for p in new:
+            self.scene.drop_to_plate(p)
+        self.undo.beginMacro(f"Import {Path(f).name}")
+        self.undo.push(AddPartsCommand(self, new, "Add"))
+        if self._overlaps(new) or len(new) > 1:
+            self.arrange_all()
+        self.undo.endMacro()
+        for p in new:
+            if not self.scene.in_volume(p):
+                self.log_msg(f"⚠ {p.name} does not fit in the build volume of the selected printer.")
+        self.viewport.frame_selection() if len(self.scene.parts) == len(new) else None
+        self.importFinished.emit(len(new))
+
+    def _overlaps(self, new: list[Part]) -> bool:
+        ids = {p.id for p in new}
+        others = [p for p in self.scene.parts if p.id not in ids]
+        for a in new:
+            la, ha = a.bounds()
+            for b in others:
+                lb, hb = b.bounds()
+                if np.all(la[:2] < hb[:2]) and np.all(lb[:2] < ha[:2]):
+                    return True
+        return False
+
+    # --------------------------------------------------------------- slicing
+    def make_slice_job(self) -> slicermod.SliceJob:
+        p = self.printer_panel.current()
+        if p is None:
+            raise ValueError("No printer selected — locate the SatelLite profiles first.")
+        if not self.scene.parts:
+            raise ValueError("Nothing to slice — import a model first.")
+        outside = [x.name for x in self.scene.parts if not self.scene.in_volume(x)]
+        if outside:
+            raise ValueError("These parts are outside the build volume: " + ", ".join(outside))
+        meshes = [x.world_mesh() for x in self.scene.parts]
+        for x in self.scene.parts:
+            sm = self.supports.world_mesh(x)
+            if sm is not None:
+                meshes.append(sm)
+        rgb = slicermod.packed_rgb(preview.render(meshes))
+        return slicermod.SliceJob(meshes, RasterSpec.from_profile(p), self.print_settings.settings(),
+                                  p.name, machine_z=p.size_z, preview_rgb=rgb)
+
+    def slice_and_send(self):
+        """Slice to the cache dir, then upload and (after confirmation) start on the connected printer."""
+        sess = self.lan.session
+        if not (sess and sess.connected):
+            QMessageBox.warning(self, APP, "Connect to a printer first (Printer → Find printers).")
+            self._show_lan(lambda: None)()
+            return
+        try:
+            job = self.make_slice_job()
+        except ValueError as e:
+            QMessageBox.warning(self, APP, str(e))
+            return
+        if not self._confirm_no_trapped_resin():
+            return
+
+        def go():
+            out = Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / "sent"
+            out.mkdir(parents=True, exist_ok=True)
+            name = "".join(c if c.isalnum() or c in "-_." else "_" for c in self.scene.parts[0].name) or "model"
+            self._send_after_slice = True
+            self.start_slice(job, str(out / f"{name}.goo"))
+        self._island_check_then(job, go)
+
+    def slice_dialog(self):
+        try:
+            job = self.make_slice_job()
+        except ValueError as e:
+            QMessageBox.warning(self, APP, str(e))
+            return
+        if not self._confirm_no_trapped_resin():
+            return
+
+        def go():
+            default = Path(self.settings.value("lastGooDir", str(Path.home()))) / f"{self.scene.parts[0].name}.goo"
+            path, _ = QFileDialog.getSaveFileName(self, "Save sliced file", str(default), "ELEGOO GOO (*.goo)")
+            if path:
+                if not path.lower().endswith(".goo"):
+                    path += ".goo"
+                self.settings.setValue("lastGooDir", str(Path(path).parent))
+                self.start_slice(job, path)
+        self._island_check_then(job, go)
+
+    def _island_check_then(self, job: slicermod.SliceJob, proceed) -> None:
+        """Look for unsupported islands at the job's layer height in the background (it takes
+        seconds on detailed models), then call `proceed` unless the user cancels at the warning.
+        A failed check is logged and does not block slicing."""
+        self._set_slicing_enabled(False)
+        self.statusBar().showMessage("Checking for unsupported islands…")
+        h = max(job.settings.layer_height, 0.01)
+
+        def done(isl):
+            self._set_slicing_enabled(True)
+            self.statusBar().clearMessage()
+            if isl:
+                lines = self._report_islands(isl)
+                if QMessageBox.warning(
+                        self, APP, f"{len(isl)} unsupported island{'' if len(isl) == 1 else 's'} would "
+                        "print in mid-air (they stick to the film and the print fails there):\n\n"
+                        + "\n".join(lines) + "\n\nAdd supports there (Supports → Edit supports). Slice anyway?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                    return
+            proceed()
+
+        def failed(msg):
+            self._set_slicing_enabled(True)
+            self.log_msg("Island check failed (slicing anyway): " + msg.splitlines()[0])
+            proceed()
+        workers.submit(supportmod.unsupported_islands, job.meshes, layer_height=h,
+                       on_done=done, on_failed=failed)
+
+    def _set_slicing_enabled(self, on: bool) -> None:
+        self.slice_action.setEnabled(on)
+        self.send_action.setEnabled(on)
+
+    def start_slice(self, job: slicermod.SliceJob, path: str):
+        r = self.print_settings.current_resin()
+        p = self.printer_panel.current()
+        if p:
+            self.settings.setValue(f"resin/{p.name}", r.name if r else "")
+        self.log_msg(f"Slicing {job.layer_count} layers ({job.settings.layer_height} mm) → {path}")
+        t = SliceThread(job, path, self)
+        t.progress.connect(self._slice_progress)
+        t.finishedOk.connect(self._slice_done)
+        t.failed.connect(self._slice_failed)
+        t.finished.connect(self._slice_cleanup)
+        self._slice_thread = t
+        self.slice_action.setEnabled(False)
+        self.send_action.setEnabled(False)
+        self._progress.setRange(0, max(1, job.layer_count))
+        self._progress.setValue(0)
+        self._progress.show()
+        self._cancel_btn.show()
+        t.start()
+
+    def cancel_slice(self):
+        if self._slice_thread:
+            self._slice_thread.cancel()
+
+    def _slice_progress(self, done, total):
+        self._progress.setValue(done)
+        self.statusBar().showMessage(f"Slicing… {done}/{total} layers")
+
+    def _slice_done(self, res):
+        m, s = divmod(res.print_time, 60)
+        h, m = divmod(m, 60)
+        self.log_msg(f"Saved {res.path}: {res.layers} layers, est. print time {h}h {m:02d}m {s:02d}s, "
+                     f"volume {res.volume:.1f} mm³, weight {res.weight:.2f} g, cost {res.price:.2f}")
+        self.statusBar().showMessage(f"Sliced {res.layers} layers — estimated {h}h {m:02d}m", 15000)
+        self.open_goo(res.path)
+        if self._send_after_slice:
+            self._send_after_slice = False
+            self._show_lan(lambda: None)()
+            self.lan.send_file(str(res.path), start=True)
+
+    def _slice_failed(self, msg):
+        self._send_after_slice = False
+        self.log_msg(f"Slicing {'cancelled' if msg == 'cancelled' else 'failed: ' + msg}")
+        self.statusBar().showMessage("Slicing cancelled" if msg == "cancelled" else "Slicing failed", 8000)
+
+    def _slice_cleanup(self):
+        self._progress.hide()
+        self._cancel_btn.hide()
+        self.slice_action.setEnabled(True)
+        self.send_action.setEnabled(True)
+        self._slice_thread = None
+
+    def open_goo_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open .goo", self.settings.value("lastGooDir", str(Path.home())),
+                                              "ELEGOO GOO (*.goo)")
+        if path:
+            self.open_goo(path)
+
+    def open_goo(self, path: str):
+        try:
+            g = goo.read(path)
+        except (OSError, goo.GooError) as e:
+            QMessageBox.warning(self, APP, f"Cannot read {Path(path).name}: {e}")
+            return
+        self.layer_preview.set_file(g)
+        self.docks["Layers"].raise_()
+        h = g.header
+        self.log_msg(f"Opened {Path(path).name}: {h.machine_type}, {h.layer_count} layers, "
+                     f"{h.resolution_x}×{h.resolution_y}, resin '{h.resin_profile}'")
+
+    def closeEvent(self, e):
+        if self._slice_thread:
+            self._slice_thread.cancel()
+            self._slice_thread.wait(10000)
+        self.lan.shutdown()
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("windowState", self.saveState())
+        super().closeEvent(e)
+
+    # -------------------------------------------------------------- profiles
+    def _printer_changed(self, *_):
+        p = self.printer_panel.current()
+        if p:
+            self.settings.setValue("printer", p.name)
+            self.scene.size = np.array([p.size_x, p.size_y, p.size_z])
+            self._load_resins(p)
+            self.scene_changed()
+
+    def _load_resins(self, p):
+        resins = []
+        d = self.resin_dir()
+        if d:
+            key = str(d)
+            if getattr(self, "_resin_cache_key", None) != key:   # parse the ~2000 files once
+                self._resin_cache = settingsmod.load_resin_profiles(d)
+                self._resin_cache_key = key
+            resins = [r for r in self._resin_cache if r.printer == p.name]
+        self.print_settings.set_sources(settingsmod.from_printer_profile(p), resins,
+                                        self.settings.value(f"resin/{p.name}"))
+        self.log_msg(f"{p.name}: {len(resins)} resin profile(s) available")
+
+    def resin_dir(self) -> Path | None:
+        saved = self.settings.value("resinDir", "")
+        if saved and Path(saved).is_dir():
+            return Path(saved)
+        ini = getattr(self, "_profile_ini", None)
+        return settingsmod.resin_dir_for(ini) if ini else None
+
+    def load_profiles(self) -> bool:
+        saved = self.settings.value("profileIni", "") or None
+        ini = profiles.find_official_ini([x for x in (saved, data_dir() / "officialPlatform.ini") if x])
+        if not ini:
+            self.log_msg("No printer profiles found. Use File → Locate SatelLite profiles… and "
+                         "pick your SatelLite install folder or officialPlatform.ini.")
+            self.printer_panel.set_profiles({})
+            return False
+        ps = profiles.load_profiles(ini)
+        self._profile_ini = ini
+        self.printer_panel.set_profiles(ps, self.settings.value("printer"))
+        self.log_msg(f"Loaded {len(ps)} Saturn 4 profile(s) from {ini}")
+        return bool(ps)
+
+    def locate_profiles(self):
+        path, _ = QFileDialog.getOpenFileName(self, "SatelLite officialPlatform.ini", str(Path.home()),
+                                              "officialPlatform.ini (officialPlatform.ini);;INI (*.ini)")
+        if path:
+            self.import_profiles(path)
+
+    def import_profiles(self, path: str) -> bool:
+        if not profiles.load_profiles(path):
+            QMessageBox.warning(self, APP, "That file contains no Saturn 4 printer profiles.")
+            return False
+        resins = settingsmod.resin_dir_for(path)   # stays in the user's install; not copied
+        if resins:
+            self.settings.setValue("resinDir", str(resins))
+        scripts = support_defaults.script_dir_for(path)   # support templates, also read in place
+        if scripts:
+            self.settings.setValue("scriptDir", str(scripts))
+        if os.environ.get("FLATPAK_ID") and not (resins and scripts):
+            # the file portal exposes only the picked file, not the install folder around it
+            self.log_msg("Resin profiles or support templates were not found next to this file. In the "
+                         "Flatpak, give GooSlicer read access to your SatelLite folder, then locate the "
+                         "profiles again:\n  flatpak override --user --filesystem=\"/path/to/SatelLite:ro\" "
+                         f"{os.environ['FLATPAK_ID']}")
+        dest = data_dir() / "officialPlatform.ini"  # local copy of the user's own file
+        if Path(path).resolve() != dest.resolve():
+            shutil.copyfile(path, dest)
+        self.settings.setValue("profileIni", str(dest))
+        return self.load_profiles()
+
+
+
+def main(argv=None) -> int:
+    QSurfaceFormat.setDefaultFormat(default_format())
+    app = QApplication(sys.argv if argv is None else argv)
+    app.setApplicationName(APP)
+    app.setOrganizationName(APP)
+    app.setDesktopFileName(os.environ.get("FLATPAK_ID", "gooslicer"))   # must match the .desktop file
+    w = MainWindow()
+    w.show()
+    files = [a for a in app.arguments()[1:] if Path(a).suffix.lower() in meshmod.SUPPORTED]
+    if files:
+        w.import_files(files)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

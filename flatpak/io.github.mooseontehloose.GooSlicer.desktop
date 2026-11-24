@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=GooSlicer
+GenericName=MSLA Slicer
+Comment=Prepare, support, slice and print models on ELEGOO Saturn 4 resin printers
+Exec=gooslicer %F
+Icon=io.github.mooseontehloose.GooSlicer
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;
+Keywords=3D;printing;resin;MSLA;slicer;goo;ELEGOO;Saturn;
+MimeType=model/stl;model/3mf;model/obj;application/sla;
+StartupWMClass=GooSlicer

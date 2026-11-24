@@ -1,0 +1,1 @@
+"""GooSlicer Qt user interface."""

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.mooseontehloose.GooSlicer</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>GooSlicer</name>
+  <summary>Slicer and printer control for ELEGOO Saturn 4 resin printers</summary>
+  <description>
+    <p>
+      GooSlicer prepares models for ELEGOO Saturn 4, Saturn 4 Ultra and Saturn 4 Ultra 16K
+      MSLA printers: import, orient and arrange, hollow and drill drain holes, add supports,
+      slice to .goo, and send and monitor prints over the local network.
+    </p>
+    <p>
+      Printer, resin and support profiles are read from your own ELEGOO SatelLite
+      installation; GooSlicer does not ship them.
+    </p>
+  </description>
+  <developer id="io.github.mooseontehloose">
+    <name>mooseontehloose</name>
+  </developer>
+  <url type="homepage">https://github.com/mooseontehloose</url>
+  <launchable type="desktop-id">io.github.mooseontehloose.GooSlicer.desktop</launchable>
+  <provides>
+    <binary>gooslicer</binary>
+  </provides>
+  <categories>
+    <category>Graphics</category>
+    <category>3DGraphics</category>
+  </categories>
+  <requires>
+    <display_length compare="ge">1024</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-23"/>
+  </releases>
+</component>
