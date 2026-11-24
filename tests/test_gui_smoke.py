@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import pytest
 
@@ -400,4 +401,704 @@ def test_tree_supports_from_dialog(app, tmp_path, monkeypatch):
     assert part.supports.params.style == "tree" and "trunks" in w.log.toPlainText()
     sm = w.supports.world_mesh(part)
     assert sm is not None and sm.is_watertight and w.unsupported_islands() == []
+    w.close()
+
+
+def test_theme_switching(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtGui import QPalette
+    from gooslicer_qt import theme
+    from gooslicer_qt.main import MainWindow
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    monkeypatch.setattr(theme, "system_is_dark", lambda a: False)
+    w = MainWindow(settings=s)
+    assert set(w.theme_actions) == {"system", "light", "dark"} and w.theme_actions["system"].isChecked()
+    assert app.style().name().lower() == "fusion"
+    light_bg = app.palette().color(QPalette.Window).lightness()
+
+    w.theme_actions["dark"].trigger()
+    assert w.theme_actions["dark"].isChecked() and s.value("theme") == "dark"
+    assert app.palette().color(QPalette.Window).lightness() < 80 < light_bg
+    assert app.palette().color(QPalette.Text).lightness() > 200
+    assert theme.WARNING["dark"] in w.lan.warn_label.styleSheet()
+    w.close()
+
+    # remembered: a new window starts dark
+    w = MainWindow(settings=s)
+    assert w.theme.current == "dark" and w.theme_actions["dark"].isChecked()
+
+    # "system" follows the desktop, live
+    w.set_theme("system")
+    assert w.theme.current == "light" and theme.WARNING["light"] in w.lan.warn_label.styleSheet()
+    monkeypatch.setattr(theme, "system_is_dark", lambda a: True)
+    w.theme._system_changed(None)
+    assert w.theme.current == "dark" and app.palette().color(QPalette.Window).lightness() < 80
+    # an explicit choice ignores desktop changes
+    w.set_theme("light")
+    w.theme._system_changed(None)
+    assert w.theme.current == "light"
+    w.close()
+
+
+def test_parts_import_button(app, tmp_path, monkeypatch):
+    import trimesh
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtWidgets import QFileDialog
+    from gooslicer_qt.main import MainWindow
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    stl = tmp_path / "cube.stl"
+    trimesh.creation.box((5, 5, 5)).export(stl)
+    monkeypatch.setattr(QFileDialog, "getOpenFileNames", lambda *a, **k: ([str(stl)], ""))
+    assert w.docks["Properties"].isAncestorOf(w.import_btn) and w.docks["Properties"].isAncestorOf(w.parts)
+    w.import_btn.click()
+    assert _wait(app, lambda: len(w.scene.parts) == 1)
+    assert w.parts.count() == 1 and w.parts.item(0).text().startswith("cube")
+    w.close()
+
+
+def test_resin_favourites(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from gooslicer import settings as S
+    from gooslicer_qt.slicing import PrintSettingsPanel
+    P16 = "ELEGOO Saturn 4 Ultra 16K"
+    resins = [S.ResinProfile(str(i), n, P16, "", {}) for i, n in enumerate("ABCD")]
+    k = {n: f"{P16}|{n}" for n in "ABCD"}
+    ps = PrintSettingsPanel()
+    ps.resize(400, 400)
+    ps.show()
+    ps.set_sources(S.PrintSettings(), resins, current="B")
+    c = ps.resin
+
+    def names():
+        return [c.itemText(i) or "---" for i in range(c.count())]
+    assert names() == ["Printer default", "A", "B", "C", "D"] and ps.current_resin().name == "B"
+    assert c.itemIcon(3).cacheKey() == ps._star_off.cacheKey()
+
+    # click the star of "C" in the open list
+    c.showPopup()
+    _wait(app, lambda: c.view().isVisible(), 5)
+    view = c.view()
+    row = view.visualRect(c.model().index(3, 0))
+    star = QPoint(row.left() + 6, row.center().y())
+    changed = []
+    ps.favoritesChanged.connect(changed.append)
+    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        btns = Qt.LeftButton if kind == QEvent.MouseButtonPress else Qt.NoButton
+        QApplication.sendEvent(view.viewport(), QMouseEvent(kind, QPointF(star), view.viewport().mapToGlobal(QPointF(star)),
+                                                            Qt.LeftButton, btns, Qt.NoModifier))
+    assert changed == [[k["C"]]] and ps.is_favorite(k["C"])
+    assert names() == ["Printer default", "C", "---", "A", "B", "D"]
+    assert c.itemIcon(1).cacheKey() == ps._star_on.cacheKey()
+    assert ps.current_resin().name == "B"                  # selection kept, nothing re-selected
+    assert view.isVisible()                                # list stays open
+    # the name area is left for normal selection
+    name_pt = QPoint(row.left() + 60, view.visualRect(c.model().index(4, 0)).center().y())
+    assert ps._star_clicks.star_hit(name_pt) is None
+    c.hidePopup()
+
+    ps.toggle_favorite(k["A"])
+    assert names() == ["Printer default", "A", "C", "---", "B", "D"]   # favourites keep profile order
+    ps.toggle_favorite(k["A"])
+    ps.toggle_favorite(k["C"])
+    assert names() == ["Printer default", "A", "B", "C", "D"]          # no divider without favourites
+    ps.close()
+
+    # saved and restored by the main window
+    from gooslicer_qt.main import MainWindow
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    w.print_settings.toggle_favorite(f"{P16}|Space Grey")
+    w.close()
+    w = MainWindow(settings=s)
+    assert w.print_settings.favorites == {f"{P16}|Space Grey"}
+    w.print_settings.toggle_favorite("ELEGOO Saturn 4|Clear")
+    w.close()
+    assert MainWindow(settings=s).print_settings.favorites == {f"{P16}|Space Grey", "ELEGOO Saturn 4|Clear"}
+
+    # same name on another printer is not a favourite
+    ps = PrintSettingsPanel()
+    ps.set_favorites([k["B"]])
+    ps.set_sources(S.PrintSettings(), [S.ResinProfile("9", "B", "ELEGOO Saturn 4", "", {})] + resins)
+    assert [ps.resin.itemText(i) for i in range(ps.resin.count())][:3] == ["Printer default", "B", ""]
+    assert ps.resin.itemData(1) == 2 and ps.resin.itemIcon(5).cacheKey() == ps._star_off.cacheKey()  # S4's "B" unstarred
+    ps.close()
+
+    # favourites saved by older versions (bare names) stay with the printer they were starred on
+    old = QtCore.QSettings(str(tmp_path / "old.ini"), QtCore.QSettings.IniFormat)
+    old.setValue("printer", P16)
+    old.setValue("resinFavorites", "Space Grey 8K ABS-Like 3.0")
+    w = MainWindow(settings=old)
+    assert w.print_settings.favorites == {f"{P16}|Space Grey 8K ABS-Like 3.0"}
+    assert old.value("resinFavorites") == [f"{P16}|Space Grey 8K ABS-Like 3.0"]
+    w.close()
+
+
+def test_remembers_printer_and_resin(app, tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    res = tmp_path / "install" / "resources"
+    ini = res / "machines" / "printer" / "officialPlatform.ini"
+    ini.parent.mkdir(parents=True)
+    ini.write_bytes(FIXTURE.encode())
+    mat = res / "resin" / "material"
+    mat.mkdir(parents=True)
+    for i, name in enumerate(("Alpha", "Beta", "Gamma")):
+        ap = {"vd_resine_profilename": name,
+              "cloudResinExtraParam": {"cloudResinPrinterName": "ELEGOO Saturn 4 Ultra 16K"},
+              "vd_printer_printer_para": {"vd_printer_printer_para_exposure_time": 2.0 + i}}
+        (mat / f"{i}.data").write_text(json.dumps({"platitem": {"vd_printer": {"vd_active_printer": ap}}}))
+    from gooslicer_qt.main import MainWindow
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    assert w.import_profiles(str(ini))
+    ps = w.print_settings
+    assert ps.current_resin() is None                       # first run: Printer default
+    ps.resin.setCurrentIndex(ps.resin.findText("Beta"))     # the user's pick is saved right away
+    assert s.value("printer") == "ELEGOO Saturn 4 Ultra 16K" and s.value("lastResin") == "Beta"
+    ps.toggle_favorite("ELEGOO Saturn 4 Ultra 16K|Gamma")   # re-sorting the list is not a pick
+    assert s.value("lastResin") == "Beta" and ps.current_resin().name == "Beta"
+    w.close()
+
+    w = MainWindow(settings=s)                              # reopened: same printer and resin
+    assert w.printer_panel.current().name == "ELEGOO Saturn 4 Ultra 16K"
+    assert w.print_settings.current_resin().name == "Beta"
+    assert w.print_settings.settings().exposure == pytest.approx(3.0)
+    w.print_settings.resin.setCurrentIndex(0)              # Printer default is remembered too
+    w.close()
+    w = MainWindow(settings=s)
+    assert w.print_settings.current_resin() is None
+    # a printer with no pick of its own starts on the last resin picked on any printer
+    s.setValue("lastResin", "Gamma")
+    assert w._last_resin("ELEGOO Saturn 4") == "Gamma" and w._last_resin("ELEGOO Saturn 4 Ultra 16K") == ""
+    w.close()
+
+
+def test_advanced_settings_collapsed(app):
+    from gooslicer_qt.slicing import PrintSettingsPanel
+    ps = PrintSettingsPanel()
+    ps.show()
+    app.processEvents()
+    fields = list(ps.widgets.values()) + [ps.slice_pos]
+    assert len(fields) == 10 and all(ps.advanced.isAncestorOf(f) for f in fields)
+    assert not ps.advanced_btn.isChecked() and not any(f.isVisible() for f in fields)
+    assert ps.resin.isVisible()
+    # directly below the resin profile
+    assert ps.layout().indexOf(ps.advanced_btn) == 1 and ps.layout().itemAt(0).layout().rowCount() == 1
+    ps.widgets["exposure"].setValue(3.3)                   # hidden values still count
+    assert ps.settings().exposure == 3.3
+    ps.advanced_btn.click()
+    app.processEvents()
+    assert ps.advanced_btn.isChecked() and all(f.isVisible() for f in fields)
+    assert ps.advanced_btn.arrowType() == QtCore.Qt.DownArrow
+    ps.advanced_btn.click()
+    assert not ps.advanced.isVisible() and ps.advanced_btn.arrowType() == QtCore.Qt.RightArrow
+    ps.close()
+
+
+def test_printer_row_and_details_popup(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtWidgets import QFormLayout
+    from gooslicer_qt.main import MainWindow
+    from gooslicer_qt.panels import InfoButton
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    assert "Printer" not in w.docks and "Print settings" in w.docks           # one merged tab
+    pp, ps = w.printer_panel, w.print_settings
+    assert w.docks["Print settings"].isAncestorOf(ps) and ps.isAncestorOf(pp)
+    top = ps._top
+    assert top.itemAt(0, QFormLayout.LabelRole).widget().text() == "Printer"
+    assert top.itemAt(0, QFormLayout.FieldRole).widget() is pp
+    assert top.itemAt(1, QFormLayout.FieldRole).widget() is ps.resin            # printer directly above resin
+    assert isinstance(pp.info_btn, InfoButton) and not pp.info_btn.isEnabled()  # no printer yet
+    src = tmp_path / "officialPlatform.ini"
+    src.write_bytes(FIXTURE.encode())
+    assert w.import_profiles(str(src))
+    w.show()
+    app.processEvents()
+    assert pp.info_btn.isEnabled()
+    lay = pp.layout()
+    assert lay.itemAt(0).widget() is pp.combo and lay.itemAt(1).widget() is pp.info_btn   # (i) right of the dropdown
+    assert not pp.details.isVisible() and not any(l.isVisible() for l in pp.info.values())
+    pp.info_btn.click()
+    assert _wait(app, lambda: pp.details.isVisible(), 5)
+    assert pp.details_title.text() == "ELEGOO Saturn 4 Ultra 16K"
+    assert pp.info["Pixel pitch"].text() == "14.0 × 19.0 µm" and pp.info["Resolution"].text() == "15120 × 6230 px"
+    assert set(pp.info) == {"Build volume", "Resolution", "Pixel pitch", "Mirror"}
+    btn = pp.info_btn.mapToGlobal(pp.info_btn.rect().bottomRight())
+    g = pp.details.frameGeometry()
+    assert g.top() >= btn.y() - 2 or g.bottom() <= btn.y() - pp.info_btn.height()   # below (or above if no room)
+    pp.details.hide()
+    w.close()
+
+
+def test_import_resin_profile(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    from gooslicer_qt.main import MainWindow, data_dir
+    from test_satres import satres
+    P16 = "ELEGOO Saturn 4 Ultra 16K"
+    one = satres(tmp_path / "one.satres", [("Siraya Blu", P16, {"print/exposuretime": 1.6, "resin/type": "Normal"})])
+    many = satres(tmp_path / "many.satres", [(f"Maker {c}", P16, {}) for c in "AB"]
+                  + [("Other printer", "ELEGOO Saturn 4", {})])
+    elsewhere = satres(tmp_path / "s4.satres", [("S4 only", "ELEGOO Saturn 4", {})])
+    bad = tmp_path / "bad.satres"
+    bad.write_bytes(b"nope")
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    src = tmp_path / "officialPlatform.ini"
+    src.write_bytes(FIXTURE.encode())
+    assert w.import_profiles(str(src))
+    ps = w.print_settings
+    file_menu = w.menuBar().actions()[0].menu()
+    act = next(a for a in file_menu.actions() if a.text().replace("&", "") == "Import resin profile…")
+
+    # File → Import resin profile…: one profile for this printer -> listed and selected
+    monkeypatch.setattr(QFileDialog, "getOpenFileNames", lambda *a, **k: ([str(one)], ""))
+    act.trigger()
+    assert ps.current_resin().name == "Siraya Blu" and ps.settings().exposure == 1.6
+    assert s.value("lastResin") == "Siraya Blu"                                  # remembered like a pick
+    assert len(list((data_dir() / "resins").glob("*.satres"))) == 1
+
+    def drop(target, *paths):
+        md = QMimeData()
+        md.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
+        enter = QDragEnterEvent(QPointF(5, 5), Qt.CopyAction, md, Qt.LeftButton, Qt.NoModifier)
+        QApplication.sendEvent(target, enter)
+        assert enter.isAccepted()
+        ev = QDropEvent(QPointF(5, 5), Qt.CopyAction, md, Qt.LeftButton, Qt.NoModifier)
+        QApplication.sendEvent(target, ev)
+        return ev.isAccepted()
+
+    # dropped on the Print settings dock: several profiles are added, the selection stays
+    assert drop(w.docks["Print settings"], many)
+    names = [r.name for r in ps.resins]
+    assert {"Siraya Blu", "Maker A", "Maker B"} <= set(names) and "Other printer" not in names
+    assert ps.current_resin().name == "Siraya Blu"
+    # dropped on the main window (and the 3D view): profiles for another printer wait there
+    assert drop(w, elsewhere)
+    assert "for ELEGOO Saturn 4" in w.statusBar().currentMessage() and "S4 only" not in [r.name for r in ps.resins]
+    # a broken file is reported, nothing else changes
+    w.viewport.filesDropped.emit([str(bad)])
+    assert warned and "not a SatelLite resin profile" in warned[-1]
+    assert len(list((data_dir() / "resins").glob("*.satres"))) == 3
+    w.close()
+
+    # still there after a restart, and the selection is remembered
+    w = MainWindow(settings=s)
+    assert w.print_settings.current_resin().name == "Siraya Blu"
+    assert {"Maker A", "Maker B"} <= {r.name for r in w.print_settings.resins}
+    w.close()
+
+
+def test_restore_windows_to_default(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtCore import Qt
+    from gooslicer_qt.main import MainWindow
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    w.resize(1200, 800)
+    w.show()
+    app.processEvents()
+    areas = {t: w.dockWidgetArea(d) for t, d in w.docks.items()}
+    assert areas["Properties"] == Qt.RightDockWidgetArea
+    w.docks["Properties"].close()                             # closed, as the user did
+    w.docks["Log"].setFloating(True)
+    w.removeDockWidget(w.docks["Print settings"])             # gone from the layout entirely
+    w.close()                                                 # the broken layout is saved
+
+    w = MainWindow(settings=s)
+    w.resize(1200, 800)
+    w.show()
+    app.processEvents()
+    assert not w.docks["Properties"].isVisible()              # stays closed after a restart
+    view = next(a.menu() for a in w.menuBar().actions() if a.text() == "&View")
+    act = next(a for a in view.actions() if a.text().replace("&", "") == "Restore all windows to default")
+    act.trigger()
+    app.processEvents()
+    assert all(d.isVisible() or w.tabifiedDockWidgets(d) for d in w.docks.values())
+    assert not any(d.isFloating() for d in w.docks.values())
+    assert {t: w.dockWidgetArea(d) for t, d in w.docks.items()} == areas
+    assert w.docks["Print settings"].isVisible() and w.docks["Log"].isVisible()
+    assert set(w.tabifiedDockWidgets(w.docks["Log"])) == {w.docks["Layers"]}
+    assert set(w.tabifiedDockWidgets(w.docks["Print settings"])) == {w.docks["Properties"]}
+    w.close()
+    w = MainWindow(settings=s)                                # and the restored layout is kept
+    w.show()
+    app.processEvents()
+    assert set(w.tabifiedDockWidgets(w.docks["Print settings"])) == {w.docks["Properties"]}
+    w.close()
+
+
+def test_manage_resins(app, tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
+    from gooslicer import settings as S
+    from gooslicer_qt.main import MainWindow
+    from test_satres import satres
+    P16 = "ELEGOO Saturn 4 Ultra 16K"
+    res = tmp_path / "install" / "resources"
+    ini = res / "machines" / "printer" / "officialPlatform.ini"
+    ini.parent.mkdir(parents=True)
+    ini.write_bytes(FIXTURE.encode())
+    mat = res / "resin" / "material"
+    mat.mkdir(parents=True)
+    for i, (name, printer) in enumerate((("Alpha", P16), ("Beta", P16), ("Mars only", "ELEGOO Mars 4 Ultra"))):
+        ap = {"vd_resine_profilename": name, "vd_resine_company": "ELEGOO",
+              "cloudResinExtraParam": {"cloudResinPrinterName": printer},
+              "vd_printer_printer_para": {"vd_printer_printer_para_exposure_time": 2.0 + i},
+              "vd_printer_resin_para": {"vd_printer_resin_para_type": "Standard"}}
+        (mat / f"{i}.data").write_text(json.dumps({"platitem": {"vd_printer": {"vd_active_printer": ap}}}))
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    assert w.import_profiles(str(ini))
+    w.import_resin_profiles([str(satres(tmp_path / "pack.satres", [("Siraya", P16, {"print/exposuretime": 1.6}),
+                                                                    ("Other", P16, {})]))])
+    w.resize(1100, 750)
+    w.show()
+    app.processEvents()
+    ps = w.print_settings
+
+    def listed():
+        return [r.name for r in ps.resins]
+
+    # Resin menu sits between Printer and View
+    titles = [a.text() for a in w.menuBar().actions()]
+    assert titles.index("&Resin") == titles.index("&Printer") + 1 == titles.index("&View") - 1
+    resin_menu = next(a.menu() for a in w.menuBar().actions() if a.text() == "&Resin")
+    act = next(a for a in resin_menu.actions() if a.text().replace("&", "") == "Manage resins…")
+    act.trigger()
+    dlg = w._resin_manager
+    assert _wait(app, dlg.isVisible, 5) and dlg.size() == w.size()
+    names = {dlg.tree.topLevelItem(i).text(0) for i in range(dlg.tree.topLevelItemCount())}
+    assert names == {"Alpha", "Beta", "Siraya", "Other"}               # not other printers' profiles
+
+    def pick(name):
+        it = next(dlg.tree.topLevelItem(i) for i in range(dlg.tree.topLevelItemCount())
+                  if dlg.tree.topLevelItem(i).text(0) == name)
+        dlg.tree.setCurrentItem(it)
+        app.processEvents()
+        return dlg.current
+
+    # selecting shows the properties on the right, read-only for SatelLite's and imported ones
+    r = pick("Beta")
+    assert dlg.title.text() == "Beta" and dlg.fields["exposure"].value() == 3.0
+    assert dlg.meta["Source"].text() == "ELEGOO (SatelLite)" and dlg.fields["exposure"].isReadOnly()
+    assert pick("Siraya").source == "imported" and dlg.fields["exposure"].value() == 1.6
+    dlg.search.setText("sir")
+    assert dlg.tree.topLevelItemCount() == 1
+    dlg.search.clear()
+
+    # Copy… asks for a name, refuses one that exists (any case), then makes an editable copy
+    pick("Beta")
+    answers = iter([("alpha", True), ("Beta custom", True)])
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: next(answers))
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a[2]))
+    new = dlg.copy_current()
+    assert len(warned) == 1 and "already exists" in warned[0]
+    assert new.name == "Beta custom" and dlg.current.key == new.key and not dlg.fields["exposure"].isReadOnly()
+    assert "Beta custom" in listed()
+    dlg.fields["exposure"].setValue(4.5)                                # edits are saved
+    dlg.save_edits()
+    ps.resin.setCurrentIndex(ps.resin.findText("Beta custom", Qt.MatchStartsWith))
+    assert ps.settings().exposure == 4.5
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("", False))
+    assert dlg.copy_current() is None                                   # cancelled
+
+    # hide: gone from the Print settings list, still in the manager (marked)
+    pick("Alpha")
+    dlg.hide_chk.setChecked(True)
+    assert "Alpha" not in listed() and dlg.tree.currentItem().text(4) == "Hidden"
+    dlg.hide_chk.setChecked(False)
+    assert "Alpha" in listed()
+
+    # export as .satres
+    out = tmp_path / "exported"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
+    pick("Beta custom")
+    assert dlg.export_current() == str(out) + ".satres"
+    (back,) = S.load_satres(str(out) + ".satres")
+    assert (back.name, back.printer, back.settings().exposure) == ("Beta custom", P16, 4.5)
+
+    # delete: a copy's file goes; SatelLite's own is only dropped from GooSlicer's lists
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    path = Path(dlg.current.path)
+    assert dlg.delete_current() and not path.exists() and "Beta custom" not in listed()
+    pick("Alpha")
+    assert dlg.delete_current()
+    assert "Alpha" not in listed() and (mat / "0.data").exists()
+    pick("Other")
+    assert dlg.delete_current() and "Other" not in listed() and "Siraya" in listed()
+    names = {dlg.tree.topLevelItem(i).text(0) for i in range(dlg.tree.topLevelItemCount())}
+    assert names == {"Beta", "Siraya"}
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+    pick("Beta")
+    assert not dlg.delete_current() and "Beta" in listed()               # declined
+    dlg.close()
+    w.close()
+
+    w = MainWindow(settings=s)                                          # all of it sticks
+    assert [r.name for r in w.print_settings.resins] == ["Beta", "Siraya"]
+    w.close()
+
+
+def test_manage_resins_favourites(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from gooslicer_qt.main import MainWindow
+    from gooslicer_qt.resins import DIVIDER, GROUP_ROLE
+    from test_satres import satres
+    P16 = "ELEGOO Saturn 4 Ultra 16K"
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    src = tmp_path / "officialPlatform.ini"
+    src.write_bytes(FIXTURE.encode())
+    assert w.import_profiles(str(src))
+    w.import_resin_profiles([str(satres(tmp_path / "p.satres", [(n, P16, {}) for n in ("Alpha", "Beta", "Gamma", "Delta")]
+                                        + [("Delta", "ELEGOO Saturn 4", {})]))])
+    w.print_settings.toggle_favorite(f"{P16}|Gamma")                   # starred in Print settings first
+    w.resize(1100, 750)
+    w.show()
+    dlg = w.manage_resins()
+    assert _wait(app, dlg.isVisible, 5)
+    tree = dlg.tree
+
+    def rows():
+        out = []
+        for i in range(tree.topLevelItemCount()):
+            it = tree.topLevelItem(i)
+            out.append("---" if it.data(0, GROUP_ROLE) == DIVIDER else it.text(0))
+        return out
+
+    def item(name, printer=P16):
+        return next(tree.topLevelItem(i) for i in range(tree.topLevelItemCount())
+                    if tree.topLevelItem(i).text(0) == name and tree.topLevelItem(i).text(1) == printer)
+
+    def icon_of(name, printer=P16):
+        return item(name, printer).icon(0).cacheKey()
+
+    assert rows() == ["Gamma", "---", "Alpha", "Beta", "Delta", "Delta"]   # same favourites as Print settings
+    assert icon_of("Gamma") == dlg._star_on.cacheKey() and icon_of("Beta") == dlg._star_off.cacheKey()
+    assert not tree.topLevelItem(1).flags() & Qt.ItemIsSelectable    # the divider can't be picked
+    sel = dlg.current.key
+
+    # click the star left of "Delta"
+    it = item("Delta")
+    rect = tree.visualItemRect(it)
+    star = QPoint(rect.left() + 6, rect.center().y())
+    vp = tree.viewport()
+    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        btns = Qt.LeftButton if kind == QEvent.MouseButtonPress else Qt.NoButton
+        QApplication.sendEvent(vp, QMouseEvent(kind, QPointF(star), vp.mapToGlobal(QPointF(star)),
+                                               Qt.LeftButton, btns, Qt.NoModifier))
+    assert rows() == ["Delta", "Gamma", "---", "Alpha", "Beta", "Delta"]
+    assert icon_of("Delta", "ELEGOO Saturn 4") == dlg._star_off.cacheKey()     # only this printer's Delta
+    assert dlg.current.key == sel                                 # selection unchanged
+    assert w.print_settings.favorites == {f"{P16}|Gamma", f"{P16}|Delta"}
+    assert s.value("resinFavorites") == [f"{P16}|Delta", f"{P16}|Gamma"]
+    names = [w.print_settings.resin.itemText(i) for i in range(w.print_settings.resin.count())]
+    assert names[:4] == ["Printer default", "Delta", "Gamma", ""]   # the Print settings list follows
+    name_pt = QPoint(rect.left() + 80, tree.visualItemRect(tree.topLevelItem(4)).center().y())
+    assert dlg._star_clicks.star_hit(QPoint(6, tree.visualItemRect(tree.topLevelItem(2)).center().y())) is None  # divider
+    assert dlg._star_clicks.star_hit(name_pt) is None             # the name itself still selects
+
+    # sorting by a column keeps favourites on top, above the divider
+    tree.sortByColumn(0, Qt.DescendingOrder)
+    assert rows() == ["Gamma", "Delta", "---", "Delta", "Beta", "Alpha"]
+    tree.sortByColumn(0, Qt.AscendingOrder)
+    dlg.toggle_favorite(f"{P16}|Gamma")
+    dlg.toggle_favorite(f"{P16}|Delta")
+    assert rows() == ["Alpha", "Beta", "Delta", "Delta", "Gamma"] and not w.print_settings.favorites   # no divider
+    dlg.toggle_favorite("ELEGOO Saturn 4|Delta")                  # the other printer's own favourite
+    assert rows() == ["Delta", "---", "Alpha", "Beta", "Delta", "Gamma"] and icon_of("Delta", P16) == dlg._star_off.cacheKey()
+    assert dlg.count.text().startswith("5 of")
+    dlg.close()
+    w.close()
+
+
+def test_printer_control_in_print_settings(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtWidgets import QFormLayout
+    from gooslicer_qt.main import MainWindow
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    w.resize(1200, 800)
+    w.show()
+    app.processEvents()
+    assert "Printer control" not in w.docks
+    ps, lan = w.print_settings, w.lan
+    assert w.docks["Print settings"].isAncestorOf(lan) and ps.isAncestorOf(lan)
+    # printer control comes first, then the Printer / Resin rows
+    lay = ps.layout()
+    assert lay.itemAt(0).widget() is lan
+    top = ps._top
+    assert top.itemAt(0, QFormLayout.LabelRole).widget().text() == "Printer"
+    assert lan.mapTo(ps, lan.rect().bottomLeft()).y() < w.printer_panel.mapTo(ps, w.printer_panel.rect().topLeft()).y()
+    assert lan.isVisible() and lan.find_btn.isVisible() and lan.files.isVisible()
+    # it fits the column: nothing wider than the dock
+    assert ps.minimumSizeHint().width() <= w.docks["Print settings"].width() + 2
+    # the Printer menu actions bring the tab forward
+    w.docks["Log"].raise_()
+    w.docks["Print settings"].close()
+    called = []
+    w._show_lan(lambda: called.append(1))()                    # what the Printer menu items do
+    app.processEvents()
+    assert called and w.docks["Print settings"].isVisible()
+    w.close()
+
+
+def test_right_hand_tabs(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtCore import QByteArray, Qt
+    from PySide6.QtWidgets import QMainWindow, QTabBar
+    from gooslicer_qt.main import MainWindow
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    # a layout saved by an older version (Parts dock on the left) is not restored
+    old = QMainWindow()
+    s.setValue("windowState", old.saveState(1))
+    w = MainWindow(settings=s)
+    w.resize(1200, 800)
+    w.show()
+    app.processEvents()
+    assert "Parts" not in w.docks
+    ps, pr = w.docks["Print settings"], w.docks["Properties"]
+    assert w.dockWidgetArea(ps) == w.dockWidgetArea(pr) == Qt.RightDockWidgetArea
+    assert w.tabifiedDockWidgets(ps) == [pr]
+    def right_bar():
+        return next((b for b in w.findChildren(QTabBar) if b.isVisible()
+                     and "Properties" in [b.tabText(i) for i in range(b.count())]), None)
+    assert _wait(app, right_bar, 5)
+    bar = right_bar()
+    assert [bar.tabText(i) for i in range(bar.count())] == ["Print settings", "Properties"]
+    def on_screen(wid):                          # a dock behind another tab still reports isVisible()
+        return wid.isVisible() and not wid.visibleRegion().isEmpty()
+    assert bar.currentIndex() == 0 and on_screen(w.print_settings) and not on_screen(w.parts)
+    # Properties tab: the Parts box with Import model above the list, then the part's properties
+    bar.setCurrentIndex(1)
+    app.processEvents()
+    assert on_screen(w.parts) and on_screen(w.import_btn) and on_screen(w.props) and not on_screen(w.print_settings)
+    assert w.properties_split.widget(0) is w.parts_box and w.properties_split.widget(1).widget().isAncestorOf(w.props)
+    assert w.import_btn.mapTo(w, w.import_btn.rect().bottomLeft()).y() < w.parts.mapTo(w, w.parts.rect().topLeft()).y()
+    w.close()
+
+
+def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
+    import trimesh
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    from elegoo_goo import goo
+    from gooslicer_qt.main import MainWindow
+    from gooslicer_qt.supporting import BUILTIN, BUILTIN_TREE
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    src = tmp_path / "officialPlatform.ini"
+    src.write_bytes(FIXTURE.encode())
+    assert w.import_profiles(str(src))
+    stl = tmp_path / "cube.stl"
+    trimesh.creation.box((6, 6, 3)).export(stl)
+    w.import_files([str(stl)])
+    assert _wait(app, lambda: len(w.scene.parts) == 1)
+    jp = w.job_panel
+    # Supports and Slicing come right after Mesh in the Properties tab
+    box = w.props.parentWidget()
+    assert box.layout().indexOf(w.props) == 0 and box.layout().indexOf(jp) == 1
+    assert w.docks["Properties"].isAncestorOf(jp)
+
+    # ---- supports: the type shown is what Generate uses; a pick is remembered
+    types = [jp.support_type.itemText(i) for i in range(jp.support_type.count())]
+    assert types[:2] == [BUILTIN, BUILTIN_TREE]
+    called = []
+    monkeypatch.setattr(w, "auto_support", lambda p, params, name: called.append((p.name, params.style == "tree", name)))
+    w.select([])
+    app.processEvents()
+    assert jp.generate_btn.text() == "Generate supports (1 part)"
+    jp.support_type.setCurrentIndex(1)
+    jp.generate_btn.click()
+    assert called == [("cube", True, "")] and s.value("supportType") == BUILTIN_TREE
+    w.select([w.scene.parts[0].id])
+    app.processEvents()
+    assert jp.generate_btn.text() == "Generate supports (selected part)" and jp.support_type.currentIndex() == 1
+    jp.support_type.setCurrentIndex(0)
+    jp.generate_btn.click()
+    assert called[-1] == ("cube", False, "")
+
+    # ---- unsupported islands: a part floating above the plate is one
+    w.scene.parts[0].position[2] += 4
+    w.scene_changed()
+    jp.islands_btn.click()
+    assert _wait(app, lambda: jp.islands_btn.isEnabled(), 60)
+    assert "1 unsupported island" in jp.islands_result.text()
+    w.scene.parts[0].position[2] = 1.5
+    w.scene_changed()
+    jp.islands_btn.click()
+    assert _wait(app, lambda: jp.islands_btn.isEnabled(), 60)
+    assert "No unsupported islands" in jp.islands_result.text()
+
+    # ---- slice into memory: progress, then the estimates
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.Yes)
+    assert jp.results.isHidden()
+    jp.slice_btn.click()
+    assert _wait(app, lambda: w.held is not None and not w.slicing(), 120)
+    res = w.held[0]
+    assert res.goo is not None and res.layers == 60 == len(res.goo.layers)
+    assert jp.progress.value() == jp.progress.maximum() == 60 and jp.slice_btn.text() == "Slice"
+    assert not jp.results.isHidden()
+    assert jp.result["Layers"].text() == "60" and jp.result["Layer thickness"].text() == "50 µm (0.05 mm)"
+    assert jp.result["Volume"].text() == f"{res.volume / 1000:.2f} ml" == "0.11 ml"
+    assert jp.result["Weight"].text() == f"{res.weight:.2f} g" and jp.result["Print time"].text().endswith(" s")
+    assert "held in memory" in jp.status.text() and w.held_slice() is res
+    assert len(w.layer_preview.goo.layers) == 60                       # the Layers tab shows it
+
+    # File → Slice and save writes what is held, without slicing again
+    out = tmp_path / "held.goo"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
+    started = []
+    monkeypatch.setattr(w, "start_slice", lambda *a: started.append(a))
+    w.slice_dialog()
+    back = goo.read(out)
+    assert not started and [(x.data, x.definition.pack()) for x in back.layers] == \
+        [(x.data, x.definition.pack()) for x in res.goo.layers]
+
+    # any change to the plate or the settings makes it out of date
+    w.scene.parts[0].position[0] += 5
+    w.scene_changed()
+    assert w.held_slice() is None and "changed since this slice" in jp.status.text()
+    w.scene.parts[0].position[0] -= 5
+    w.scene_changed()
+    assert w.held_slice() is res
+    w.print_settings.widgets["exposure"].setValue(w.print_settings.widgets["exposure"].value() + 1)
+    assert w.held_slice() is None and "changed since this slice" in jp.status.text()
+    w.slice_dialog()
+    assert _wait(app, lambda: started, 60)                             # now it slices again (after the island check)
     w.close()

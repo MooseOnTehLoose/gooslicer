@@ -100,7 +100,7 @@ Each phase ends with passing tests and a short demo. Specs are written before th
   - STL/OBJ/3MF import, including multi-object 3MF, run as background jobs
   - GL 3.3 viewport: plate grid, volume box, orbit/pan/zoom, view presets
   - picking (multi-select with Ctrl) and drag-move on the plate
-  - transform panel (position, size, scale %, uniform lock), rotate +45° buttons or by any angle, lay flat on a clicked face, drop to plate, centre, reset
+  - transform panel (position, size, scale %, uniform lock), rotate −45° buttons or by any angle, lay flat on a clicked face, drop to plate, centre, reset
   - shelf auto-arrange, duplicate and delete
   - mesh report (holes, non-manifold edges, degenerate and duplicate triangles, winding, inverted, volume) with one-click repair
   - undo/redo for every edit

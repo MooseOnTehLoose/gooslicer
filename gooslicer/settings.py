@@ -134,6 +134,17 @@ class ResinProfile:
     printer: str
     resin_type: str
     raw: dict
+    source: str = "satellite"   # "satellite" (SatelLite install), "imported" (.satres) or "custom" (a copy)
+    path: str = ""              # the file it was read from
+
+    @property
+    def key(self) -> str:
+        """Identity across sources: printer and name (hidden/deleted lists use it)."""
+        return f"{self.printer}|{self.name}"
+
+    @property
+    def company(self) -> str:
+        return str(self.raw.get("vd_resine_company", "") or "")
 
     def settings(self) -> PrintSettings:
         kw = {"resin_name": self.name}
@@ -154,7 +165,7 @@ def load_resin_profile(path: str | os.PathLike) -> ResinProfile | None:
         id=Path(path).stem, name=str(ap.get("vd_resine_profilename", "")),
         printer=str(ap.get("cloudResinExtraParam", {}).get("cloudResinPrinterName", "")),
         resin_type=str(ap.get("vd_printer_resin_para", {}).get("vd_printer_resin_para_type", "")),
-        raw=ap)
+        raw=ap, path=str(path))
 
 
 def resin_dir_for(profile_ini: str | os.PathLike) -> Path | None:
@@ -179,3 +190,132 @@ def load_resin_profiles(directory: str | os.PathLike, printer: str | None = None
 
 def with_overrides(s: PrintSettings, **kw) -> PrintSettings:
     return replace(s, **kw)
+
+
+# ---------------------------------------------------------------- .satres (05-slicing-spec §9)
+SATRES_EXT = ".satres"
+_SATRES_ROOT = "printer/scriptmanager/scripcustomtnum"
+# .satres key (below the profile prefix) -> (resin .data group, key), so ResinProfile.settings() reads both
+_P, _A, _R = "vd_printer_printer_para", "vd_printer_advanced_para", "vd_printer_resin_para"
+_SATRES = {
+    "print/thickness": (_P, "vd_printer_printer_para_thickness"),
+    "print/bottomlayer": (_P, "vd_printer_printer_para_bottom_layer"),
+    "print/exposuretime": (_P, "vd_printer_printer_para_exposure_time"),
+    "print/bottomexposuretime": (_P, "vd_printer_printer_para_bottom_exposure_time"),
+    "print/translate_layer_count": (_P, "vd_printer_printer_para_tanslate_layer_count"),
+    "print/lightoffdelay": (_P, "vd_printer_printer_para_lightoff_delay"),
+    "print/bottomlightoffdelay": (_P, "vd_printer_printer_para_bottom_lightoff_delay"),
+    "print/wait_after_cure": (_P, "vd_printer_printer_para_wait_after_cure"),
+    "print/bottom_wait_before_lift": (_P, "vd_printer_printer_bottom_wait_before_lift"),
+    "print/bottom_wait_after_lift": (_P, "vd_printer_printer_bottom_wait_after_lift"),
+    "print/bottom_wait_after_retract": (_P, "vd_printer_printer_bottom_wait_after_retract"),
+    "print/bottomliftdis": (_P, "vd_printer_printer_para_bootom_lift_dis"),
+    "print/liftingdis": (_P, "vd_printer_printer_para_lift_dis"),
+    "print/bottomliftspeed": (_P, "vd_printer_printer_para_bottom_lift_speed"),
+    "print/liftingspeed": (_P, "vd_printer_printer_para_lift_speed"),
+    "print/bottom_backspeed": (_P, "vd_printer_printer_para_bottom_back_speed"),
+    "print/backspeed": (_P, "vd_printer_printer_para_back_speed"),
+    "print/slow_bottom_lift_dis": (_P, "vd_printer_printer_slow_bottom_lift_dis"),
+    "print/slow_lift_dis": (_P, "vd_printer_printer_slow_lift_dis"),
+    "print/slow_bottom_back_dis": (_P, "vd_printer_printer_slow_bottom_back_dis"),
+    "print/slow_back_dis": (_P, "vd_printer_printer_slow_back_dis"),
+    "print/slow_bottom_lift_speed": (_P, "vd_printer_printer_slow_bottom_lift_speed"),
+    "print/slow_lift_speed": (_P, "vd_printer_printer_slow_lift_speed"),
+    "print/slow_bottom_back_speed": (_P, "vd_printer_printer_slow_bottom_back_speed"),
+    "print/slow_back_speed": (_P, "vd_printer_printer_slow_back_speed"),
+    "advanced/bottom_ledpower": (_A, "vd_printer_advanced_para_bottom_led_power"),
+    "advanced/ledpower": (_A, "vd_printer_advanced_para_led_power"),
+    "resin/density": (_R, "vd_printer_resin_para_density"),
+    "resin/cost": (_R, "vd_printer_resin_para_cost"),
+    "resin/type": (_R, "vd_printer_resin_para_type"),
+    # kept for a faithful round trip; GooSlicer does not use them when slicing
+    "print/first_layer_exposure_time": (_P, "vd_printer_printer_first_layer_exposure_time"),
+    "print/parameter_mode": (_P, "vd_printer_printer_parameter_mode"),
+    "advanced/antilevel": (_A, "vd_printer_advanced_para_anti_level"),
+    "advanced/isanti": (_A, "vd_printer_advanced_para_anti"),
+    "advanced/beamCompensation": (_A, "vd_printer_advanced_para_beam_compenstation"),
+    "advanced/doubleblur": (_A, "vd_printer_advanced_doubleblur"),
+    "advanced/greylevel": (_A, "vd_printer_advanced_para_grey_level"),
+    "advanced/imageblur": (_A, "vd_printer_advanced_para_image_blur"),
+    "advanced/imageblurpixel": (_A, "vd_printer_advanced_para_image_blur_pixel"),
+    "advanced/innertolerancecomp": (_A, "vd_printer_advanced_innercomp"),
+    "advanced/notes": (_A, "vd_printer_advanced_para_notes"),
+    "advanced/reducepoint": (_A, "vd_printer_advanced_para_reduce_point"),
+    "advanced/scale_x": (_A, "vd_printer_advanced_para_scale_x"),
+    "advanced/scale_y": (_A, "vd_printer_advanced_para_scale_y"),
+    "advanced/scale_z": (_A, "vd_printer_advanced_para_scale_z"),
+    "advanced/supportAA": (_A, "vd_printer_advanced_supoort_aa"),
+}
+
+
+def load_satres(path: str | os.PathLike, source: str = "imported") -> list[ResinProfile]:
+    """All resin profiles in a SatelLite .satres export. Raises ValueError if it is not one."""
+    from .qdatastream import read_variant_map
+    try:
+        m = read_variant_map(str(path))
+    except Exception as e:                      # truncated / not a QDataStream map
+        raise ValueError(f"not a SatelLite resin profile file ({e.__class__.__name__})") from None
+    try:
+        n = int(m[_SATRES_ROOT])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("not a SatelLite resin profile file (no resin profiles in it)") from None
+    out = []
+    for i in range(n):
+        pre = f"{_SATRES_ROOT}{i}/scriptcontainername"
+        name = str(m.get(pre, "") or "").strip()
+        if not name:
+            continue
+        raw: dict = {_P: {}, _A: {}, _R: {}}
+        for k, (group, jk) in _SATRES.items():
+            v = m.get(f"{pre}/{k}")
+            if v is not None and not isinstance(v, (list, dict)):
+                raw[group][jk] = v
+        raw["vd_resine_profilename"] = name
+        raw["vd_resine_company"] = str(m.get(f"{pre}/company", "") or "")
+        out.append(ResinProfile(
+            id=f"satres:{Path(path).stem}:{i}", name=name,
+            printer=str(m.get(f"{pre}/ExtraResinParameters/PrinterName", "") or ""),
+            resin_type=str(raw[_R].get("vd_printer_resin_para_type", "") or ""), raw=raw,
+            source=source, path=str(path)))
+    if not out:
+        raise ValueError("the file contains no resin profiles")
+    return out
+
+
+def store_satres(src: str | os.PathLike, directory: str | os.PathLike) -> tuple[Path, list[ResinProfile]]:
+    """Validate a .satres and copy it into `directory` as <stem>-<hash>.satres (re-importing the
+    same file is a no-op; two different exports with the same name are both kept)."""
+    import hashlib
+    profs = load_satres(src)
+    data = Path(src).read_bytes()
+    d = Path(directory)
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / f"{Path(src).stem}-{hashlib.sha256(data).hexdigest()[:10]}{SATRES_EXT}"
+    if not dest.exists():
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+    return dest, profs
+
+
+def load_imported_resins(directory: str | os.PathLike, source: str = "imported") -> list[ResinProfile]:
+    """Profiles from every stored .satres, oldest file first (a later import of the same printer
+    and name wins when merged)."""
+    d = Path(directory)
+    if not d.is_dir():
+        return []
+    out = []
+    for f in sorted(d.glob(f"*{SATRES_EXT}"), key=lambda f: (f.stat().st_mtime, f.name)):
+        try:
+            out.extend(load_satres(f, source))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def merge_resins(official: list[ResinProfile], imported: list[ResinProfile]) -> list[ResinProfile]:
+    """One list, sorted by name; an imported profile replaces one with the same printer and name."""
+    by = {(r.printer, r.name): r for r in official}
+    for r in imported:
+        by[(r.printer, r.name)] = r
+    return sorted(by.values(), key=lambda r: r.name.lower())

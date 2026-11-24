@@ -7,11 +7,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence, QSurfaceFormat, QUndoStack
+from PySide6.QtCore import QEvent, QObject, QSettings, QStandardPaths, Qt, Signal
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QSurfaceFormat, QUndoStack
 from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout,
-                               QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QScrollArea, QWidget)
+                               QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+                               QGroupBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+                               QSplitter, QStyle, QVBoxLayout, QWidget)
 
 from elegoo_goo import goo
 from gooslicer import __version__, mesh as meshmod, preview, profiles
@@ -26,13 +27,18 @@ from gooslicer.scene import Part, Scene
 from . import workers
 from .commands import AddPartsCommand, MeshCommand, RemovePartsCommand, StateCommand
 from .hollowing import DrainHoleDialog, HollowDialog, drill_part, hollow_part
-from .panels import PartsList, PropertiesPanel
+from .jobpanel import JobPanel
+from .panels import InfoButton, PartsList, PropertiesPanel
 from .printers import PrinterControlPanel
 from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
 from .supporting import SupportDialog, SupportManager, SupportsCommand
+from .theme import THEMES, ThemeManager
 from .viewport import Viewport, default_format
 
 APP = "GooSlicer"
+# Bumped when the dock layout changes enough that an older saved layout should be dropped
+# (2: Parts inside Properties; Print settings and Properties are tabs).
+LAYOUT_VERSION = 2
 MODEL_FILTER = "3D models (*.stl *.STL *.obj *.OBJ *.3mf *.3MF);;All files (*)"
 
 
@@ -44,17 +50,51 @@ def data_dir() -> Path:
 
 
 class PrinterPanel(QWidget):
+    """The printer row of the Print settings tab: model dropdown plus an (i) button that pops up
+    the printer's build volume, resolution, pixel pitch and mirroring."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.combo = QComboBox()
+        self.combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.combo.setMinimumContentsLength(12)
+        self.info_btn = InfoButton("Printer details")
+        self.info_btn.clicked.connect(self.show_details)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.combo, 1)
+        row.addWidget(self.info_btn)
+        # details pop-up (closes on any click outside it)
+        self.details = QFrame(self, Qt.Popup)
+        self.details.setFrameShape(QFrame.StyledPanel)
+        self.details_title = QLabel()
+        f = self.details_title.font()
+        f.setBold(True)
+        self.details_title.setFont(f)
         self.info = {k: QLabel("–") for k in ("Build volume", "Resolution", "Pixel pitch", "Mirror")}
-        lay = QFormLayout(self)
-        lay.addRow("Printer", self.combo)
+        form = QFormLayout(self.details)
+        form.setContentsMargins(12, 10, 12, 10)
+        form.addRow(self.details_title)
         for k, w in self.info.items():
             w.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            lay.addRow(k, w)
+            form.addRow(k, w)
         self.combo.currentIndexChanged.connect(self._show)
         self._profiles: dict[str, profiles.PrinterProfile] = {}
+        self._show()
+
+    def show_details(self) -> None:
+        """Open the details pop-up under the (i) button, right-aligned to it."""
+        d = self.details
+        d.adjustSize()
+        anchor = self.info_btn.mapToGlobal(self.info_btn.rect().bottomRight())
+        x, y = anchor.x() - d.width() + 1, anchor.y() + 4
+        scr = self.info_btn.screen().availableGeometry() if self.info_btn.screen() else None
+        if scr is not None:
+            x = max(scr.left(), min(x, scr.right() - d.width()))
+            if y + d.height() > scr.bottom():                 # no room below: open above
+                y = self.info_btn.mapToGlobal(self.info_btn.rect().topLeft()).y() - d.height() - 4
+        d.move(x, y)
+        d.show()
 
     def set_profiles(self, ps: dict[str, profiles.PrinterProfile], current: str | None = None):
         self._profiles = ps
@@ -72,6 +112,8 @@ class PrinterPanel(QWidget):
 
     def _show(self, *_):
         p = self.current()
+        self.info_btn.setEnabled(p is not None)
+        self.details_title.setText(p.name if p else "No printer selected")
         if not p:
             for w in self.info.values():
                 w.setText("–")
@@ -80,6 +122,22 @@ class PrinterPanel(QWidget):
         self.info["Resolution"].setText(f"{p.res_x} × {p.res_y} px")
         self.info["Pixel pitch"].setText(f"{p.pixel_x_mm * 1000:.1f} × {p.pixel_y_mm * 1000:.1f} µm")
         self.info["Mirror"].setText(", ".join(a for a, m in (("X", p.mirror_x), ("Y", p.mirror_y)) if m) or "none")
+
+
+class _DropForwarder(QObject):
+    """Hands file drops on a dock (docked or floating) to the main window's handlers."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+
+    def eventFilter(self, obj, e):
+        h = {QEvent.DragEnter: self.win.dragEnterEvent, QEvent.DragMove: self.win.dragMoveEvent,
+             QEvent.Drop: self.win.dropEvent}.get(e.type())
+        if h is not None:
+            h(e)
+            return e.isAccepted()
+        return False
 
 
 def _warm(part_mesh):
@@ -110,6 +168,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None, lan_ports: dict | None = None):
         super().__init__()
         self.settings = settings or QSettings(APP, APP)
+        self.theme = ThemeManager.for_app(QApplication.instance(), str(self.settings.value("theme", "system")))
         self.setWindowTitle(f"{APP} {__version__}")
         self.resize(1400, 900)
         self.scene = Scene()
@@ -123,30 +182,75 @@ class MainWindow(QMainWindow):
 
         self.printer_panel = PrinterPanel()
         self.parts = PartsList()
+        self.import_btn = QPushButton(self.style().standardIcon(QStyle.SP_DialogOpenButton), "Import model…")
+        self.import_btn.setToolTip("Import STL, OBJ or 3MF models (Ctrl+I)")
+        self.import_btn.clicked.connect(self.import_dialog)
+        self.parts_box = QGroupBox("Parts")
+        pl = QVBoxLayout(self.parts_box)
+        pl.addWidget(self.import_btn)                   # above the list
+        pl.addWidget(self.parts, 1)
         self.props = PropertiesPanel(self)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.props)
+        props_scroll = QScrollArea()
+        props_scroll.setWidgetResizable(True)
+        props_scroll.setFrameShape(QFrame.NoFrame)
+        self.job_panel = JobPanel(self)                 # Supports and Slicing, below Mesh
+        props_box = QWidget()
+        pbl = QVBoxLayout(props_box)
+        pbl.setContentsMargins(0, 0, 0, 0)
+        pbl.setSpacing(0)
+        pbl.addWidget(self.props)
+        pbl.addWidget(self.job_panel)
+        pbl.addStretch(1)
+        props_scroll.setWidget(props_box)
+        # the Properties tab: parts on top, the selected part's properties below (resizable)
+        self.properties_split = QSplitter(Qt.Vertical)
+        self.properties_split.addWidget(self.parts_box)
+        self.properties_split.addWidget(props_scroll)
+        self.properties_split.setStretchFactor(0, 1)
+        self.properties_split.setStretchFactor(1, 2)
+        self.properties_split.setChildrenCollapsible(False)
         self.log = QPlainTextEdit(readOnly=True)
         self.log.setMaximumBlockCount(5000)
         self.print_settings = PrintSettingsPanel()
+        self.print_settings.insert_top_row("Printer", self.printer_panel)   # directly above the resin
+        fav = self.settings.value("resinFavorites", [])
+        fav = [fav] if isinstance(fav, str) else list(fav or [])
+        if any("|" not in k for k in fav):
+            # older versions saved bare resin names (a favourite on every printer); keep them for
+            # the printer that was in use, which is where they were starred
+            printer = str(self.settings.value("printer", "") or "")
+            fav = sorted({k if "|" in k else f"{printer}|{k}" for k in fav if printer or "|" in k})
+            self.settings.setValue("resinFavorites", fav)
+        self.print_settings.set_favorites(fav)
+        self.print_settings.favoritesChanged.connect(lambda keys: self.settings.setValue("resinFavorites", keys))
+        self.print_settings.resinSelected.connect(self._remember_resin)
+        self.print_settings.changed.connect(lambda: self._check_held())
+        self.held = None                 # (SliceResult with .goo, plate fingerprint) of the last in-memory slice
+        self._slicing_fp = None
         self.layer_preview = LayerPreview()
         self.lan = PrinterControlPanel(self.settings, ports=lan_ports)
         self.lan.log.connect(self.log_msg)
+        self.print_settings.insert_top_widget(self.lan)          # above the Printer dropdown
+        self.settings_scroll = QScrollArea()                     # the tab is taller than the column
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.NoFrame)
+        self.settings_scroll.setWidget(self.print_settings)
         self._send_after_slice = False
         self.docks = {}
-        for title, w, area in (("Parts", self.parts, Qt.LeftDockWidgetArea),
-                               ("Properties", scroll, Qt.RightDockWidgetArea),
-                               ("Printer", self.printer_panel, Qt.RightDockWidgetArea),
-                               ("Print settings", self.print_settings, Qt.RightDockWidgetArea),
+        self._drops = _DropForwarder(self)
+        # the right column (Properties, Print settings) runs the full height, beside the Log
+        self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+        for title, w, area in (("Print settings", self.settings_scroll, Qt.RightDockWidgetArea),
+                               ("Properties", self.properties_split, Qt.RightDockWidgetArea),
                                ("Log", self.log, Qt.BottomDockWidgetArea),
-                               ("Layers", self.layer_preview, Qt.BottomDockWidgetArea),
-                               ("Printer control", self.lan, Qt.BottomDockWidgetArea)):
+                               ("Layers", self.layer_preview, Qt.BottomDockWidgetArea)):
             d = QDockWidget(title, self)
             d.setObjectName(f"dock{title.replace(' ', '')}")
             d.setWidget(w)
             self.addDockWidget(area, d)
             self.docks[title] = d
+            d.setAcceptDrops(True)      # also when floated out as its own window
+            d.installEventFilter(self._drops)
         self._layout_done = False
         self._slice_thread = None
         self._progress = QProgressBar()
@@ -168,13 +272,14 @@ class MainWindow(QMainWindow):
         self.supports.updated.connect(self._supports_updated)
         self.viewport.supportClicked.connect(self._support_click)
         self.viewport.supportModeEnded.connect(lambda: self.statusBar().clearMessage())
-        self.viewport.filesDropped.connect(self.import_files)
+        self.viewport.filesDropped.connect(self.open_files)
+        self.setAcceptDrops(True)       # drops anywhere in the window, not only on the 3D view
         self.parts.selectionChangedIds.connect(lambda ids: self.select(ids))
         self.printer_panel.combo.currentIndexChanged.connect(self._printer_changed)
         self.load_profiles()
         if self.settings.value("geometry"):
             self.restoreGeometry(self.settings.value("geometry"))
-        self.statusBar().showMessage("Import a model (Ctrl+I) or drop STL/OBJ/3MF files here")
+        self.statusBar().showMessage("Import a model (Ctrl+I) or drop STL/OBJ/3MF or .satres files here")
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -183,12 +288,30 @@ class MainWindow(QMainWindow):
         self._layout_done = True
         # Dock tab groups are formed only after the first show: with two groups created before
         # the first layout, Qt 6.12 leaves a stale, visible QTabBar behind (plain-Qt repro).
-        if not (self.settings.value("windowState") and self.restoreState(self.settings.value("windowState"))):
-            self.tabifyDockWidget(self.docks["Printer"], self.docks["Print settings"])
-            self.tabifyDockWidget(self.docks["Log"], self.docks["Layers"])
-            self.tabifyDockWidget(self.docks["Layers"], self.docks["Printer control"])
-            self.docks["Log"].raise_()
-            self.resizeDocks([self.docks["Log"]], [280], Qt.Vertical)
+        # The default layout is always built first and kept, for View → Restore all windows to default.
+        self._default_layout()
+        self._default_state = self.saveState(LAYOUT_VERSION)
+        if self.settings.value("windowState"):
+            self.restoreState(self.settings.value("windowState"), LAYOUT_VERSION)   # older: ignored
+
+    def _default_layout(self) -> None:
+        self.tabifyDockWidget(self.docks["Log"], self.docks["Layers"])
+        self.docks["Log"].raise_()
+        self.resizeDocks([self.docks["Log"]], [280], Qt.Vertical)
+        # right-hand tabs: Print settings first, then Properties (with the parts list)
+        self.tabifyDockWidget(self.docks["Print settings"], self.docks["Properties"])
+        self.docks["Print settings"].raise_()
+
+    def restore_default_windows(self) -> None:
+        """Bring back every panel (closed or floated out) in its default place."""
+        for d in self.docks.values():
+            d.setFloating(False)
+            d.show()
+        if getattr(self, "_default_state", None) is None or not self.restoreState(self._default_state, LAYOUT_VERSION):
+            self._default_layout()
+        self.docks["Log"].raise_()
+        self.docks["Print settings"].raise_()
+        self.settings.setValue("windowState", self.saveState(LAYOUT_VERSION))
 
     # ----------------------------------------------------------------- setup
     def _act(self, menu, text, slot, shortcut=None, tip=None):
@@ -205,6 +328,8 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         m = mb.addMenu("&File")
         self._act(m, "&Import model…", self.import_dialog, "Ctrl+I")
+        self._act(m, "Import &resin profile…", self.import_resin_dialog, None,
+                  "Add resin profiles exported from SatelLite (.satres)")
         self.slice_action = self._act(m, "&Slice and save .goo…", self.slice_dialog, "Ctrl+R")
         self.send_action = self._act(m, "Slice and sen&d to printer…", self.slice_and_send, "Ctrl+Shift+R")
         self._act(m, "&Open .goo for inspection…", self.open_goo_dialog, "Ctrl+Shift+O")
@@ -244,12 +369,28 @@ class MainWindow(QMainWindow):
         self._act(pm, "&Connect / disconnect", self._show_lan(self.lan.toggle_connection))
         self._act(pm, "&Send .goo file…", self._show_lan(self.lan.send_dialog))
 
+        rm = mb.addMenu("&Resin")
+        self._act(rm, "&Manage resins…", self.manage_resins, None,
+                  "Browse, copy, hide, delete and export resin profiles")
+
         v = mb.addMenu("&View")
         self._act(v, "&Reset view", self.viewport.reset_view, "Home")
         self._act(v, "&Frame selection", self.viewport.frame_selection, "F")
         self._act(v, "&Top", lambda: self.viewport.set_view(-90, 89), "7")
         self._act(v, "F&ront", lambda: self.viewport.set_view(-90, 0), "1")
         self._act(v, "&Side", lambda: self.viewport.set_view(0, 0), "3")
+        v.addSeparator()
+        self._act(v, "Restore all &windows to default", self.restore_default_windows, None,
+                  "Reopen closed panels and put every panel back in its default place")
+        tm = v.addMenu("T&heme")
+        group = QActionGroup(self)
+        self.theme_actions = {}
+        for key, label in THEMES:
+            a = self._act(tm, label, lambda _=False, k=key: self.set_theme(k))
+            a.setCheckable(True)
+            a.setChecked(key == self.theme.mode)
+            group.addAction(a)
+            self.theme_actions[key] = a
 
         h = mb.addMenu("&Help")
         self._act(h, "&About GooSlicer", lambda: QMessageBox.about(
@@ -258,10 +399,17 @@ class MainWindow(QMainWindow):
                        "<p>Mouse: left = select/drag on plate, right = orbit, middle or "
                        "Shift+drag = pan, wheel = zoom.</p>"))
 
+    def set_theme(self, mode: str) -> None:
+        """System (follow the desktop), light or dark; remembered across sessions."""
+        self.theme.apply(mode)
+        self.settings.setValue("theme", self.theme.mode)
+        self.theme_actions[self.theme.mode].setChecked(True)
+
     def _show_lan(self, fn):
         def go():
-            self.docks["Printer control"].show()
-            self.docks["Printer control"].raise_()
+            self.docks["Print settings"].show()
+            self.docks["Print settings"].raise_()
+            self.settings_scroll.ensureWidgetVisible(self.lan, 0, 0)
             fn()
         return go
 
@@ -287,6 +435,9 @@ class MainWindow(QMainWindow):
         self.parts.refresh(self.scene, self.selected_ids())
         p = self.primary()
         self.props.set_part(p, self.reports.get(id(p.mesh)) if p else None)
+        if hasattr(self, "job_panel"):
+            self.job_panel.refresh()
+            self._check_held()
 
     def scene_changed(self, select=None, mesh_changed=None):
         self.supports.sync()
@@ -595,6 +746,29 @@ class MainWindow(QMainWindow):
             self._report_islands(isl)
         return isl
 
+    def check_islands_async(self, on_done) -> None:
+        """The island check in the background (seconds on detailed models); reports to the Log and
+        calls on_done(islands), or on_done(None) if it failed."""
+        meshes = [p.world_mesh() for p in self.scene.parts]
+        meshes += [m for m in (self.supports.world_mesh(p) for p in self.scene.parts) if m is not None]
+        if not meshes:
+            on_done([])
+            return
+        h = self.print_settings.settings().layer_height if self.printer_panel.current() else 0.05
+
+        def done(isl):
+            if isl:
+                self._report_islands(isl)
+            else:
+                self.log_msg("No unsupported islands: every region connects to the layer below.")
+            on_done(isl)
+
+        def failed(msg):
+            self.log_msg("Island check failed: " + msg.splitlines()[0])
+            on_done(None)
+        workers.submit(supportmod.unsupported_islands, meshes, layer_height=max(h, 0.05),
+                       on_done=done, on_failed=failed)
+
     def _report_islands(self, isl) -> list[str]:
         lines = [f"• z {i.z:.2f} mm at ({i.point[0]:.1f}, {i.point[1]:.1f}): up to {i.area:.2f} mm², "
                  f"hangs {i.height:.2f} mm" for i in isl[:10]]
@@ -632,6 +806,33 @@ class MainWindow(QMainWindow):
         if files:
             self.settings.setValue("lastDir", str(Path(files[0]).parent))
             self.import_files(files)
+
+    # ------------------------------------------------------------ drag and drop
+    def dragEnterEvent(self, e):
+        if any(u.isLocalFile() for u in e.mimeData().urls()):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        self.dragEnterEvent(e)
+
+    def dropEvent(self, e):
+        files = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if files:
+            e.acceptProposedAction()
+            self.open_files(files)
+        else:
+            e.ignore()
+
+    def open_files(self, files: list[str]):
+        """Dropped or command-line files: .satres are resin profiles, anything else a model."""
+        resins = [f for f in files if Path(f).suffix.lower() == settingsmod.SATRES_EXT]
+        models = [f for f in files if f not in resins]
+        if resins:
+            self.import_resin_profiles(resins)
+        if models:
+            self.import_files(models)
 
     def import_files(self, files: list[str]):
         for f in files:
@@ -700,12 +901,78 @@ class MainWindow(QMainWindow):
         return slicermod.SliceJob(meshes, RasterSpec.from_profile(p), self.print_settings.settings(),
                                   p.name, machine_z=p.size_z, preview_rgb=rgb)
 
+    # ---- the slice held in memory (Properties → Slicing → Slice)
+    def _plate_fingerprint(self):
+        """What a slice depends on. Meshes and support plans are compared by identity: every edit
+        replaces them (MeshCommand, SupportPlan.with_contacts) rather than changing them in place."""
+        p = self.printer_panel.current()
+        parts = tuple((x.id, x.mesh, x.supports, x.position.tobytes(), x.rotation.tobytes(), x.scale.tobytes())
+                      for x in self.scene.parts)
+        return (p.name if p else None, self.print_settings.settings(), parts)
+
+    @staticmethod
+    def _same_plate(a, b) -> bool:
+        if a is None or b is None or a[0] != b[0] or a[1] != b[1] or len(a[2]) != len(b[2]):
+            return False
+        return all(x[0] == y[0] and x[1] is y[1] and x[2] is y[2] and x[3:] == y[3:]
+                   for x, y in zip(a[2], b[2]))
+
+    def held_slice(self):
+        """The in-memory slice if it still matches the plate and settings, else None."""
+        if self.held is not None and self._same_plate(self.held[1], self._plate_fingerprint()):
+            return self.held[0]
+        return None
+
+    def _check_held(self) -> None:
+        if self.held is not None and hasattr(self, "job_panel"):
+            self.job_panel.set_stale(self.held_slice() is None)
+
+    def slicing(self) -> bool:
+        return self._slice_thread is not None
+
+    def slice_to_memory(self) -> None:
+        """Slice the build area and keep it in memory (with the island check first)."""
+        if self.slicing():
+            return
+        try:
+            job = self.make_slice_job()
+        except ValueError as e:
+            QMessageBox.warning(self, APP, str(e))
+            return
+        if not self._confirm_no_trapped_resin():
+            return
+        fp = self._plate_fingerprint()
+
+        def go():
+            self._slicing_fp = fp
+            self.start_slice(job, None)
+        self._island_check_then(job, go)
+
+    def _save_held(self, res, path: str) -> bool:
+        try:
+            goo.write(path, res.goo.header, res.goo.layers)
+        except OSError as e:
+            QMessageBox.warning(self, APP, f"Could not save {path}:\n{e}")
+            return False
+        self.log_msg(f"Saved the sliced plate held in memory to {path} ({res.layers} layers)")
+        return True
+
     def slice_and_send(self):
         """Slice to the cache dir, then upload and (after confirmation) start on the connected printer."""
         sess = self.lan.session
         if not (sess and sess.connected):
             QMessageBox.warning(self, APP, "Connect to a printer first (Printer → Find printers).")
             self._show_lan(lambda: None)()
+            return
+        held = self.held_slice()
+        if held is not None:                 # already sliced: send what is in memory
+            out = Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / "sent"
+            out.mkdir(parents=True, exist_ok=True)
+            name = "".join(c if c.isalnum() or c in "-_." else "_" for c in self.scene.parts[0].name) or "model"
+            path = str(out / f"{name}.goo")
+            if self._save_held(held, path):
+                self._show_lan(lambda: None)()
+                self.lan.send_file(path, start=True)
             return
         try:
             job = self.make_slice_job()
@@ -724,6 +991,16 @@ class MainWindow(QMainWindow):
         self._island_check_then(job, go)
 
     def slice_dialog(self):
+        held = self.held_slice()
+        if held is not None:                 # already sliced: just save what is in memory
+            default = Path(self.settings.value("lastGooDir", str(Path.home()))) / f"{self.scene.parts[0].name}.goo"
+            path, _ = QFileDialog.getSaveFileName(self, "Save sliced file", str(default), "ELEGOO GOO (*.goo)")
+            if path:
+                if not path.lower().endswith(".goo"):
+                    path += ".goo"
+                self.settings.setValue("lastGooDir", str(Path(path).parent))
+                self._save_held(held, path)
+            return
         try:
             job = self.make_slice_job()
         except ValueError as e:
@@ -774,12 +1051,10 @@ class MainWindow(QMainWindow):
         self.slice_action.setEnabled(on)
         self.send_action.setEnabled(on)
 
-    def start_slice(self, job: slicermod.SliceJob, path: str):
-        r = self.print_settings.current_resin()
-        p = self.printer_panel.current()
-        if p:
-            self.settings.setValue(f"resin/{p.name}", r.name if r else "")
-        self.log_msg(f"Slicing {job.layer_count} layers ({job.settings.layer_height} mm) → {path}")
+    def start_slice(self, job: slicermod.SliceJob, path: str | None):
+        self.log_msg(f"Slicing {job.layer_count} layers ({job.settings.layer_height} mm) → "
+                     + (path or "memory"))
+        self.job_panel.slicing_started(job.layer_count)
         t = SliceThread(job, path, self)
         t.progress.connect(self._slice_progress)
         t.finishedOk.connect(self._slice_done)
@@ -800,11 +1075,23 @@ class MainWindow(QMainWindow):
 
     def _slice_progress(self, done, total):
         self._progress.setValue(done)
+        self.job_panel.slicing_progress(done, total)
         self.statusBar().showMessage(f"Slicing… {done}/{total} layers")
 
     def _slice_done(self, res):
         m, s = divmod(res.print_time, 60)
         h, m = divmod(m, 60)
+        if res.goo is not None:              # sliced into memory
+            self.held = (res, self._slicing_fp)
+            self._slicing_fp = None
+            self.log_msg(f"Sliced {res.layers} layers into memory: est. print time {h}h {m:02d}m {s:02d}s, "
+                         f"volume {res.volume / 1000:.2f} ml, weight {res.weight:.2f} g")
+            self.statusBar().showMessage(f"Sliced {res.layers} layers — estimated {h}h {m:02d}m", 15000)
+            self.layer_preview.set_file(res.goo)
+            self.job_panel.show_result(res)
+            self._check_held()
+            return
+        self.job_panel.show_result(res, held=False)
         self.log_msg(f"Saved {res.path}: {res.layers} layers, est. print time {h}h {m:02d}m {s:02d}s, "
                      f"volume {res.volume:.1f} mm³, weight {res.weight:.2f} g, cost {res.price:.2f}")
         self.statusBar().showMessage(f"Sliced {res.layers} layers — estimated {h}h {m:02d}m", 15000)
@@ -816,10 +1103,13 @@ class MainWindow(QMainWindow):
 
     def _slice_failed(self, msg):
         self._send_after_slice = False
+        self._slicing_fp = None
+        self.job_panel.slicing_failed(msg)
         self.log_msg(f"Slicing {'cancelled' if msg == 'cancelled' else 'failed: ' + msg}")
         self.statusBar().showMessage("Slicing cancelled" if msg == "cancelled" else "Slicing failed", 8000)
 
     def _slice_cleanup(self):
+        self.job_panel.slicing_finished()
         self._progress.hide()
         self._cancel_btn.hide()
         self.slice_action.setEnabled(True)
@@ -850,7 +1140,7 @@ class MainWindow(QMainWindow):
             self._slice_thread.wait(10000)
         self.lan.shutdown()
         self.settings.setValue("geometry", self.saveGeometry())
-        self.settings.setValue("windowState", self.saveState())
+        self.settings.setValue("windowState", self.saveState(LAYOUT_VERSION))
         super().closeEvent(e)
 
     # -------------------------------------------------------------- profiles
@@ -860,20 +1150,132 @@ class MainWindow(QMainWindow):
             self.settings.setValue("printer", p.name)
             self.scene.size = np.array([p.size_x, p.size_y, p.size_z])
             self._load_resins(p)
+            if hasattr(self, "job_panel"):
+                self.job_panel.refresh(reload=True)          # the printer's support templates
             self.scene_changed()
 
     def _load_resins(self, p):
-        resins = []
-        d = self.resin_dir()
-        if d:
-            key = str(d)
-            if getattr(self, "_resin_cache_key", None) != key:   # parse the ~2000 files once
-                self._resin_cache = settingsmod.load_resin_profiles(d)
-                self._resin_cache_key = key
-            resins = [r for r in self._resin_cache if r.printer == p.name]
-        self.print_settings.set_sources(settingsmod.from_printer_profile(p), resins,
-                                        self.settings.value(f"resin/{p.name}"))
+        hidden = self.resin_marks("resinHidden")
+        resins = [r for r in self.all_resins() if r.printer == p.name and r.key not in hidden]
+        self.print_settings.set_sources(settingsmod.from_printer_profile(p), resins, self._last_resin(p.name))
         self.log_msg(f"{p.name}: {len(resins)} resin profile(s) available")
+
+    def _official_resins(self) -> list:
+        """SatelLite's own resin profiles (all printers), parsed once per install."""
+        d = self.resin_dir()
+        if not d:
+            return []
+        key = str(d)
+        if getattr(self, "_resin_cache_key", None) != key:   # parse the ~2000 files once
+            self._resin_cache = settingsmod.load_resin_profiles(d)
+            self._resin_cache_key = key
+        return self._resin_cache
+
+    def resin_library_dir(self) -> Path:
+        return data_dir() / "resins"
+
+    def _imported_resins(self) -> list:
+        if getattr(self, "_imported_cache", None) is None:
+            lib = self.resin_library_dir()
+            self._imported_cache = (settingsmod.load_imported_resins(lib)
+                                    + settingsmod.load_imported_resins(lib / "custom", "custom"))
+        return self._imported_cache
+
+    def all_resins(self) -> list:
+        """Every resin profile GooSlicer knows (all printers, hidden ones included), sorted."""
+        deleted = self.resin_marks("resinDeleted")
+        return [r for r in settingsmod.merge_resins(self._official_resins(), self._imported_resins())
+                if r.key not in deleted]
+
+    def resin_marks(self, key: str) -> set[str]:
+        """'resinHidden' / 'resinDeleted': sets of ResinProfile.key."""
+        v = self.settings.value(key, [])
+        return {v} if isinstance(v, str) and v else set(v or [])
+
+    def set_resin_mark(self, key: str, profile_key: str, on: bool) -> None:
+        marks = self.resin_marks(key)
+        marks = marks | {profile_key} if on else marks - {profile_key}
+        self.settings.setValue(key, sorted(marks))
+
+    def refresh_resins(self) -> None:
+        """Re-read the resin library and refill the Resin profile list (after manager changes)."""
+        self._imported_cache = None
+        p = self.printer_panel.current()
+        if p:
+            self._load_resins(p)
+
+    def manage_resins(self):
+        from .resins import ResinManager
+        dlg = ResinManager(self)
+        dlg.open()
+        self._resin_manager = dlg
+        return dlg
+
+    def import_resin_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import resin profile", self.settings.value("lastResinDir", str(Path.home())),
+            "SatelLite resin profiles (*.satres);;All files (*)")
+        if paths:
+            self.settings.setValue("lastResinDir", str(Path(paths[0]).parent))
+            self.import_resin_profiles(paths)
+
+    def import_resin_profiles(self, paths: list[str]) -> int:
+        """Copy .satres files into the data dir and add their profiles to the resin list. If the
+        import holds one profile for the current printer, it is selected. Returns the count."""
+        got = []
+        for path in paths:
+            try:
+                _dest, profs = settingsmod.store_satres(path, data_dir() / "resins")
+            except (OSError, ValueError) as e:
+                self.log_msg(f"Resin import failed for {Path(path).name}: {e}")
+                QMessageBox.warning(self, APP, f"Could not import {Path(path).name}:\n{e}")
+                continue
+            got.extend(profs)
+            for r in profs:                                 # importing brings a deleted one back
+                self.set_resin_mark("resinDeleted", r.key, False)
+            by_printer: dict[str, int] = {}
+            for r in profs:
+                by_printer[r.printer or "no printer named"] = by_printer.get(r.printer or "no printer named", 0) + 1
+            self.log_msg(f"Imported {len(profs)} resin profile(s) from {Path(path).name}: "
+                         + ", ".join(f"{n} for {pr}" for pr, n in by_printer.items()))
+        if not got:
+            return 0
+        self._imported_cache = None
+        p = self.printer_panel.current()
+        if p is None:
+            self.log_msg("They will be listed once printer profiles are loaded.")
+            return len(got)
+        self._load_resins(p)
+        mine = [r for r in got if r.printer == p.name]
+        if len(mine) == 1:                                  # select a single new profile
+            ps = self.print_settings
+            i = next((i for i, r in enumerate(ps.resins) if r.name == mine[0].name), None)
+            if i is not None:
+                ps.resin.setCurrentIndex(ps.resin.findData(i))
+        if mine:
+            self.statusBar().showMessage(f"Imported {len(got)} resin profile(s); {len(mine)} for {p.name} "
+                                         "added to the Resin profile list", 8000)
+        else:
+            others = sorted({r.printer for r in got if r.printer})
+            self.statusBar().showMessage(f"Imported {len(got)} resin profile(s), for "
+                                         f"{', '.join(others) or 'no named printer'}: choose that printer "
+                                         "to use them", 10000)
+        return len(got)
+
+    def _remember_resin(self, name: str) -> None:
+        """The user's resin pick, per printer ("" = Printer default), plus the last pick overall."""
+        p = self.printer_panel.current()
+        if p:
+            self.settings.setValue(f"resin/{p.name}", name)
+        self.settings.setValue("lastResin", name)
+
+    def _last_resin(self, printer: str) -> str:
+        """The resin to preselect: this printer's last pick, else the last pick on any printer
+        (resin names are shared across the Saturn 4 models)."""
+        key = f"resin/{printer}"
+        if self.settings.contains(key):
+            return str(self.settings.value(key) or "")
+        return str(self.settings.value("lastResin", "") or "")
 
     def resin_dir(self) -> Path | None:
         saved = self.settings.value("resinDir", "")
@@ -934,9 +1336,10 @@ def main(argv=None) -> int:
     app.setDesktopFileName(os.environ.get("FLATPAK_ID", "gooslicer"))   # must match the .desktop file
     w = MainWindow()
     w.show()
-    files = [a for a in app.arguments()[1:] if Path(a).suffix.lower() in meshmod.SUPPORTED]
+    files = [a for a in app.arguments()[1:]
+             if Path(a).suffix.lower() in (*meshmod.SUPPORTED, settingsmod.SATRES_EXT)]
     if files:
-        w.import_files(files)
+        w.open_files(files)
     return app.exec()
 
 

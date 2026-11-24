@@ -136,3 +136,46 @@ workers > 1 need an `if __name__ == "__main__":` guard (the GUI entry point has 
 - `tests/test_gui_smoke.py::test_slice_from_window`: profile import → resin selection → import → slice →
   layer preview, run through the main window.
 - Arc: per-layer lit area matches the exact mesh cross-section area within 0.1 mm².
+
+## 9. Imported resin profiles (`.satres`)
+
+SatelLite exports resin presets as `.satres` files. GooSlicer imports them with File → Import resin profile… or by dropping the file on the window.
+
+- **Container:** a big-endian Qt `QDataStream` `QVariantMap` (same container as `.satsup`, read by `gooslicer/qdatastream.py`). Not a ZIP or JSON. [SAMPLE]
+- **Layout:** one file holds several profiles. `printer/scriptmanager/scripcustomtnum` = count N; profile *i* lives under `printer/scriptmanager/scripcustomtnum<i>/scriptcontainername`, whose own value is the profile name. [SAMPLE]
+- **Profile keys** (relative to the profile prefix): [SAMPLE]
+
+| Key | Setting | Same field in resin `.data` JSON |
+|---|---|---|
+| `print/thickness` | layer height | `vd_printer_printer_para_thickness` |
+| `print/bottomlayer`, `print/translate_layer_count` | bottom / transition layers | `…_bottom_layer`, `…_tanslate_layer_count` |
+| `print/exposuretime`, `print/bottomexposuretime` | exposure / bottom exposure | `…_exposure_time`, `…_bottom_exposure_time` |
+| `print/lightoffdelay`, `print/bottomlightoffdelay` | light-off delays | `…_lightoff_delay`, `…_bottom_lightoff_delay` |
+| `print/wait_after_cure`, `print/bottom_wait_{before_lift,after_lift,after_retract}` | waits | same names |
+| `print/{bottomliftdis,liftingdis,bottomliftspeed,liftingspeed,bottom_backspeed,backspeed}` | lift / retract | `…_bootom_lift_dis`, `…_lift_dis`, … `…_back_speed` |
+| `print/slow_{bottom_,}{lift,back}_{dis,speed}` | second-stage motion | `vd_printer_printer_slow_…` |
+| `advanced/ledpower`, `advanced/bottom_ledpower` | light PWM | `vd_printer_advanced_para_{led_power,bottom_led_power}` |
+| `resin/density`, `resin/cost`, `resin/type` | density, cost, type | `vd_printer_resin_para_{density,cost,type}` |
+| `ExtraResinParameters/PrinterName` | printer the profile is for | `cloudResinPrinterName` |
+| `company` | resin maker | — |
+
+- The mapping is by matching key names and values against the `.data` fields; it was not traced in SatelLite's code. [INFERRED]
+- Kept (so they survive an export) but not used when slicing: `print/first_layer_exposure_time` ↔ `vd_printer_printer_first_layer_exposure_time` (no `.goo` field found), `print/parameter_mode` ↔ `…_parameter_mode`, and the other `advanced/*` keys ↔ `vd_printer_advanced_*` (anti-aliasing, grey level, blur, support AA, beam/inner compensation, reduce point, scale, notes), matched by name. [INFERRED] [UNKNOWN] what SatelLite does with `first_layer_exposure_time`.
+- Dropped: the rest of `ExtraResinParameters` (scores, counters, ids) and `resin/suffixindex*`.
+- **Storage:** an imported file is copied to `<data dir>/resins/` (named `<stem>-<hash>.satres`, so re-importing the same file is a no-op and two exports with the same file name both stay). Its profiles appear under the printer they name, alongside SatelLite's own; an imported profile with the same printer and name replaces SatelLite's.
+
+## 10. Resin library (Resin → Manage resins…)
+
+- **Sources:** SatelLite's install (`*.data`, read-only, never written), imported `.satres` (`<data dir>/resins/`), and copies made in GooSlicer (`<data dir>/resins/custom/`, one single-profile `.satres` each). A profile's identity is printer + name.
+- **Listed:** profiles for the printers GooSlicer supports, plus every imported profile and copy. SatelLite ships profiles for every ELEGOO printer (about 2,000).
+- **Copy:** asks for a name, which must differ (ignoring case and surrounding spaces) from every existing profile on any printer. A copy keeps the source's printer and values. Only copies can be edited; changes are written to the copy's file.
+- **Hide:** removes a profile from the Print settings Resin profile list only. Stored in settings as `resinHidden` (a list of printer|name).
+- **Delete:** a copy's file is removed; an imported profile is removed from GooSlicer's copy of its `.satres` (the file is rewritten without it, or removed when it was the last one); a SatelLite profile is only listed as deleted (`resinDeleted`) and the install is untouched. Importing a profile again clears its deleted mark.
+- **Export** writes a SatelLite `.satres`: a Qt 5 `QDataStream` `QVariantMap` with keys in reverse UTF-16 order (as Qt 5 writes a `QMap`), `printer/scriptmanager/scripcustomtnum` = count, and per profile the name plus the 69 keys of `resin_library.SCHEMA` with SatelLite's types (Qt5 Float 38 for `print/*`, double for `advanced/*` floats, int, bool, ulong, string). [SAMPLE] Values come from the profile; ones it lacks are GooSlicer's slicing defaults, and keys GooSlicer does not track get the values all 36 sample profiles share.
+- **Verification:** re-exporting the sample's 36 profiles reproduces the file byte for byte (`tests/test_satres.py`). Whether SatelLite imports a GooSlicer export has not been tried. [UNKNOWN]
+
+## 11. Front of the plate, and the slice held in memory
+
+- **Front is −Y** in GooSlicer's plate coordinates; the 3D view marks it with FRONT on the floor just in front of the −Y edge. [INFERRED] GooSlicer's Front view and default camera look from −Y, and slices match SatelLite's byte for byte (§8), so this is SatelLite's −Y as well. SatelLite's platform model (`resources/PlatformModel/*/…stl`, the build plate with its centred mounting bracket) does not settle which physical side that is. To be confirmed on the printer: slice a part placed near the FRONT edge and check that it prints at the door side of the plate. [UNKNOWN]
+- **Properties → Slicing → Slice** builds the whole `.goo` in memory (`SliceJob.build`): the same layers and header as a sliced file (tested against `write`). The estimates shown are the header's: print time (§6), volume (mm³ / 1000 = ml) and weight (g, §5), plus layer count and layer height.
+- The held slice stays valid while the printer, the print settings and every part (mesh and support plan by identity, since edits replace them; position, rotation and scale by value) are unchanged. While valid, File → Slice and save, and Slice and send, write it out instead of slicing again; once anything changes, the panel says so and those commands slice afresh.

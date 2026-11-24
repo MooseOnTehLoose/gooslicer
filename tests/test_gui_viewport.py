@@ -202,3 +202,72 @@ def test_import_error_is_reported(app, win, tmp_path, monkeypatch):
     bad.write_bytes(b"solid x\nendsolid x\n")
     assert wait_import(app, win, [bad]) == 0
     assert "Import failed" in win.log.toPlainText() and not win.scene.parts
+
+
+def test_axis_compass_top_right(app, win, tmp_path):
+    from gooslicer_qt.viewport import COMPASS_COLORS
+    from PySide6.QtGui import QColor
+    assert wait_import(app, win, [box_file(tmp_path)]) == 1
+    vp = win.viewport
+    vp.set_view(-90, 89)                       # top view: X to the right, Y up
+    pump(app)
+    r = vp.compass_rect()
+    assert r.right() <= vp.width() and r.top() >= 0 and r.left() > vp.width() / 2
+    img = vp.grabFramebuffer()
+    dpr = img.devicePixelRatio()
+    arm = r.width() / 2 - 11
+
+    def near(pt, name):
+        """The axis's hue (red X, green Y, blue Z); far-pointing axes are drawn dimmer."""
+        c = img.pixelColor(int(pt.x() * dpr), int(pt.y() * dpr))
+        ch = {"X": c.red(), "Y": c.green(), "Z": c.blue()}
+        top = ch.pop(name)
+        assert QColor(COMPASS_COLORS[name]).isValid()
+        return top > 90 and all(top > v + 40 for v in ch.values())
+
+    cx, cy = r.center().x(), r.center().y()
+    # sample along each arm (the disc centre holds the dark letter)
+    assert near(QPointF(cx + arm * 0.55, cy), "X") and near(QPointF(cx, cy - arm * 0.55), "Y")
+    # the 3D scene still renders after the painter overlay (GL state restored each frame)
+    win.select([])
+    vp.frame_selection()
+    pump(app)
+    img = vp.grabFramebuffer()
+    c = img.pixelColor(int(project(vp, [0, 0, 10]).x() * dpr), int(project(vp, [0, 0, 10]).y() * dpr))
+    assert c.blue() > c.red() and c.green() > 100
+    vp.show_compass = False
+    vp.update()
+    pump(app)
+    img = vp.grabFramebuffer()
+    assert not near(QPointF(cx + arm * 0.55, cy), "X")
+
+
+def test_front_label(app, win):
+    vp = win.viewport
+    sy = float(win.scene.size[1])
+    vp.set_view(-90, 89)                       # top view: X right, Y up, front (−Y) at the bottom
+    pump(app)
+    quad = vp.front_label_quad()
+    edge = project(vp, [0, -sy / 2, 0])
+    assert quad is not None and min(q.y() for q in quad) > edge.y()          # in front of the plate
+    assert quad[0].x() < quad[1].x() and quad[0].y() < quad[3].y()          # reads left to right, upright
+    assert abs((quad[0].x() + quad[1].x()) / 2 - edge.x()) < 2               # centred on the front edge
+    img = vp.grabFramebuffer()
+    dpr = img.devicePixelRatio()
+    x0, x1 = int(min(q.x() for q in quad) * dpr), int(max(q.x() for q in quad) * dpr)
+    y0, y1 = int(min(q.y() for q in quad) * dpr), int(max(q.y() for q in quad) * dpr)
+
+    def white():
+        im = vp.grabFramebuffer()
+        return sum(1 for x in range(x0, x1) for y in range(y0, y1)
+                   if min(im.pixelColor(x, y).red(), im.pixelColor(x, y).green(), im.pixelColor(x, y).blue()) > 225)
+    assert white() > 40                                                      # white text is drawn
+    vp.show_front = False
+    vp.update()
+    pump(app)
+    assert white() == 0
+    vp.show_front = True
+    vp.set_view(90, 30)                        # from behind: beyond the far edge, mirrored
+    pump(app)
+    q = vp.front_label_quad()
+    assert q[0].x() > q[1].x() and max(p.y() for p in q) < project(vp, [0, -sy / 2, 0]).y()

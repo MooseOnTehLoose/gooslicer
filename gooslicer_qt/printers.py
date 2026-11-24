@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
                                QInputDialog, QLabel, QListWidget, QListWidgetItem, QMessageBox,
                                QProgressBar, QPushButton, QVBoxLayout, QWidget)
 
@@ -75,13 +75,20 @@ class PrinterControlPanel(QWidget):
         self.conn_label = QLabel("Not connected")
         self.warn_label = QLabel()
         self.warn_label.setWordWrap(True)
-        self.warn_label.setStyleSheet("color:#c0392b;")
+        self._update_warn_color()
+        tm = QApplication.instance().property("gooslicerTheme")
+        if tm is not None:
+            tm.changed.connect(self._update_warn_color)
         self.warn_label.hide()
-        top = QHBoxLayout()
-        top.addWidget(self.combo, 1)
-        top.addWidget(self.find_btn)
-        top.addWidget(self.add_btn)
-        top.addWidget(self.connect_btn)
+        # stacked to fit the Print settings column
+        self.combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.combo.setMinimumContentsLength(12)
+        top = QFormLayout()
+        top.addRow("Network printer", self.combo)
+        btns = QHBoxLayout()
+        btns.addWidget(self.find_btn)
+        btns.addWidget(self.add_btn)
+        btns.addWidget(self.connect_btn)
 
         # --- status
         self.state_label = QLabel("—")
@@ -112,6 +119,7 @@ class PrinterControlPanel(QWidget):
         # --- files
         files_box = QGroupBox("Files on printer")
         self.files = QListWidget()
+        self.files.setMinimumHeight(110)
         self.refresh_files_btn = QPushButton("Refresh")
         self.print_file_btn = QPushButton("Print")
         self.delete_file_btn = QPushButton("Delete")
@@ -132,14 +140,14 @@ class PrinterControlPanel(QWidget):
         fl.addLayout(fb)
         fl.addLayout(ub)
 
-        body = QHBoxLayout()
-        body.addWidget(status_box, 1)
-        body.addWidget(files_box, 1)
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.addLayout(top)
+        lay.addLayout(btns)
         lay.addWidget(self.conn_label)
         lay.addWidget(self.warn_label)
-        lay.addLayout(body, 1)
+        lay.addWidget(status_box)
+        lay.addWidget(files_box, 1)
 
         self.find_btn.clicked.connect(self.find_printers)
         self.add_btn.clicked.connect(self.add_by_ip_dialog)
@@ -158,7 +166,12 @@ class PrinterControlPanel(QWidget):
         self._fill_combo()
         self._update_buttons()
 
+    def _update_warn_color(self, *_):
+        tm = QApplication.instance().property("gooslicerTheme")
+        self.warn_label.setStyleSheet(f"color:{tm.warning_color() if tm is not None else '#c0392b'};")
+
     # ----------------------------------------------------------- persistence
+
     def _load_known(self) -> list[Printer]:
         try:
             rows = json.loads(self.settings.value("lan/printers", "[]") or "[]")

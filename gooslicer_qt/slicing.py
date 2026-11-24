@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
-                               QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget)
+import math
+
+from PySide6.QtCore import QEvent, QObject, QPointF, QSize, QThread, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QHBoxLayout, QLabel,
+                               QSizePolicy, QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from elegoo_goo import goo, rle
 from gooslicer import settings as S
@@ -13,9 +15,76 @@ from gooslicer import slicer as SL
 
 SLICE_POS = (("Layer bottom", 0.0), ("Layer middle", 0.5), ("Layer top", 1.0))
 
+STAR_SIZE = 16
+STAR_OFF = "#9aa0a6"                    # grey outline
+STAR_ON, STAR_ON_EDGE = "#f5c518", "#c99a00"   # filled yellow
+
+
+def star_icon(filled: bool, size: int = STAR_SIZE) -> QIcon:
+    """A five-pointed star: grey outline (not a favourite) or filled yellow (favourite)."""
+    icon = QIcon()
+    for scale in (1, 2):                # crisp on HiDPI
+        px = QPixmap(size * scale, size * scale)
+        px.setDevicePixelRatio(scale)
+        px.fill(Qt.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing)
+        c, ro, ri = size / 2, size / 2 - 1.2, (size / 2 - 1.2) * 0.42
+        pts = [QPointF(c + (ro if k % 2 == 0 else ri) * math.sin(k * math.pi / 5),
+                       c + 0.6 - (ro if k % 2 == 0 else ri) * math.cos(k * math.pi / 5)) for k in range(10)]
+        if filled:
+            p.setPen(QPen(QColor(STAR_ON_EDGE), 1.0))
+            p.setBrush(QColor(STAR_ON))
+        else:
+            p.setPen(QPen(QColor(STAR_OFF), 1.3))
+            p.setBrush(Qt.NoBrush)
+        p.drawPolygon(QPolygonF(pts))
+        p.end()
+        icon.addPixmap(px)
+    return icon
+
+
+def blank_icon(size: int = STAR_SIZE) -> QIcon:
+    px = QPixmap(size, size)
+    px.fill(Qt.transparent)
+    return QIcon(px)
+
+
+class _StarClicks(QObject):
+    """Clicks on the star column of the resin list toggle the favourite instead of selecting
+    the row, and the list stays open."""
+
+    def __init__(self, panel: "PrintSettingsPanel"):
+        super().__init__(panel)
+        self.panel = panel
+
+    def star_hit(self, pos) -> int | None:
+        view = self.panel.resin.view()
+        idx = view.indexAt(pos)
+        if not idx.isValid():
+            return None
+        ri = idx.data(Qt.UserRole)
+        if not isinstance(ri, int):
+            return None                 # "Printer default" or the divider
+        if pos.x() > view.visualRect(idx).left() + STAR_SIZE + 8:
+            return None
+        return ri
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseButtonDblClick):
+            ri = self.star_hit(ev.position().toPoint())
+            if ri is not None:
+                if t == QEvent.MouseButtonRelease and ev.button() == Qt.LeftButton:
+                    self.panel.toggle_favorite(self.panel.resins[ri].key)
+                return True             # swallow: no selection, popup stays open
+        return False
+
 
 class PrintSettingsPanel(QWidget):
     changed = Signal()
+    favoritesChanged = Signal(list)     # favourite profile keys (printer|name), to persist
+    resinSelected = Signal(str)         # picked by the user ("" = Printer default), to persist
 
     FIELDS = (  # attr, label, kind, min, max, decimals/suffix
         ("layer_height", "Layer height", float, 0.01, 0.2, (3, " mm")),
@@ -32,10 +101,17 @@ class PrintSettingsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.resins: list[S.ResinProfile] = []
+        self.favorites: set[str] = set()    # ResinProfile.key: printer|name, so per printer
         self.base = S.PrintSettings()
         self.resin = QComboBox()
         self.resin.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.resin.setMinimumContentsLength(18)
+        self.resin.setIconSize(QSize(STAR_SIZE, STAR_SIZE))
+        self.resin.setToolTip("Click a star in the list to add or remove a favourite. "
+                              "Favourites are listed first.")
+        self._star_on, self._star_off, self._blank = star_icon(True), star_icon(False), blank_icon()
+        self._star_clicks = _StarClicks(self)
+        self.resin.view().viewport().installEventFilter(self._star_clicks)
         self.slice_pos = QComboBox()
         for label, _ in SLICE_POS:
             self.slice_pos.addItem(label)
@@ -43,8 +119,26 @@ class PrintSettingsPanel(QWidget):
         self.slice_pos.setToolTip("Height inside each layer at which the model is cut "
                                   "(SatelLite default: layer middle).")
         self.widgets = {}
-        lay = QFormLayout(self)
-        lay.addRow("Resin profile", self.resin)
+        outer = QVBoxLayout(self)
+        self._top = QFormLayout()
+        self._top.addRow("Resin profile", self.resin)
+        outer.addLayout(self._top)
+        # everything below the resin is tucked away behind "Advanced settings" (collapsed)
+        self.advanced_btn = QToolButton()
+        self.advanced_btn.setText("Advanced settings")
+        self.advanced_btn.setCheckable(True)
+        self.advanced_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.advanced_btn.setArrowType(Qt.RightArrow)
+        self.advanced_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.advanced_btn.setToolTip("Layer height, exposures, delays, light power and slice position. "
+                                     "Choosing a resin profile fills these in.")
+        self.advanced_btn.toggled.connect(self.set_advanced_visible)
+        outer.addWidget(self.advanced_btn)
+        self.advanced = QWidget()
+        lay = QFormLayout(self.advanced)
+        lay.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.advanced)
+        outer.addStretch(1)
         for attr, label, kind, lo, hi, fmt in self.FIELDS:
             if kind is int:
                 w = QSpinBox()
@@ -60,23 +154,77 @@ class PrintSettingsPanel(QWidget):
             self.widgets[attr] = w
             lay.addRow(label, w)
         lay.addRow("Slice at", self.slice_pos)
+        self.set_advanced_visible(False)
         self.resin.currentIndexChanged.connect(self._resin_changed)
+        # list rebuilds block signals, so this fires only for the user's own picks
+        self.resin.currentIndexChanged.connect(
+            lambda *_: self.resinSelected.emit(r.name if (r := self.current_resin()) else ""))
+
+    def insert_top_widget(self, widget: QWidget) -> None:
+        """A section above the Printer/Resin rows, with a divider line (the main window puts
+        printer control there)."""
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        self.layout().insertWidget(0, line)
+        self.layout().insertWidget(0, widget)
+
+    def insert_top_row(self, label: str, widget: QWidget) -> None:
+        """A row above the resin profile (the main window puts the printer there)."""
+        self._top.insertRow(0, label, widget)
+
+    def set_advanced_visible(self, on: bool) -> None:
+        self.advanced.setVisible(on)
+        self.advanced_btn.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        if self.advanced_btn.isChecked() != on:
+            self.advanced_btn.setChecked(on)
 
     def set_sources(self, base: S.PrintSettings, resins: list[S.ResinProfile], current: str | None = None):
         self.base, self.resins = base, resins
-        self.resin.blockSignals(True)
-        self.resin.clear()
-        self.resin.addItem("Printer default")
-        for r in resins:
-            self.resin.addItem(f"{r.name}" + (f"  ({r.resin_type})" if r.resin_type else ""), r.id)
-        idx = next((i + 1 for i, r in enumerate(resins) if r.name == current), 0)
-        self.resin.setCurrentIndex(idx)
-        self.resin.blockSignals(False)
+        cur = next((i for i, r in enumerate(resins) if r.name == current), None)
+        self._rebuild(cur)
         self._resin_changed()
 
+    def set_favorites(self, keys) -> None:
+        """Favourite profile keys (from settings); re-sorts the list, keeping the selection."""
+        self.favorites = {str(k) for k in keys or [] if k}
+        self._rebuild(self._current_index())
+
+    def is_favorite(self, key: str) -> bool:
+        return key in self.favorites
+
+    def toggle_favorite(self, key: str) -> None:
+        self.favorites ^= {key}
+        self._rebuild(self._current_index())
+        self.favoritesChanged.emit(sorted(self.favorites))
+
+    def _rebuild(self, current: int | None) -> None:
+        """'Printer default', then favourites, a divider, then the rest; each in profile order.
+        Item data is the index into self.resins (None for 'Printer default' and the divider)."""
+        fav = [i for i, r in enumerate(self.resins) if r.key in self.favorites]
+        rest = [i for i, r in enumerate(self.resins) if r.key not in self.favorites]
+        c = self.resin
+        c.blockSignals(True)
+        c.clear()
+        c.addItem(self._blank, "Printer default", None)
+        for group in (fav, rest):
+            if group is rest and fav and rest:
+                c.insertSeparator(c.count())
+            for i in group:
+                r = self.resins[i]
+                c.addItem(self._star_on if group is fav else self._star_off,
+                          r.name + (f"  ({r.resin_type})" if r.resin_type else ""), i)
+        pos = c.findData(current) if current is not None else 0
+        c.setCurrentIndex(max(pos, 0))
+        c.blockSignals(False)
+
+    def _current_index(self) -> int | None:
+        d = self.resin.currentData(Qt.UserRole)
+        return d if isinstance(d, int) else None
+
     def current_resin(self) -> S.ResinProfile | None:
-        i = self.resin.currentIndex()
-        return self.resins[i - 1] if 0 < i <= len(self.resins) else None
+        i = self._current_index()
+        return self.resins[i] if i is not None and 0 <= i < len(self.resins) else None
 
     def _resin_changed(self, *_):
         r = self.current_resin()
@@ -102,18 +250,18 @@ class SliceThread(QThread):
     finishedOk = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, job: SL.SliceJob, path: str, parent=None):
+    def __init__(self, job: SL.SliceJob, path: str | None, parent=None):
         super().__init__(parent)
-        self.job, self.path = job, path
+        self.job, self.path = job, path          # path None: slice into memory (result.goo)
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
+        kw = dict(progress=lambda d, n: self.progress.emit(d, n), cancelled=lambda: self._cancel)
         try:
-            res = self.job.write(self.path, progress=lambda d, n: self.progress.emit(d, n),
-                                 cancelled=lambda: self._cancel)
+            res = self.job.build(**kw) if self.path is None else self.job.write(self.path, **kw)
         except SL.SliceCancelled:
             self.failed.emit("cancelled")
         except Exception as e:  # surface every failure in the UI

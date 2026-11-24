@@ -16,6 +16,41 @@ BUILTIN = "Built-in defaults (EVO 30-60 mm values)"
 BUILTIN_TREE = "Built-in tree (Tree Medium values)"
 
 
+def support_choices(templates) -> list[tuple[str, object]]:
+    """The support types to offer: built-in EVO and tree values, then SatelLite's templates."""
+    return [(BUILTIN, None), (BUILTIN_TREE, "tree")] + \
+        [(t.name, t) for t in templates if t.family in ("evo", "tree")]
+
+
+def recommended_choice(templates, max_height: float):
+    """The template SatelLite's height rule picks (06 §1), or None for the built-in values."""
+    return recommended_template([t for t in templates if t.family in ("evo", "tree")], max_height)
+
+
+def support_note(t, max_height: float, have_templates: bool) -> str:
+    if t is None:
+        return "SatelLite's templates were not found; using the EVO 30-60 mm values." \
+            if not have_templates else "Values of SatelLite's EVO 30-60 mm template."
+    if t == "tree":
+        return "Tree supports with the values of SatelLite's Tree Medium template."
+    if t.family == "tree":
+        return f"Tree supports. Tallest part {max_height:.1f} mm."
+    txt = f"Tallest part {max_height:.1f} mm."
+    if not t.fits_height(max_height):
+        txt += f" “{t.name}” may cause printing failure at this height; " \
+               "the recommended template is preselected."
+    return txt
+
+
+def support_params(t) -> tuple[S.SupportParams, str]:
+    """(parameters, template name) for a support_choices() entry."""
+    if t is None:
+        return S.SupportParams(), ""
+    if t == "tree":
+        return S.SupportParams.tree_defaults(), ""
+    return S.SupportParams.from_template(t), t.name
+
+
 class SupportDialog(QDialog):
     """Pick a SatelLite template (read in place from the user's install) or the built-in values.
     The recommended template follows SatelLite's height rule (06 §1)."""
@@ -25,10 +60,8 @@ class SupportDialog(QDialog):
         self.setWindowTitle("Auto-support")
         self.templates = [t for t in templates if t.family in ("evo", "tree")]
         self.combo = QComboBox()
-        self.combo.addItem(BUILTIN, None)
-        self.combo.addItem(BUILTIN_TREE, "tree")
-        for t in self.templates:
-            self.combo.addItem(t.name, t)
+        for label, data in support_choices(self.templates):
+            self.combo.addItem(label, data)
         rec = recommended_template(self.templates, max_height)
         if rec is not None:
             self.combo.setCurrentIndex(self.templates.index(rec) + 2)
@@ -53,28 +86,10 @@ class SupportDialog(QDialog):
         v.addWidget(bb)
 
     def _update_note(self, h):
-        t = self.combo.currentData()
-        if t is None:
-            txt = "SatelLite's templates were not found; using the EVO 30-60 mm values." \
-                if not self.templates else "Values of SatelLite's EVO 30-60 mm template."
-        elif t == "tree":
-            txt = "Tree supports with the values of SatelLite's Tree Medium template."
-        elif t.family == "tree":
-            txt = f"Tree supports. Tallest part {h:.1f} mm."
-        else:
-            txt = f"Tallest part {h:.1f} mm."
-            if not t.fits_height(h):
-                txt += f" “{t.name}” may cause printing failure at this height; " \
-                       "the recommended template is preselected."
-        self.note.setText(txt)
+        self.note.setText(support_note(self.combo.currentData(), h, bool(self.templates)))
 
     def params(self) -> tuple[S.SupportParams, str]:
-        t = self.combo.currentData()
-        if t is None:
-            return S.SupportParams(), ""
-        if t == "tree":
-            return S.SupportParams.tree_defaults(), ""
-        return S.SupportParams.from_template(t), t.name
+        return support_params(self.combo.currentData())
 
     def apply_to_all(self) -> bool:
         return self.all.isChecked()

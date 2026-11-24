@@ -9,11 +9,11 @@ from OpenGL import GL
 # pointer per context and fails when PyOpenGL's platform differs from Qt's; we only pass
 # VBO offsets, so use the raw entry point.
 from OpenGL.raw.GL.VERSION.GL_2_0 import glVertexAttribPointer as _raw_attrib_pointer
-from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QSurfaceFormat
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF, QSurfaceFormat, QTransform
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
-from gooslicer.camera import OrbitCamera, ray_plane
+from gooslicer.camera import OrbitCamera, axis_gizmo, ray_plane
 from gooslicer.scene import Part, PartState, Scene
 
 MESH_VS = """#version 330 core
@@ -126,6 +126,22 @@ def plate_lines(size, step: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
     return np.array(grid, float), np.array(box, float)
 
 
+# FRONT label on the floor in front of the plate. GooSlicer's front is −Y: the Front view and
+# the default camera look from there, and slices match SatelLite's (05-slicing-spec §11).
+FRONT_TEXT = "FRONT"
+FRONT_ASPECT = 4.6       # label width / height
+FRONT_FONT_PX = 64       # drawing resolution of the label before it is projected
+
+
+def _area(q) -> float:
+    return 0.5 * sum(q[i].x() * q[i - 1].y() - q[i - 1].x() * q[i].y() for i in range(len(q)))
+
+
+COMPASS_RADIUS = 42      # px, logical
+COMPASS_MARGIN = 10
+COMPASS_COLORS = {"X": "#e5534b", "Y": "#7ac74f", "Z": "#4c9be8"}   # the usual red/green/blue
+
+
 class Viewport(QOpenGLWidget):
     selectionChanged = Signal(list)                # [part ids]
     moveFinished = Signal(object)                  # {id: (before PartState, after PartState)}
@@ -148,6 +164,8 @@ class Viewport(QOpenGLWidget):
         self.lay_flat_mode = False
         self.hole_mode = False
         self.support_mode = False
+        self.show_compass = True
+        self.show_front = True
         self.extra_meshes = lambda: []             # [(trimesh, 4x4 world matrix)] drawn as supports
         self._buffers: dict[int, tuple[object, _Buffer]] = {}  # id(mesh) -> (mesh, buffer)
         self._plate: tuple | None = None
@@ -227,6 +245,9 @@ class Viewport(QOpenGLWidget):
 
     def paintGL(self):
         self._sync_buffers()
+        # QPainter (the compass, drawn last) leaves its own GL state behind: reset ours
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glDisable(GL.GL_BLEND)
         GL.glClearColor(0.16, 0.17, 0.19, 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         w, h = max(self.width(), 1), max(self.height(), 1)
@@ -277,6 +298,99 @@ class Viewport(QOpenGLWidget):
             GL.glBindVertexArray(b.vao)
             GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
         GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
+        painter = QPainter(self)
+        try:
+            if self.show_front:
+                self._draw_front(painter, vp, w, h)
+            if self.show_compass:
+                self._draw_compass(painter)
+        finally:
+            painter.end()
+
+    def front_label_quad(self, vp=None, w=None, h=None) -> list[QPointF] | None:
+        """Screen corners (top-left, top-right, bottom-right, bottom-left) of the FRONT label,
+        which lies flat on the floor just in front of the plate's front (−Y) edge, reading from
+        the front. None when part of it is behind the camera."""
+        w = w or max(self.width(), 1)
+        h = h or max(self.height(), 1)
+        if vp is None:
+            vp = self.camera.projection(w / h) @ self.camera.view()
+        sx, sy = float(self.scene.size[0]), float(self.scene.size[1])
+        th = float(np.clip(sy * 0.16, 10.0, 28.0))                # text height in mm
+        tw = th * FRONT_ASPECT
+        far = -sy / 2 - th * 0.35
+        near = far - th
+        pts = []
+        for x, y in ((-tw / 2, far), (tw / 2, far), (tw / 2, near), (-tw / 2, near)):
+            c = vp @ np.array([x, y, 0.0, 1.0])
+            if c[3] <= 1e-6:
+                return None
+            pts.append(QPointF((c[0] / c[3] + 1) * w / 2, (1 - c[1] / c[3]) * h / 2))
+        return pts
+
+    def _draw_front(self, p: QPainter, vp, w, h) -> None:
+        quad = self.front_label_quad(vp, w, h)
+        if quad is None:
+            return
+        poly = QPolygonF(quad)
+        if abs(_area(quad)) < 40:                                 # edge-on: nothing readable
+            return
+        src = QRectF(0, 0, FRONT_FONT_PX * FRONT_ASPECT, FRONT_FONT_PX)
+        t = QTransform.quadToQuad(QPolygonF([src.topLeft(), src.topRight(), src.bottomRight(), src.bottomLeft()]), poly)
+        if t is None:
+            return
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setTransform(t)
+        font = QFont(self.font())
+        font.setBold(True)
+        font.setPixelSize(int(FRONT_FONT_PX * 0.86))
+        font.setLetterSpacing(QFont.PercentageSpacing, 112)
+        p.setFont(font)
+        p.setPen(QColor(0, 0, 0, 110))                           # soft shadow for contrast
+        p.drawText(src.translated(1.5, 1.5), Qt.AlignCenter, FRONT_TEXT)
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(src, Qt.AlignCenter, FRONT_TEXT)
+        p.restore()
+
+    def compass_rect(self) -> QRectF:
+        """Where the orientation compass sits: the top-right corner."""
+        d = 2 * COMPASS_RADIUS
+        return QRectF(self.width() - d - COMPASS_MARGIN, COMPASS_MARGIN, d, d)
+
+    def _draw_compass(self, p: QPainter) -> None:
+        """X/Y/Z axes as the camera sees them (rotation only), far ends first so nearer
+        axes overlap. Positive ends carry a labelled disc, negative ends a small ring."""
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.compass_rect()
+        c = r.center()
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1.0))
+        p.setBrush(QColor(0x22, 0x24, 0x28, 225))        # hides scene lines behind it
+        p.drawEllipse(r)
+        arm = COMPASS_RADIUS - 11
+        font = QFont(self.font())
+        font.setBold(True)
+        font.setPixelSize(11)
+        p.setFont(font)
+        for name, sign, x, y, depth in axis_gizmo(self.camera.view()):
+            col = QColor(COMPASS_COLORS[name])
+            if depth < 0:                                   # pointing away: dim it
+                col = col.darker(135)
+            end = QPointF(c.x() + x * arm, c.y() + y * arm)
+            if sign > 0:
+                p.setPen(QPen(col, 2.5, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(c, end)
+                p.setPen(Qt.NoPen)
+                p.setBrush(col)
+                p.drawEllipse(end, 8.5, 8.5)
+                p.setPen(QColor("#15171a"))
+                p.drawText(QRectF(end.x() - 8.5, end.y() - 8.5, 17, 17), Qt.AlignCenter, name)
+            else:
+                p.setPen(QPen(col, 1.5))
+                p.setBrush(QColor(0x29, 0x2b, 0x30))
+                p.drawEllipse(end, 5.0, 5.0)
 
     # ------------------------------------------------------------ input
     def _ray(self, pos: QPointF):

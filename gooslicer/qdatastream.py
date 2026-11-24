@@ -64,6 +64,39 @@ def read_variant_map(path: str) -> dict:
     return m
 
 
+# ------------------------------------------------------------------ writer
+BOOL, INT, UINT, LONG, ULONG, DOUBLE, STRING, FLOAT = 1, 2, 3, 4, 5, 6, 10, 38
+
+
+def _qstring(s: str) -> bytes:
+    b = s.encode("utf-16-be")
+    return struct.pack(">I", len(b)) + b
+
+
+def _variant(t: int, v) -> bytes:
+    head = struct.pack(">IB", t, 0)
+    if t == BOOL:   return head + struct.pack(">?", bool(v))
+    if t == INT:    return head + struct.pack(">i", int(v))
+    if t == UINT:   return head + struct.pack(">I", int(v))
+    if t == LONG:   return head + struct.pack(">q", int(v))
+    if t == ULONG:  return head + struct.pack(">Q", int(v))
+    if t in (DOUBLE, FLOAT): return head + struct.pack(">d", float(v))   # Qt5 Float: a double on the wire
+    if t == STRING: return head + _qstring(str(v))
+    raise ValueError(f"cannot write QVariant type {t}")
+
+
+def write_variant_map(path, typed: dict) -> None:
+    """Write {key: (qvariant type, value)} as a Qt 5 QDataStream QVariantMap. Keys go in reverse
+    UTF-16 order, as Qt 5 serialises a QMap (seen in SatelLite's .satres)."""
+    keys = sorted(typed, key=lambda k: k.encode("utf-16-be"), reverse=True)
+    data = struct.pack(">I", len(keys)) + b"".join(_qstring(k) + _variant(*typed[k]) for k in keys)
+    tmp = f"{path}.tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    import os
+    os.replace(tmp, path)
+
+
 if __name__ == "__main__":  # python -m gooslicer.qdatastream FILE…
     import json
     for p in sys.argv[1:]:

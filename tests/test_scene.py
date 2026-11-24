@@ -203,3 +203,16 @@ def test_camera_orbit_clamps_and_frame():
     assert cam.pitch == 89.0
     cam.frame([-10, -10, 0], [10, 10, 20])
     assert np.allclose(cam.target, [0, 0, 10]) and cam.distance > 20
+
+
+def test_axis_gizmo_follows_camera_rotation():
+    def ends(cam):
+        return {(n, sg): (x, y, d) for n, sg, x, y, d in camera.axis_gizmo(cam.view())}
+    top = ends(camera.OrbitCamera(yaw=-90, pitch=89))
+    assert top[("X", 1)][0] > 0.99 and top[("Y", 1)][1] < -0.99          # X right, Y up the screen
+    assert top[("Z", 1)][2] > 0.99                                        # Z toward the viewer
+    front = ends(camera.OrbitCamera(yaw=-90, pitch=0, target=np.array([50.0, 20, 0]), distance=900))
+    assert front[("X", 1)][0] > 0.99 and front[("Z", 1)][1] < -0.99      # pan/zoom don't matter
+    assert front[("Y", 1)][2] < -0.99                                     # +Y points away
+    order = [d for *_, d in camera.axis_gizmo(camera.OrbitCamera(yaw=35, pitch=55).view())]
+    assert order == sorted(order) and len(order) == 6                    # drawn far to near

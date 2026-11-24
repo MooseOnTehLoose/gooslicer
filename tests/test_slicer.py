@@ -245,3 +245,24 @@ def test_sphere_sample_is_cut_mid_layer():
         n = min(len(ours), len(theirs))
         rms[f] = float(np.sqrt(np.mean((ours[:n] - theirs[:n]) ** 2)))
     assert rms[0.5] < 0.15 and rms[0.5] < rms[0.0] / 3 and rms[0.5] < rms[1.0] / 3
+
+
+def test_build_in_memory_matches_file(tmp_path):
+    cube = trimesh.creation.box((6, 4, 3))
+    cube.apply_translation((2, -1, 1.5))
+    job = SL.SliceJob([cube], SPEC16K, ABS_LIKE_16K, "ELEGOO Saturn 4 Ultra 16K")
+    mem = job.build(workers=1)
+    disk = job.write(str(tmp_path / "c.goo"), workers=1)
+    assert mem.path == "" and mem.layers == disk.layers == 60 == len(mem.goo.layers)
+    assert (mem.print_time, mem.volume, mem.weight, mem.layer_height) == \
+           (disk.print_time, disk.volume, disk.weight, disk.layer_height) and mem.layer_height == 0.05
+    assert mem.volume == pytest.approx(72.0, rel=1e-6)
+    on_disk = goo.read(disk.path)
+    for a, b in zip(mem.goo.layers, on_disk.layers):
+        assert a.data == b.data and a.definition.pack() == b.definition.pack()
+    # what is held in memory saves to the same file
+    goo.write(tmp_path / "m.goo", mem.goo.header, mem.goo.layers)
+    assert [(x.data, x.definition.pack()) for x in goo.read(tmp_path / "m.goo").layers] == \
+        [(x.data, x.definition.pack()) for x in on_disk.layers]
+    with pytest.raises(ValueError):
+        SL.SliceJob([], SPEC16K, ABS_LIKE_16K, "x").build()

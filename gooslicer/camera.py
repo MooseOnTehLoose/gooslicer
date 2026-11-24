@@ -87,3 +87,18 @@ def ray_plane(origin, direction, point, normal) -> np.ndarray | None:
         return None
     t = float(np.dot(np.asarray(point) - origin, normal)) / denom
     return None if t < 0 else np.asarray(origin) + t * np.asarray(direction)
+
+
+def axis_gizmo(view: np.ndarray) -> list[tuple[str, int, float, float, float]]:
+    """The world axes as the camera sees them, for an orientation compass: one entry per axis
+    end (name, sign ±1, x, y, depth). x/y are unit-length screen offsets (x right, y down),
+    taken from the view rotation only (no pan, zoom or perspective). depth grows toward the
+    viewer. Sorted far to near, the order to draw them in."""
+    R = np.asarray(view, float)[:3, :3]
+    out = []
+    for i, name in enumerate("XYZ"):
+        v = R[:, i]                         # camera-space direction of the world axis
+        for sign in (1, -1):
+            out.append((name, sign, float(sign * v[0]), float(-sign * v[1]), float(sign * v[2])))
+    out.sort(key=lambda a: a[4])
+    return out

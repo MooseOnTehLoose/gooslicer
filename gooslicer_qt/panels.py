@@ -2,14 +2,58 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-                               QPushButton, QVBoxLayout, QWidget)
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QFont, QPainter, QPalette, QPen
+from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
+                               QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+                               QListWidgetItem, QPushButton, QVBoxLayout, QWidget)
 
 from gooslicer.mesh import MeshReport
 
 AXES = ("X", "Y", "Z")
+
+
+class InfoButton(QAbstractButton):
+    """A small circular button with a lower-case "i", drawn from the current palette so it
+    follows the light/dark theme."""
+    SIZE = 22
+
+    def __init__(self, tooltip: str = "", parent=None):
+        super().__init__(parent)
+        self.setToolTip(tooltip)
+        self.setAccessibleName(tooltip or "Information")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.TabFocus)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setAttribute(Qt.WA_Hover)
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.SIZE, self.SIZE)
+
+    def paintEvent(self, _e) -> None:
+        pal = self.palette()
+        active = self.isDown() or self.underMouse() or self.hasFocus()
+        ring = pal.color(QPalette.Highlight) if active else pal.color(QPalette.ButtonText)
+        text = ring
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        p.setBrush(Qt.NoBrush)
+        if self.isDown():
+            p.setBrush(pal.color(QPalette.Highlight))
+            text = pal.color(QPalette.HighlightedText)
+        if not self.isEnabled():
+            ring = text = pal.color(QPalette.Disabled, QPalette.ButtonText)
+        p.setPen(QPen(ring, 1.5))
+        p.drawEllipse(r)
+        f = QFont(self.font())
+        f.setFamily("serif")
+        f.setBold(True)
+        f.setPixelSize(14)
+        p.setFont(f)
+        p.setPen(text)
+        p.drawText(r, Qt.AlignCenter, "i")
+        p.end()
 
 
 class PartsList(QListWidget):
@@ -65,6 +109,7 @@ class PropertiesPanel(QWidget):
         for r, (label, row) in enumerate((("Position", self.pos), ("Size", self.size), ("Scale", self.scale)), 1):
             grid.addWidget(QLabel(label), r, 0)
             for c, w in enumerate(row):
+                w.setMinimumWidth(80)        # may shrink below its size hint: fits the right column
                 grid.addWidget(w, r, c + 1)
         self.uniform = QCheckBox("Uniform scale")
         self.uniform.setChecked(True)
@@ -74,8 +119,8 @@ class PropertiesPanel(QWidget):
         g = QGroupBox("Rotate")
         rl = QGridLayout(g)
         for c, a in enumerate(AXES):
-            b = QPushButton(f"{a} +45°")
-            b.clicked.connect(lambda _=False, i=c: self._rotate(i, 45))
+            b = QPushButton(f"{a} −45°")
+            b.clicked.connect(lambda _=False, i=c: self._rotate(i, -45))
             rl.addWidget(b, 0, c)
         self.angle = _spin(-360, 360, 1, "°", 5)
         self.axis = QComboBox()

@@ -7,7 +7,7 @@ A native Linux slicer and printer controller for ELEGOO Saturn 4 MSLA resin prin
 GooSlicer is an independent project. It is not affiliated with or endorsed by ELEGOO.
 
 ## Features
-- **Models:** STL, OBJ and 3MF import; mesh checks and one-click repair; move, rotate (45° steps or any angle), scale, lay flat, auto-arrange; undo/redo.
+- **Models:** STL, OBJ and 3MF import; mesh checks and one-click repair; move, rotate (−45° steps or any angle), scale, lay flat, auto-arrange; undo/redo.
 - **Hollowing:** inside, outside, centre and open-bottom shells; drain holes placed by clicking; a trapped-resin check before slicing.
 - **Supports:** automatic EVO-style supports (tips, pillars, bracing, raft with holes) and tree supports, using SatelLite's template parameters; manual add/remove; an unsupported-island check before slicing.
 - **Slicing:** native-resolution rasterising (non-square pixels on the 16K), parallel across all cores, `.goo` output checked against SatelLite's (a 10 mm cube is byte-identical; curved models differ by a few edge pixels per layer), plus print time, volume and cost estimates.
@@ -15,6 +15,8 @@ GooSlicer is an independent project. It is not affiliated with or endorsed by EL
 
 ## Printer profiles
 GooSlicer reads printer, resin and support profiles from **your own SatelLite installation** (`officialPlatform.ini`, resin `.data` files, `.satsup` templates). It does not ship them. On first start, use File → Locate SatelLite profiles… if they are not found in the default Wine location (`~/.wine`).
+
+Resin profiles exported from SatelLite (`.satres`) can be added with File → Import resin profile… or by dropping the file on the window. They are copied to GooSlicer's data folder and listed under the printer they were made for. Resin → Manage resins… shows every profile's values and lets you copy (and then edit), hide, delete or export them as `.satres`.
 
 ## Install (Flatpak)
 ```sh

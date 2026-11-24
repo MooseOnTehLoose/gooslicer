@@ -138,6 +138,8 @@ class SliceResult:
     weight: float
     price: float
     header: goo.Header = field(repr=False)
+    goo: "goo.GooFile | None" = field(default=None, repr=False)   # the slice itself, when built in memory
+    layer_height: float = 0.0
 
 
 @dataclass
@@ -282,7 +284,22 @@ class SliceJob:
         layers = (goo.Layer(goo.default_layer_def(header, i, tmpl), data)
                   for i, data in enumerate(self.iter_rle(**kw)))
         n = goo.write(path, header, layers)
-        return SliceResult(path, n, header.print_time, vol, header.weight, header.price, header)
+        return SliceResult(path, n, header.print_time, vol, header.weight, header.price, header,
+                           layer_height=self.settings.layer_height)
+
+    def build(self, **kw) -> SliceResult:
+        """Slice into memory: the result carries the complete .goo (`result.goo`), ready to save
+        or send without slicing again."""
+        if self.layer_count == 0:
+            raise ValueError("nothing to slice")
+        vol = self.volume()
+        header = self.build_header(vol)
+        tmpl = self.layer_template()
+        layers = [goo.Layer(goo.default_layer_def(header, i, tmpl), data)
+                  for i, data in enumerate(self.iter_rle(**kw))]
+        header.layer_count = len(layers)
+        return SliceResult("", len(layers), header.print_time, vol, header.weight, header.price, header,
+                           goo=goo.GooFile(header, layers), layer_height=self.settings.layer_height)
 
 
 def estimate_print_time(s: PrintSettings, layers: int) -> int:
