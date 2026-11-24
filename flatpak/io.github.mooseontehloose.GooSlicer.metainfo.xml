@@ -19,7 +19,9 @@
   <developer id="io.github.mooseontehloose">
     <name>mooseontehloose</name>
   </developer>
-  <url type="homepage">https://github.com/mooseontehloose</url>
+  <url type="homepage">https://github.com/MooseOnTehLoose/gooslicer</url>
+  <url type="bugtracker">https://github.com/MooseOnTehLoose/gooslicer/issues</url>
+  <url type="vcs-browser">https://github.com/MooseOnTehLoose/gooslicer</url>
   <launchable type="desktop-id">io.github.mooseontehloose.GooSlicer.desktop</launchable>
   <provides>
     <binary>gooslicer</binary>
