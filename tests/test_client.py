@@ -142,3 +142,21 @@ def test_status_descriptions():
                                                                      "TotalTicks": 5000}})
     assert st.summary() == "Printing — status 42"      # unknown codes are shown, not guessed
     assert st.progress == 0.5 and st.remaining_s == 4.0
+
+
+def test_video_stream_on_and_off(sim, session):
+    assert session.has_camera() is True
+    v = session.start_video()
+    assert v.url == "rtsp://127.0.0.1:554/video" and v.ack == 0 and v.note == ""
+    session.stop_video()
+    assert wait(lambda: sim.video_on == [1, 0])
+    # viewer limit reached: the 16K still serves its default URL, so it is passed back, not raised
+    sim.video_ack = 1
+    v = session.start_video()
+    assert v.ack == 1 and "limit" in v.note and v.url == C.default_video_url("127.0.0.1")
+    sim.camera = False
+    with pytest.raises(C.SessionError, match="no camera"):
+        session.start_video()
+    session.request(1)
+    assert wait(lambda: session.state.attributes.get("CameraStatus") == 0)
+    assert session.has_camera() is False

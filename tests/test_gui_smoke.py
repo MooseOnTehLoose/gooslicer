@@ -1674,3 +1674,161 @@ def test_drain_hole_links_load(app, tmp_path):
     f.changed.connect(lambda: seen.append(1))
     f.r2.setValue(4.0)
     assert f.r1.value() == 4.0 and len(seen) == 1                     # one change for the pair
+
+
+def _h264_clip(path, frames=60):
+    """A short H.264 clip like the printer's (yuv420p), to stand in for its RTSP stream."""
+    import av
+    import numpy as np
+    with av.open(str(path), "w") as out:
+        st = out.add_stream("libx264", rate=30)
+        st.width, st.height, st.pix_fmt = 320, 180, "yuv420p"
+        st.options = {"g": "10"}
+        for i in range(frames):
+            img = np.zeros((180, 320, 3), np.uint8)
+            img[:, : (i * 5) % 320] = (200, 40, 40)
+            for pkt in st.encode(av.VideoFrame.from_ndarray(img, format="rgb24")):
+                out.mux(pkt)
+        for pkt in st.encode():
+            out.mux(pkt)
+    return path
+
+
+def test_camera_panel(app, tmp_path, monkeypatch):
+    pytest.importorskip("av")
+    from sim_printer import SimPrinter
+    from gooslicer_qt import camera as cam
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    sim = SimPrinter()
+    sim.video_url = _h264_clip(tmp_path / "cam.mp4", 900).as_uri()      # 30 s: plays throughout
+    try:
+        from gooslicer_qt.main import MainWindow
+        s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+        w = MainWindow(settings=s, lan_ports={"discovery": sim.udp_port, "ws": sim.ws_port,
+                                              "http": sim.http_port, "targets": ["127.0.0.1"]})
+        w.show()
+        c = w.camera
+        # below Advanced settings, in the Printer settings tab, folded and off
+        ps = w.print_settings
+        assert ps.isAncestorOf(c) and c.mapTo(ps, c.rect().topLeft()).y() > ps.advanced_btn.geometry().bottom()
+        assert not c.is_open() and not c.body.isVisible()
+        c.set_open(True)                                                 # not connected: nothing to show
+        assert not c.wanted and not c.button.isEnabled() and "Connect to a printer" in c.status.text()
+        c.set_open(False)
+
+        w.lan.find_printers()
+        assert _wait(app, lambda: w.lan.combo.count() == 1)
+        w.lan.connect_printer()
+        assert _wait(app, lambda: w.lan.session and w.lan.session.connected and c.button.isEnabled(), 15)
+        c.set_open(True)                                                 # opening starts the feed
+        assert _wait(app, lambda: c.view.image is not None, 30), (c.view.message, c.status.text(), c.isVisible(), c.stream)
+        assert sim.video_on == [1] and c.playing() and c.status.text().startswith("Live")
+        assert c.button.text() == "Stop camera"
+        img = c.view.image
+        assert 0 < img.width() <= c.view.device_size().width() + 2
+
+        # another tab in front: decoding pauses, the printer's stream stays on; back: resumes
+        w.docks["Models"].raise_()
+        assert _wait(app, lambda: not c.playing(), 5) and c.wanted and sim.video_on == [1]
+        w.docks["Printer settings"].raise_()
+        assert _wait(app, lambda: c.playing() and c.reader.frames > 0, 30)
+
+        # pop out: the picture moves to its own window, which keeps playing behind other tabs
+        assert c.popout_btn.geometry().right() < c.button.geometry().left()   # left of Stop camera
+        c.popout_btn.click()
+        assert c.popped_out() and c.popout_btn.text() == "Pop in" and c.popout.isWindow()
+        assert c.view.message == "Shown in its own window" and c.view.image is None
+        assert _wait(app, lambda: c.window_view.image is not None, 30)
+        # the window opens at the stream's own resolution (the clip is 320 x 180)
+        assert _wait(app, lambda: c.window_view.size() == QtCore.QSize(320, 180), 5), c.window_view.size()
+        assert c.stream_size == QtCore.QSize(320, 180) and c.popout.size() == QtCore.QSize(320, 180)
+        assert _wait(app, lambda: c.window_view.image.size() == QtCore.QSize(320, 180), 5)   # full detail
+        w.docks["Models"].raise_()
+        n = c.reader.frames
+        assert _wait(app, lambda: c.playing() and c.reader.frames > n + 5, 10)
+        w.docks["Printer settings"].raise_()
+        c.popout.close()                                                 # closing brings it back
+        assert not c.popped_out() and c.popout_btn.text() == "Pop out" and c.wanted
+        assert _wait(app, lambda: c.view.image is not None and c.view.message == "", 10)
+        assert s.value("cameraWindowGeometry") is not None              # remembers where it was
+
+        c.button.click()                                                 # stop: stream switched off
+        assert _wait(app, lambda: sim.video_on == [1, 0], 5)
+        assert not c.playing() and not c.wanted and c.view.image is None and c.button.text() == "Start camera"
+
+        # a dead stream retries, then gives up and says why
+        monkeypatch.setattr(cam, "RETRY_DELAY_MS", 10)
+        monkeypatch.setattr(cam, "OPEN_TIMEOUT_S", 1.0)
+        sim.video_url = (tmp_path / "missing.mp4").as_uri()
+        c.button.click()
+        assert _wait(app, lambda: not c.wanted, 30)
+        assert "Camera feed error" in c.status.text() and sim.video_on[-1] == 0
+
+        # disconnecting stops it
+        sim.video_url = (tmp_path / "cam.mp4").as_uri()
+        c.button.click()
+        assert _wait(app, lambda: c.view.image is not None, 30)
+        w.lan.disconnect_printer()
+        assert not c.wanted and not c.playing() and not c.button.isEnabled()
+
+        # a printer without a camera
+        sim.camera = False
+        w.lan.connect_printer()
+        assert _wait(app, lambda: w.lan.session and w.lan.session.connected
+                     and w.lan.session.state.attributes, 15)
+        assert _wait(app, lambda: "no camera" in c.status.text(), 5) and not c.button.isEnabled()
+        w.close()
+    finally:
+        sim.close()
+
+
+def test_profiles_copied_so_satellite_can_go(app, tmp_path, monkeypatch):
+    import shutil
+
+    from test_profile_store import install
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from gooslicer_qt.main import MainWindow, data_dir, profile_root
+    from gooslicer import profile_store
+    sat = tmp_path / "wine" / "drive_c" / "Program Files" / "ELEGOO SatelLite"
+    ini = install(sat, ("Grey",), ("EVO_0-30mm", "Tree_Small"))
+    # set up as an older GooSlicer left it: a copy of the ini only, the rest read from the install
+    shutil.copyfile(ini, data_dir() / "officialPlatform.ini")
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    s.setValue("profileIni", str(data_dir() / "officialPlatform.ini"))
+    s.setValue("resinDir", str(sat / "resources" / "resin" / "material"))
+    s.setValue("scriptDir", str(sat / "resources" / "script" / "common"))
+
+    def check(w):
+        assert profile_store.is_inside(w._profile_ini, profile_root())
+        assert w.printer_panel.combo.count() > 0
+        assert [r.name for r in w.print_settings.resins] == ["Grey"]
+        assert profile_store.is_inside(w.resin_dir(), profile_root())
+        assert sorted(t.name for t in w.support_templates()) == ["EVO_0-30mm", "Tree_Small"]
+
+    w = MainWindow(settings=s)
+    check(w)
+    assert "SatelLite is no longer needed" in w.log.toPlainText()
+    assert s.value("resinDir") is None and s.value("scriptDir") is None and s.value("profileIni") is None
+    w.close()
+
+    shutil.rmtree(tmp_path / "wine")                                   # SatelLite uninstalled
+    w = MainWindow(settings=s)
+    check(w)
+    assert "No printer profiles found" not in w.log.toPlainText()
+    dlg = w.open_preferences("Printer")
+    # copied from where the older GooSlicer read it
+    assert "officialPlatform.ini (20" in dlg.profile_source.text() and dlg.resin_dir.text().startswith("1 profiles")
+    assert dlg.script_dir.text().startswith("3 templates")              # two plus the Jupiter 2 one
+    dlg.close()
+
+    # Replace… copies another folder of resins over the copy
+    more = tmp_path / "more"
+    from test_profile_store import resin
+    resin(more / "a.data", "Other")
+    assert w.set_resin_dir(str(more))
+    assert [r.name for r in w.print_settings.resins] == ["Other"]
+    w.close()

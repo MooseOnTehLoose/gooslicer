@@ -26,7 +26,7 @@ flatpak install --user dist/GooSlicer.flatpak    # pulls the KDE runtime from Fl
 |---|---|
 | `wayland`, `fallback-x11`, `ipc`, `dri` | window and OpenGL viewport |
 | `network` | printer discovery (UDP broadcast), WebSocket control, HTTP upload |
-| `~/.wine:ro` | SatelLite's printer, resin and support profiles, read in place from the default Wine install |
+| `~/.wine:ro` | SatelLite's printer, resin and support profiles in the default Wine install. They're copied into the app's data folder the first time, so this is only needed until then (and to refresh the copy) |
 
 Models and `.goo` files are opened and saved through the desktop's file portal, so no other home access is needed.
 

@@ -12,8 +12,9 @@
       slice to .goo, and send and monitor prints over the local network.
     </p>
     <p>
-      Printer, resin and support profiles are read from your own ELEGOO SatelLite
-      installation; GooSlicer does not ship them.
+      Printer, resin and support profiles are copied from your own ELEGOO SatelLite
+      installation the first time GooSlicer runs, so SatelLite need not stay installed;
+      GooSlicer does not ship them.
     </p>
   </description>
   <developer id="io.github.mooseontehloose">

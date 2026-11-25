@@ -55,6 +55,8 @@ class PrinterControlPanel(QWidget):
     log = Signal(str)
     uploadProgress = Signal(int, int)
     uploadFinished = Signal(str, bool, str)     # filename, ok, message
+    connectionStateChanged = Signal(bool)       # connected or not (also on disconnect by the user)
+    attributesUpdated = Signal()                # the printer's attributes arrived (camera, …)
 
     def __init__(self, settings, parent=None, ports: dict | None = None):
         super().__init__(parent)
@@ -319,6 +321,7 @@ class PrinterControlPanel(QWidget):
         self.progress.setFormat("%p%")
         self.files.clear()
         self._update_buttons()
+        self.connectionStateChanged.emit(False)
 
     @property
     def session(self) -> C.PrinterSession | None:
@@ -335,6 +338,7 @@ class PrinterControlPanel(QWidget):
         if ok:
             self.refresh_files()
         self._update_buttons()
+        self.connectionStateChanged.emit(bool(ok))
 
     def _attributes(self, st: C.PrinterState):
         a = st.attributes
@@ -342,6 +346,7 @@ class PrinterControlPanel(QWidget):
         if p and a.get("MachineName") and not p.machine_name:
             p.machine_name = a["MachineName"]
         self._update_buttons()
+        self.attributesUpdated.emit()
 
     def _status(self, st: C.PrinterState):
         pi = st.print_info

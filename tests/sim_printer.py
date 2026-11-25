@@ -33,6 +33,11 @@ class SimPrinter:
         self.files: dict[str, bytes] = {}
         self.partial: dict[str, dict] = {}
         self.commands: list[dict] = []
+        # camera (Cmd 386): the 16K replies {"Ack": 0, "VideoUrl": "rtsp://<ip>:554/video"}
+        self.camera = True
+        self.video_url: str | None = None        # None: the 16K's own URL for self.host
+        self.video_ack = 0
+        self.video_on: list[int] = []            # every Enable value received
         self.lock = threading.RLock()
         self.machine = [0]
         self.print = {"Status": 0, "CurrentLayer": 0, "TotalLayer": 0, "CurrentTicks": 0,
@@ -105,7 +110,8 @@ class SimPrinter:
                                "Resolution": self.resolution, "XYZsize": "218.88x128.88x220",
                                "MainboardIP": self.host, "MainboardID": self.mainboard,
                                "Capabilities": ["FILE_TRANSFER", "PRINT_CONTROL", "VIDEO_STREAM"],
-                               "SupportFileType": ["CTB", "GOO"], "RemainingMemory": 5_000_000_000},
+                               "SupportFileType": ["CTB", "GOO"], "RemainingMemory": 5_000_000_000,
+                               "CameraStatus": int(self.camera), "MaximumVideoStreamAllowed": 2},
                 "MainboardID": self.mainboard, "TimeStamp": int(time.time()),
                 "Topic": f"sdcp/attributes/{self.mainboard}"}
 
@@ -169,6 +175,13 @@ class SimPrinter:
         with self.lock:
             if cmd in (0, 1):
                 return {"Ack": 0}
+            if cmd == 386:
+                self.video_on.append(int(a.get("Enable", 0)))
+                if not self.camera:
+                    return {"Ack": 2}
+                if a.get("Enable") and not self.video_ack:
+                    return {"Ack": 0, "VideoUrl": self.video_url or f"rtsp://{self.host}:554/video"}
+                return {"Ack": self.video_ack}
             if cmd == 128:
                 if self.machine != [0]:
                     return {"Ack": 1}

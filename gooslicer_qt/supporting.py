@@ -52,7 +52,7 @@ def support_params(t) -> tuple[S.SupportParams, str]:
 
 
 class SupportDialog(QDialog):
-    """Pick a SatelLite template (read in place from the user's install) or the built-in values.
+    """Pick a SatelLite template (from GooSlicer's copy of the user's install) or the built-in values.
     The recommended template follows SatelLite's height rule (06 §1)."""
 
     def __init__(self, templates, max_height: float, has_selection: bool, parent=None):

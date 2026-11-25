@@ -12,7 +12,7 @@ Evidence bundles:
 
 Code: `gooslicer/qdatastream.py`, `gooslicer/support_defaults.py`. Tests: `tests/test_support_defaults.py`.
 
-SatelLite's template files are **read in place** from the user's install. GooSlicer does not copy or ship them. The values below are documented for interoperability.
+SatelLite's template files come from the user's own install: GooSlicer copies them once into its data folder on the user's machine (with the printer and resin profiles, `gooslicer/profile_store.py`) and reads that copy. It does not ship them. The values below are documented for interoperability.
 
 ## 1. Support templates (`resources/script/common/*.satsup`)
 

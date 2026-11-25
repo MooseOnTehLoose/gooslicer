@@ -2,6 +2,7 @@
 (and are remembered), the same as changing them where they live in the main window."""
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -201,29 +202,27 @@ class PreferencesDialog(QDialog):
         g = QGroupBox("SatelLite profiles")
         gf = QFormLayout(g)
         self.profile_path = _path_label()
-        locate = QPushButton("Locate…")
-        locate.setToolTip("Pick your SatelLite install's officialPlatform.ini (also File → Locate "
-                          "SatelLite profiles…)")
+        locate = QPushButton("Copy again…")
+        locate.setToolTip("Pick a SatelLite install's officialPlatform.ini to copy its printer and resin "
+                          "profiles and support templates again, e.g. after updating SatelLite (also "
+                          "File → Locate SatelLite profiles…)")
         locate.clicked.connect(lambda: (win.locate_profiles(), self._refresh_printer()))
         gf.addRow("Printer profiles", self._row(self.profile_path, locate))
+        self.profile_source = _path_label()
+        gf.addRow("Copied from", self.profile_source)
         self.resin_dir = _path_label()
-        gf.addRow("Resin profiles folder", self._folder_row(
-            self.resin_dir, "Resin profiles folder (SatelLite's resin .data files)",
-            lambda: win.resin_dir(), win.set_resin_dir))
+        gf.addRow("Resin profiles", self._folder_row(
+            self.resin_dir, "Copy resin profiles (.data files) from", lambda: win.resin_dir(), win.set_resin_dir))
         self.script_dir = _path_label()
-        gf.addRow("Support templates folder", self._folder_row(
-            self.script_dir, "Support templates folder (SatelLite's .satsup files)",
-            lambda: win.template_dir(), win.set_template_dir))
-        gf.addRow(_note("Profiles are read from your own SatelLite install. The folders are found next "
-                        "to the printer profiles unless you choose them here (Automatic goes back "
-                        "to that)."))
+        gf.addRow("Support templates", self._folder_row(
+            self.script_dir, "Copy support templates (.satsup files) from", lambda: win.template_dir(),
+            win.set_template_dir))
+        gf.addRow(_note("GooSlicer keeps its own copy of your SatelLite profiles, made the first time "
+                        "they were found, so SatelLite doesn't need to stay installed. Replace… copies "
+                        "a different folder of resin profiles or support templates over the copy."))
         lay.addWidget(g)
         self._refresh_printer()
-
-        def reset():
-            win.set_resin_dir("")
-            win.set_template_dir("")
-        return _Page("Printer", w, reset=reset, refresh=self._refresh_printer)
+        return _Page("Printer", w, refresh=self._refresh_printer)
 
     def _refresh_printer(self) -> None:
         win = self.win
@@ -231,11 +230,17 @@ class PreferencesDialog(QDialog):
         self.printer.setCurrentIndex(win.printer_panel.combo.currentIndex())
         self.printer.blockSignals(False)
         ini = getattr(win, "_profile_ini", None)
+        info = win.profile_info()
         self.profile_path.setText(str(ini) if ini else "Not found")
-        for lab, d, key in ((self.resin_dir, win.resin_dir(), "resinDir"),
-                            (self.script_dir, win.template_dir(), "scriptDir")):
-            auto = "" if win.settings.value(key, "") else " (automatic)"
-            lab.setText(f"{d}{auto}" if d else "Not found")
+        if info is not None:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(info.copied)) if info.copied else "unknown date"
+            self.profile_source.setText(f"{info.source or 'unknown'} ({when})")
+        else:
+            self.profile_source.setText("Not copied: read in place" if ini else "—")
+        for lab, d, n, what in ((self.resin_dir, win.resin_dir(), info.resins if info else None, "profiles"),
+                                (self.script_dir, win.template_dir(), info.templates if info else None,
+                                 "templates")):
+            lab.setText((f"{n} {what} · {d}" if n is not None else str(d)) if d else "Not found")
 
     def _resin(self) -> _Page:
         win = self.win
@@ -425,23 +430,17 @@ class PreferencesDialog(QDialog):
         return w
 
     def _folder_row(self, label: QLabel, title: str, current, apply) -> QWidget:
-        """A path with Choose… and Automatic buttons; apply(path) sets it ("" for automatic)."""
-        choose = QPushButton("Choose…")
-        auto = QPushButton("Automatic")
+        """A path with a Replace… button: apply(folder) copies that folder's files over the copy."""
+        choose = QPushButton("Replace…")
+        choose.setToolTip(title + " another folder, replacing GooSlicer's copy")
 
         def pick():
-            start = current()
-            path = QFileDialog.getExistingDirectory(self, title, str(start or Path.home()))
+            path = QFileDialog.getExistingDirectory(self, title, str(Path.home()))
             if path:
                 apply(path)
                 self._refresh_current()
-
-        def clear():
-            apply("")
-            self._refresh_current()
         choose.clicked.connect(pick)
-        auto.clicked.connect(clear)
-        return self._row(label, choose, auto)
+        return self._row(label, choose)
 
     def _refresh_current(self) -> None:
         p = self.pages[self.stack.currentIndex()] if self.pages else None

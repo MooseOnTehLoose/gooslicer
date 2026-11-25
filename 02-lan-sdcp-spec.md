@@ -251,7 +251,16 @@ Printer: Saturn 4 Ultra 16K, firmware V1.5.6, ProtocolVersion V3.0.0. Raw captur
     - `TaskStatus`, `AlreadyPrintLayer`, `ErrorStatusReason`, `MD5`
     - `Thumbnail` (`http://<ip>:3030/media/mmcblk0p1/history_image/<TaskId>.bmp`)
     - `SliceInformation`, i.e. the parsed .goo header: speeds are in mm/ms (0.000833 = 50 mm/min), times in ms.
-- **Not yet exercised at runtime:** video (Cmd 386/387), start from a layer other than 0.
+- **Camera** (2026-11-24) [RUNTIME]:
+  - The 16K reports `Capabilities` with `VIDEO_STREAM`, `CameraStatus` 1, `MaximumVideoStreamAllowed` 2 and `NumberOfVideoStreamConnected`.
+  - Cmd 386 `{"Enable": 1}` answered `{"Ack": 0, "VideoUrl": "rtsp://192.168.1.144:554/video"}`: the URL comes with its scheme.
+  - The RTSP server identifies as `ireader/media-server`. It offers `DESCRIBE, SETUP, TEARDOWN, PLAY`, with a session timeout of 60 s.
+  - The stream is H.264 at 1280×720 and 30 fps, over RTP/UDP only. A SETUP asking for TCP interleaving gets a UDP transport back, so FFmpeg's `-rtsp_transport tcp` fails with "Nonmatching transport".
+  - The SDP has no `sprop-parameter-sets`, so decoding starts at the next keyframe: the first picture came about 4 s after connecting.
+  - The SDP declares a clock rate of `H264/9000` instead of 90000, so frame timestamps are unusable. Frames are shown as they're decoded.
+  - After a first session that enabled the stream and tried TCP twice, `NumberOfVideoStreamConnected` stayed at 2 of 2 for over 3 minutes. From then on, Cmd 386 answered `{"Ack": 1}` to both Enable 1 and Enable 0. The stream still played over UDP, so a client should try the URL anyway, falling back to `rtsp://<ip>:554/video`. What resets the count is **[UNKNOWN]**: the stream's 60 s timeout did not.
+  - Ack meanings for Cmd 386 [PUBLIC-SPEC]: 1 viewer limit reached, 2 no camera, 3 camera error.
+- **Not yet exercised at runtime:** timelapse (Cmd 387), start from a layer other than 0.
 
 ## 7. Client implementation (GooSlicer P3)
 - **`elegoo_lan/client.py`**:

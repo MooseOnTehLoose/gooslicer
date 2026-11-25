@@ -134,6 +134,9 @@ class PrintSettingsPanel(QWidget):
         lay = QFormLayout(self.advanced)
         lay.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.advanced)
+        self._bottom = QVBoxLayout()            # sections below Advanced settings (the camera)
+        self._bottom.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(self._bottom)
         outer.addStretch(1)
         for attr, label, kind, lo, hi, fmt in self.FIELDS:
             if kind is int:
@@ -164,6 +167,10 @@ class PrintSettingsPanel(QWidget):
         line.setFrameShadow(QFrame.Sunken)
         self.layout().insertWidget(0, line)
         self.layout().insertWidget(0, widget)
+
+    def add_bottom_widget(self, widget: QWidget) -> None:
+        """A section below Advanced settings."""
+        self._bottom.addWidget(widget)
 
     def insert_top_row(self, label: str, widget: QWidget) -> None:
         """A row above the resin profile (the main window puts the printer there)."""

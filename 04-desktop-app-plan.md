@@ -24,7 +24,7 @@ Name: **GooSlicer**.
 - lattice infill (`EleTriInfill`, `EleTriCreate`)
 - labels/emboss, the wash-score/NFC features, and V5.x `.goo` extensions
 
-**Clean-room rule for assets:** SatelLite's icons, images, translations and resources (`EleResources.dll`, `resources/`) are not copied into the app. The app may *read* `officialPlatform.ini` from the user's own SatelLite install as data. It does not redistribute that file.
+**Clean-room rule for assets:** SatelLite's icons, images, translations and resources (`EleResources.dll`, `resources/`) are not copied into the app. The app may *read* `officialPlatform.ini`, the resin `.data` files and the `.satsup` templates from the user's own SatelLite install as data. Since 2026-11-24 it copies them once into its own data folder on the user's machine, so SatelLite can be uninstalled afterwards (`gooslicer/profile_store.py`). It does not redistribute them.
 
 ## 2. What SatelLite has, and where it lives [OBSERVED by strings/imports]
 | Feature | SatelLite module(s) | Evidence | Our phase |
@@ -75,6 +75,7 @@ elegoo_lan/  elegoo_goo/       (existing; reused unchanged)
 | manifold3d 3.5.5 | robust booleans (drain holes, support union), plane slicing, `level_set` meshing |
 | shapely 2.2 | 2D polygon operations (island detection, support bases) |
 | PyOpenGL 3.1 | GL calls beyond Qt's wrappers |
+| PyAV (av) 19 | decoding the printer camera's H.264 stream (bundles FFmpeg) |
 | *optional* numba 0.68 | JIT for hot loops (point sampling, rasteriser fallback) |
 
 **OpenVDB has no wheel**, and SatelLite uses it. Hollowing will use a voxel SDF instead: an EDT on a narrow band at the chosen accuracy, meshed with `manifold3d` level-set or marching cubes. That matches SatelLite's own voxel approach (`HollowOctree`). If this proves too slow or memory-hungry for large models, a small C++ extension is the fallback (decision point in P5).

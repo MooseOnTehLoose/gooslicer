@@ -431,3 +431,34 @@ class PropertiesPanel(QWidget):
         p.rotation = np.eye(3)
         p.scale = np.ones(3)
         self.win.scene.drop_to_plate(p)
+
+
+class ToolWindow(QWidget):
+    """A panel in its own top-level window (View → Logs, View → Layers): it stays out of the
+    main window and remembers where it was."""
+    closed = Signal()                     # the user closed the window
+
+    def __init__(self, title: str, widget: QWidget, settings, key: str, parent):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle(f"{title} — GooSlicer")
+        self.setObjectName(f"window{title}")
+        self._settings, self._key = settings, f"{key}Geometry"
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(widget)
+        self.resize(900, 460)
+        if settings.value(self._key):
+            self.restoreGeometry(settings.value(self._key))
+
+    def popup(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, e):
+        self.closed.emit()
+        super().closeEvent(e)
+
+    def hideEvent(self, e):
+        self._settings.setValue(self._key, self.saveGeometry())
+        super().hideEvent(e)

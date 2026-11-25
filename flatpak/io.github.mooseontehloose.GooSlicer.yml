@@ -11,8 +11,8 @@ finish-args:
   - --socket=fallback-x11
   - --device=dri              # OpenGL viewport
   - --share=network           # printer discovery (UDP broadcast), WebSocket and HTTP upload
-  # SatelLite's printer, resin and support profiles are read in place from the user's own
-  # install (never shipped). This is the default Wine location; other locations:
+  # SatelLite's printer, resin and support profiles are copied once from the user's own install
+  # into the app's data folder (never shipped). This is the default Wine location; other locations:
   #   flatpak override --user --filesystem=/path/to/SatelLite:ro io.github.mooseontehloose.GooSlicer
   - --filesystem=~/.wine:ro
 build-options:

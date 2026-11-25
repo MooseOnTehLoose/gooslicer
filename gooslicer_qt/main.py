@@ -1,7 +1,6 @@
 """GooSlicer main window: scene, 3D viewport, panels, undo/redo, import and repair."""
 from __future__ import annotations
 
-import shutil
 import os
 import sys
 from types import SimpleNamespace
@@ -20,17 +19,18 @@ from gooslicer import __version__, mesh as meshmod, preview, profiles
 from gooslicer import hollow as hollowmod
 from gooslicer import settings as settingsmod
 from gooslicer import slicer as slicermod
-from gooslicer import support_defaults
+from gooslicer import profile_store, support_defaults
 from gooslicer import supports as supportmod
 from gooslicer.raster import RasterSpec
 from gooslicer.scene import Part, Scene, rotation_between
 
 from . import workers
 from .commands import AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, StateCommand
+from .camera import CameraPanel
 from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowDialog, drill_part_at, hole_axis_world,
                         hole_preview_mesh, hollow_part)
 from .jobpanel import JobPanel
-from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, show_popup
+from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, ToolWindow, show_popup
 from .printers import PrinterControlPanel
 from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
 from .supporting import SupportDialog, SupportManager, SupportsCommand, support_params
@@ -43,6 +43,11 @@ APP = "GooSlicer"
 # (2: Parts inside Properties; Print settings and Properties are tabs).
 LAYOUT_VERSION = 5          # 3: Log and Layers became own windows; 4: tabs renamed; 5: Flaws tab
 MODEL_FILTER = "3D models (*.stl *.STL *.obj *.OBJ *.3mf *.3MF);;All files (*)"
+
+
+def profile_root() -> Path:
+    """GooSlicer's copy of the user's SatelLite profiles (gooslicer/profile_store.py)."""
+    return data_dir() / "satellite"
 
 
 def data_dir() -> Path:
@@ -131,32 +136,6 @@ class _DropForwarder(QObject):
             h(e)
             return e.isAccepted()
         return False
-
-
-class ToolWindow(QWidget):
-    """A panel in its own top-level window (View → Logs, View → Layers): it stays out of the
-    main window and remembers where it was."""
-
-    def __init__(self, title: str, widget: QWidget, settings, key: str, parent):
-        super().__init__(parent, Qt.Window)
-        self.setWindowTitle(f"{title} — {APP}")
-        self.setObjectName(f"window{title}")
-        self._settings, self._key = settings, f"{key}Geometry"
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(widget)
-        self.resize(900, 460)
-        if settings.value(self._key):
-            self.restoreGeometry(settings.value(self._key))
-
-    def popup(self) -> None:
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def hideEvent(self, e):
-        self._settings.setValue(self._key, self.saveGeometry())
-        super().hideEvent(e)
 
 
 def _red(meshes, masks) -> list:
@@ -289,6 +268,9 @@ class MainWindow(QMainWindow):
         self.lan = PrinterControlPanel(self.settings, ports=lan_ports)
         self.lan.log.connect(self.log_msg)
         self.print_settings.insert_top_widget(self.lan)          # above the Printer dropdown
+        self.camera = CameraPanel(self.lan, self.settings)
+        self.camera.log.connect(self.log_msg)
+        self.print_settings.add_bottom_widget(self.camera)       # below Advanced settings
         self.settings_scroll = QScrollArea()                     # the tab is taller than the column
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setFrameShape(QFrame.NoFrame)
@@ -1011,9 +993,6 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------- supports
     def template_dir(self) -> Path | None:
-        saved = self.settings.value("scriptDir", "")
-        if saved and Path(saved).is_dir():
-            return Path(saved)
         ini = getattr(self, "_profile_ini", None)
         return support_defaults.script_dir_for(ini) if ini else None
 
@@ -1730,6 +1709,7 @@ class MainWindow(QMainWindow):
         if self._slice_thread:
             self._slice_thread.cancel()
             self._slice_thread.wait(10000)
+        self.camera.shutdown()
         self.lan.shutdown()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState(LAYOUT_VERSION))
@@ -1805,21 +1785,41 @@ class MainWindow(QMainWindow):
         self._preferences = dlg
         return dlg
 
-    def set_resin_dir(self, path: str) -> None:
-        """Where SatelLite's resin .data files are read from ("": next to the printer profiles)."""
-        if path:
-            self.settings.setValue("resinDir", str(path))
-        else:
-            self.settings.remove("resinDir")
-        self.refresh_resins()
+    def set_resin_dir(self, path: str) -> bool:
+        """Replace GooSlicer's copy of the resin .data files with those in another folder."""
+        return self._replace_stored("resin", path)
 
-    def set_template_dir(self, path: str) -> None:
-        """Where SatelLite's support templates are read from ("": next to the printer profiles)."""
-        if path:
-            self.settings.setValue("scriptDir", str(path))
+    def set_template_dir(self, path: str) -> bool:
+        """Replace GooSlicer's copy of the support templates with those in another folder."""
+        return self._replace_stored("templates", path)
+
+    def _replace_stored(self, kind: str, path: str) -> bool:
+        what = "resin profiles" if kind == "resin" else "support templates"
+        if not path:
+            return False
+        if self.profile_info() is None:
+            QMessageBox.information(self, APP, "Locate your SatelLite profiles first (File → Locate "
+                                               "SatelLite profiles…).")
+            return False
+        try:
+            st = profile_store.replace_folder(profile_root(), kind, path)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, APP, f"Could not copy the {what}:\n{e}")
+            return False
+        n = st.resins if kind == "resin" else st.templates
+        self.log_msg(f"Copied {n} {what} from {path}")
+        if kind == "resin":
+            self._resin_cache_key = None          # same folder, new files
+            self.refresh_resins()
         else:
-            self.settings.remove("scriptDir")
-        self.job_panel.refresh(reload=True)
+            self.job_panel.refresh(reload=True)
+        return True
+
+    def profile_info(self):
+        """Where GooSlicer's copy of the SatelLite profiles came from (None when reading in place)."""
+        ini = getattr(self, "_profile_ini", None)
+        root = profile_root()
+        return profile_store.info(root) if ini and profile_store.is_inside(ini, root) else None
 
     def manage_resins(self):
         from .resins import ResinManager
@@ -1895,15 +1895,21 @@ class MainWindow(QMainWindow):
         return str(self.settings.value("lastResin", "") or "")
 
     def resin_dir(self) -> Path | None:
-        saved = self.settings.value("resinDir", "")
-        if saved and Path(saved).is_dir():
-            return Path(saved)
         ini = getattr(self, "_profile_ini", None)
         return settingsmod.resin_dir_for(ini) if ini else None
 
     def load_profiles(self) -> bool:
-        saved = self.settings.value("profileIni", "") or None
-        ini = profiles.find_official_ini([x for x in (saved, data_dir() / "officialPlatform.ini") if x])
+        """Printer profiles from GooSlicer's own copy. The first time, they're found in a SatelLite
+        install (or where an older GooSlicer read them) and copied, with the resin profiles and
+        support templates, so SatelLite isn't needed afterwards. $GOOSLICER_PROFILE_INI is read in
+        place (development and tests)."""
+        env = os.environ.get("GOOSLICER_PROFILE_INI")
+        ini = Path(env) if env and Path(env).is_file() else profile_store.stored_ini(profile_root())
+        if ini is None:
+            saved = self.settings.value("profileIni", "") or None
+            src = profiles.find_official_ini([x for x in (saved, data_dir() / "officialPlatform.ini") if x])
+            if src:
+                ini = self._store_profiles(src)
         if not ini:
             self.log_msg("No printer profiles found. Use File → Locate SatelLite profiles… and "
                          "pick your SatelLite install folder or officialPlatform.ini.")
@@ -1921,26 +1927,53 @@ class MainWindow(QMainWindow):
         if path:
             self.import_profiles(path)
 
+    def _store_profiles(self, src, resin_src=None, script_src=None) -> Path:
+        """Copy SatelLite's profiles from src (an officialPlatform.ini) into GooSlicer's data folder
+        and return the copied ini; on failure, src itself (read in place). Resin profiles and
+        support templates come from the given folders, else those an older GooSlicer remembered,
+        else next to src, else the Wine install; none found keeps what the copy already has."""
+        src = Path(src)
+        install = profiles.find_official_ini()
+        found = []
+        for key, fn, cur in (("resinDir", settingsmod.resin_dir_for, resin_src),
+                             ("scriptDir", support_defaults.script_dir_for, script_src)):
+            if cur is None:
+                saved = self.settings.value(key, "")
+                cur = (Path(saved) if saved and Path(saved).is_dir() else
+                       fn(src) or (fn(install) if install else None))
+            found.append(cur)
+        try:
+            st = profile_store.copy_profiles(src, profile_root(), resin_src=found[0], script_src=found[1])
+        except OSError as e:
+            self.log_msg(f"Could not copy the SatelLite profiles ({e}); reading them from {src}")
+            return src
+        for key in ("profileIni", "resinDir", "scriptDir"):       # superseded by the copy
+            self.settings.remove(key)
+        self._resin_cache_key = None                              # same folder, new files
+        self.log_msg(f"Copied SatelLite's printer profiles, {st.resins} resin profiles and {st.templates} "
+                     f"support templates from {src} into {st.root}. SatelLite is no longer needed.")
+        return st.ini
+
     def import_profiles(self, path: str) -> bool:
+        """Copy (or refresh the copy of) the profiles from a SatelLite officialPlatform.ini."""
         if not profiles.load_profiles(path):
             QMessageBox.warning(self, APP, "That file contains no Saturn 4 printer profiles.")
             return False
-        resins = settingsmod.resin_dir_for(path)   # stays in the user's install; not copied
-        if resins:
-            self.settings.setValue("resinDir", str(resins))
-        scripts = support_defaults.script_dir_for(path)   # support templates, also read in place
-        if scripts:
-            self.settings.setValue("scriptDir", str(scripts))
-        if os.environ.get("FLATPAK_ID") and not (resins and scripts):
+        resins = settingsmod.resin_dir_for(path)
+        scripts = support_defaults.script_dir_for(path)
+        had = profile_store.info(profile_root())
+        if os.environ.get("FLATPAK_ID") and not (resins and scripts) and not (had and had.resins and had.templates):
             # the file portal exposes only the picked file, not the install folder around it
             self.log_msg("Resin profiles or support templates were not found next to this file. In the "
                          "Flatpak, give GooSlicer read access to your SatelLite folder, then locate the "
                          "profiles again:\n  flatpak override --user --filesystem=\"/path/to/SatelLite:ro\" "
                          f"{os.environ['FLATPAK_ID']}")
-        dest = data_dir() / "officialPlatform.ini"  # local copy of the user's own file
-        if Path(path).resolve() != dest.resolve():
-            shutil.copyfile(path, dest)
-        self.settings.setValue("profileIni", str(dest))
+        stored = self._store_profiles(path, resins, scripts)
+        if not profile_store.is_inside(stored, profile_root()):     # couldn't copy: read in place
+            ps = profiles.load_profiles(stored)
+            self._profile_ini = Path(stored)
+            self.printer_panel.set_profiles(ps, self.settings.value("printer"))
+            return bool(ps)
         return self.load_profiles()
 
 

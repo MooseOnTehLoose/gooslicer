@@ -21,6 +21,7 @@ dependencies = [
   "PyOpenGL>=3.1",
   "pillow>=10",
   "lxml>=5",
+  "av>=14",                # printer camera (H.264 over RTSP)
 ]
 
 [project.optional-dependencies]

@@ -29,6 +29,28 @@ PRINT_STATUS = {0: "Idle", 1: "Homing", 2: "Dropping", 3: "Exposing", 4: "Liftin
 ACK = {0: "OK", 1: "Printer busy", 2: "File not found", 3: "MD5 check failed",
        4: "File read error", 5: "Resolution mismatch", 6: "Unknown file format",
        7: "Machine model mismatch"}                                             # [PUBLIC-SPEC]
+# Cmd 386 (video stream on/off) acks [PUBLIC-SPEC]. Seen on the 16K [RUNTIME]: Ack 1 while the
+# printer counted 2 of 2 viewers, and the stream still played (02-lan-sdcp-spec.md §6).
+VIDEO_ACK = {0: "OK", 1: "The printer's camera viewer limit is reached", 2: "The printer has no camera",
+             3: "Camera error"}
+RTSP_PORT = 554
+
+
+def default_video_url(host: str) -> str:
+    """Where the 16K serves its camera when it doesn't say [RUNTIME: its VideoUrl reply]."""
+    return f"rtsp://{host}:{RTSP_PORT}/video"
+
+
+@dataclass
+class VideoStream:
+    url: str
+    ack: int = 0            # the printer's answer to switching the stream on (VIDEO_ACK)
+
+    @property
+    def note(self) -> str:
+        return "" if not self.ack else describe(self.ack, VIDEO_ACK)
+
+
 PRINT_ERROR = {0: "", 1: "File MD5 check failed", 2: "File read failed",
                3: "Resolution mismatch", 4: "Format mismatch", 5: "Machine model mismatch"}
 
@@ -253,6 +275,40 @@ class PrinterSession:
 
     def refresh(self) -> None:
         self._send(Cmd.STATUS)
+
+    def has_camera(self) -> bool | None:
+        """From the attributes: True/False, or None before they arrive."""
+        a = self.state.attributes
+        if not a:
+            return None
+        caps = a.get("Capabilities")
+        if isinstance(caps, list) and "VIDEO_STREAM" not in caps:
+            return False
+        return a.get("CameraStatus", 1) != 0
+
+    def start_video(self, timeout: float = 10.0) -> VideoStream:
+        """Switch the camera stream on (Cmd 386) and return its URL (RTSP, H.264 over UDP on the
+        16K). A full viewer count (Ack 1) is passed back rather than raised: the 16K kept
+        serving the stream regardless [RUNTIME]. No camera (Ack 2) raises SessionError."""
+        try:
+            data = self._send(Cmd.VIDEO_STREAM, {"Enable": 1}).result(timeout)
+        except TimeoutError as e:
+            raise SessionError("no response to the camera request") from e
+        ack = int(data.get("Ack", 0) or 0)
+        if ack == 2:
+            raise SessionError(describe(ack, VIDEO_ACK))
+        url = str(data.get("VideoUrl") or "") or default_video_url(self.host)
+        if "://" not in url:
+            url = "rtsp://" + url
+        return VideoStream(url, ack)
+
+    def stop_video(self) -> None:
+        """Switch the camera stream off; best effort (never raises)."""
+        try:
+            if self._ws is not None:
+                self._send(Cmd.VIDEO_STREAM, {"Enable": 0})
+        except Exception:  # noqa: BLE001
+            pass
 
     def pause(self) -> dict:
         return self.request(Cmd.PAUSE)

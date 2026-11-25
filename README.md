@@ -12,10 +12,10 @@ GooSlicer is an independent project. It is not affiliated with or endorsed by EL
 - **Supports:** automatic EVO-style supports (tips, pillars, bracing, raft with holes) and tree supports, using SatelLite's template parameters; manual add/remove; an unsupported-island check (islands shown in red) before slicing. Every island and sealed cavity found is numbered and listed in the Flaws tab, where a false positive can be dismissed.
 - **Slicing:** native-resolution rasterising (non-square pixels on the 16K), parallel across all cores, `.goo` output checked against SatelLite's (a 10 mm cube is byte-identical; curved models differ by a few edge pixels per layer), plus print time, volume and cost estimates. Slices are held in memory to export or send to the printer. Experimental GPU slicing (OpenGL) is several times faster.
 - **Preferences:** Edit → Preferences… (Ctrl+,) lists every option by category: appearance, printer and profile folders, resin, slicing, hollowing, drain holes, supports, saved network printers, file folders and windows. It's searchable, and changes apply straight away.
-- **Printer control:** discovery, live status, upload, start/pause/stop and file management over SDCP V3 (WebSocket and HTTP).
+- **Printer control:** discovery, live status, upload, start/pause/stop and file management over SDCP V3 (WebSocket and HTTP), and the printer's camera live in the Printer settings tab (Camera, below Advanced settings), which can pop out into its own window at the camera's full resolution.
 
 ## Printer profiles
-GooSlicer reads printer, resin and support profiles from **your own SatelLite installation** (`officialPlatform.ini`, resin `.data` files, `.satsup` templates). It does not ship them. On first start, use File → Locate SatelLite profiles… if they are not found in the default Wine location (`~/.wine`).
+GooSlicer uses the printer, resin and support profiles from **your own SatelLite installation** (`officialPlatform.ini`, resin `.data` files, `.satsup` templates). It does not ship them. The first time it finds them (in the default Wine location, `~/.wine`, or wherever you point File → Locate SatelLite profiles…), it copies them into its own data folder (`~/.local/share/GooSlicer/satellite`, or `~/.var/app/io.github.mooseontehloose.GooSlicer/data/GooSlicer/satellite` in the Flatpak) and reads only that copy from then on, so SatelLite can be uninstalled. Locating the profiles again refreshes the copy, e.g. after a SatelLite update. Edit → Preferences → Printer shows where the copy came from.
 
 Resin profiles exported from SatelLite (`.satres`) can be added with File → Import resin profile… or by dropping the file on the window. They are copied to GooSlicer's data folder and listed under the printer they were made for. Resin → Manage resins… shows every profile's values and lets you copy (and then edit), hide, delete or export them as `.satres`.
 
@@ -69,4 +69,4 @@ The file format, network protocol and SatelLite defaults were documented by inte
 The specs cite evidence bundles (`evidence/`) and captures (`captures/`) that are kept out of this repository.
 
 ## License
-[MIT](LICENSE). Printer, resin and support profiles stay ELEGOO's and are read from your own SatelLite install. The exception is a small test fixture in `tests/test_profiles.py`: one printer's dimensions and settings.
+[MIT](LICENSE). Printer, resin and support profiles stay ELEGOO's: GooSlicer copies them from your own SatelLite install onto your machine only, and never redistributes them. The exception is a small test fixture in `tests/test_profiles.py`: one printer's dimensions and settings.

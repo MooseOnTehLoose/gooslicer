@@ -1,7 +1,8 @@
 """SatelLite support templates (*.satsup), template auto-selection, hollow and drain-hole defaults.
 
-Spec: 06-support-hollow-defaults-spec.md. Templates are read in place from the user's own SatelLite
-install (`resources/script/common/`); GooSlicer never copies or ships them.
+Spec: 06-support-hollow-defaults-spec.md. Templates come from the user's own SatelLite install
+(`resources/script/common/`), copied once into GooSlicer's data folder (gooslicer/profile_store.py);
+GooSlicer never ships them.
 """
 from __future__ import annotations
 
