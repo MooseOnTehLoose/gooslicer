@@ -1,5 +1,6 @@
 """Interactive viewport tests (real GL). Run via scripts/test-gui.sh."""
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -555,7 +556,8 @@ def test_auto_position(app, win, tmp_path):
     lay = pp.layout()
     row = next(i for i in range(lay.count())
                if lay.itemAt(i).layout() is not None and lay.itemAt(i).layout().indexOf(pp.btn_flat) >= 0)
-    assert lay.indexOf(pp.btn_auto) == row + 1
+    nxt = lay.itemAt(row + 1).layout()                 # the row after holds Auto Position
+    assert nxt is not None and nxt.indexOf(pp.btn_auto) == 0
     win.select([])
     assert not pp.btn_auto.isEnabled()
     win.select([p.id])
@@ -696,3 +698,35 @@ def test_support_mode_click_and_drag(app, win, tmp_path):
     mouse(vp, QEvent.MouseButtonRelease, a, mods=Qt.ControlModifier)
     assert clicks == [False, True] and len(drags) == 1
     vp.stop_support_mode()
+
+
+def test_arrange_all_button(app, win, tmp_path):
+    """Arrange All sits to the right of Auto Position and arranges every part, selected or not,
+    as Edit → Arrange all does; one undo step."""
+    files = [box_file(tmp_path, (60, 40, 10), f"b{i}.stl") for i in range(3)]
+    win.import_files([str(f) for f in files])
+    end = time.time() + 60
+    while len(win.scene.parts) < 3 and time.time() < end:
+        app.processEvents()
+    parts = win.scene.parts
+    assert len(parts) == 3
+    for p in parts:                                  # all piled on the centre
+        p.position[:2] = 0.0
+    win.scene_changed()
+    before = {p.id: p.position.copy() for p in parts}
+    win.select([])
+    props = win.props
+    assert props.btn_arrange.isEnabled() and props.btn_arrange.text() == "Arrange All"
+    lay = props.btn_auto.parentWidget().layout()
+    row = next(lay.itemAt(i).layout() for i in range(lay.count())
+               if lay.itemAt(i).layout() is not None and lay.itemAt(i).layout().indexOf(props.btn_auto) >= 0)
+    assert row.indexOf(props.btn_arrange) == row.indexOf(props.btn_auto) + 1      # to its right
+    props.btn_arrange.click()
+    b = [p.bounds() for p in parts]
+    for i in range(3):
+        assert win.scene.in_volume(parts[i])
+        for j in range(i + 1, 3):
+            assert np.maximum(b[j][0][:2] - b[i][1][:2], b[i][0][:2] - b[j][1][:2]).max() > 0
+    assert win.undo.undoText() == "Arrange"
+    win.undo.undo()
+    assert all(np.allclose(p.position, before[p.id]) for p in parts)

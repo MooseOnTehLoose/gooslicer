@@ -319,7 +319,12 @@ class PropertiesPanel(QWidget):
         self.btn_auto = QPushButton("Auto Position")
         self.btn_auto.setToolTip("Turn the selected part to the angle that needs the fewest supports "
                                  "(and has no large flat areas facing the plate)")
-        lay.addWidget(self.btn_auto)
+        self.btn_arrange = QPushButton("Arrange All")
+        self.btn_arrange.setToolTip("Lay out all parts side by side on the plate (Edit → Arrange all, A)")
+        auto_row = QHBoxLayout()
+        auto_row.addWidget(self.btn_auto)
+        auto_row.addWidget(self.btn_arrange)
+        lay.addLayout(auto_row)
 
         g = QGroupBox("Mesh")
         ml = QFormLayout(g)
@@ -344,6 +349,7 @@ class PropertiesPanel(QWidget):
         self.btn_reset.clicked.connect(lambda: self._edit("Reset transform", self._reset))
         self.btn_repair.clicked.connect(win.repair_selected)
         self.btn_auto.clicked.connect(win.auto_position)
+        self.btn_arrange.clicked.connect(win.arrange_all)
         self.set_part(None, None)
 
     def set_transform_visible(self, on: bool) -> None:
@@ -361,6 +367,7 @@ class PropertiesPanel(QWidget):
                 w.setEnabled(enabled)
         if getattr(self.win, "_orienting", False):
             self.btn_auto.setEnabled(False)             # one Auto Position at a time
+        self.btn_arrange.setEnabled(bool(self.win.scene.parts))    # works on all parts, selected or not
         if not enabled:
             self.title.setText("No part selected")
             self.mesh_info.setText("–")
