@@ -67,13 +67,15 @@ class PartState:
     position: np.ndarray
     rotation: np.ndarray
     scale: np.ndarray
+    elevation: float = 0.0          # Part.elevation: a bare part lifted off the plate keeps its lift
 
     def copy(self) -> "PartState":
-        return PartState(self.position.copy(), self.rotation.copy(), self.scale.copy())
+        return PartState(self.position.copy(), self.rotation.copy(), self.scale.copy(), self.elevation)
 
     def __eq__(self, o) -> bool:
         return (isinstance(o, PartState) and np.allclose(self.position, o.position)
-                and np.allclose(self.rotation, o.rotation) and np.allclose(self.scale, o.scale))
+                and np.allclose(self.rotation, o.rotation) and np.allclose(self.scale, o.scale)
+                and abs(self.elevation - o.elevation) < 1e-9)
 
 
 @dataclass(eq=False)
@@ -84,7 +86,8 @@ class Part:
     rotation: np.ndarray = field(default_factory=lambda: np.eye(3))
     scale: np.ndarray = field(default_factory=lambda: np.ones(3))
     id: int = field(default_factory=lambda: next(_ids))
-    elevation: float = 0.0                   # height of the part's bottom above the plate (supports lift)
+    elevation: float = 0.0                   # height of the part's bottom above the plate: the supports'
+                                             # lift, or a bare part raised with the Z arrow
     supports: object = None                  # gooslicer.supports.SupportPlan | None
     _cache: tuple | None = field(default=None, repr=False)
     _bcache: tuple | None = field(default=None, repr=False)
@@ -104,10 +107,11 @@ class Part:
         return M
 
     def state(self) -> PartState:
-        return PartState(self.position.copy(), self.rotation.copy(), self.scale.copy())
+        return PartState(self.position.copy(), self.rotation.copy(), self.scale.copy(), float(self.elevation))
 
     def set_state(self, s: PartState) -> None:
         self.position, self.rotation, self.scale = s.position.copy(), s.rotation.copy(), s.scale.copy()
+        self.elevation = float(s.elevation)
 
     def set_mesh(self, mesh: trimesh.Trimesh) -> None:
         """Replace geometry keeping the world placement of the bounding-box centre."""

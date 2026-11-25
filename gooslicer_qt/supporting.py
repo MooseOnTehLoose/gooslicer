@@ -111,8 +111,9 @@ class SupportsCommand(QUndoCommand):
         p = self.win.scene.get(self.pid)
         if p is None:
             return
-        p.supports, p.elevation, st = snap
+        p.supports, elevation, st = snap
         p.set_state(st)
+        p.elevation = elevation
         self.win.scene_changed()
 
     def redo(self):

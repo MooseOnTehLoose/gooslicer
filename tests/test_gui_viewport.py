@@ -670,6 +670,64 @@ def test_drain_hole_panel_and_preview(app, win, tmp_path):
     win.viewport.stop_hole_mode()
 
 
+def test_drain_hole_keeps_its_pin(app, win, tmp_path):
+    """07 §3: "Keep hole pin" adds the plug as a new part, in the same undo step as the hole;
+    the hole goes through the wall to the next surface."""
+    wait_import(app, win, [box_file(tmp_path, size=(30, 30, 20), name="block.stl")])
+    p = win.scene.parts[0]
+    vp = win.viewport
+    vp.reset_view()
+    win.drain_hole_mode()
+    f = win.hole_panel.fields
+    f.more_btn.setChecked(True)
+    assert f.more.isVisible() and not f.clearance.isEnabled()
+    f.keep.setChecked(True)
+    assert f.clearance.isEnabled()
+    f.clearance.setValue(0.2)
+    f.direction.setCurrentIndex(f.direction.findData("normal"))
+    top = np.array([p.position[0], p.position[1], p.bounds()[1][2]])
+    pos = project(vp, top)
+    mouse(vp, QEvent.MouseMove, pos, Qt.NoButton, Qt.NoButton)
+    app.processEvents()
+    assert np.isclose(np.ptp(vp.hole_preview.bounds[:, 2]), 20 + 2 + 2, atol=0.01)   # through the block
+    n0, count = win.undo.index(), len(win.scene.parts)
+    mouse(vp, QEvent.MouseButtonPress, pos)
+    mouse(vp, QEvent.MouseButtonRelease, pos, Qt.LeftButton, Qt.NoButton)
+    loop = QEventLoop()
+    quit_loop = lambda *_: loop.quit()
+    win.undo.indexChanged.connect(quit_loop)
+    QTimer.singleShot(30000, loop.quit)
+    loop.exec()
+    win.undo.indexChanged.disconnect(quit_loop)
+    assert win.undo.index() == n0 + 1 and win.undo.undoText() == "Drain hole"
+    assert len(win.scene.parts) == count + 1
+    pin = win.scene.parts[-1]
+    assert pin.name == "block pin" and abs(pin.bounds()[0][2]) < 1e-6           # on the plate
+    assert np.isclose(pin.mesh.extents[2], 20.0) and np.isclose(pin.mesh.extents[0], 3.6, atol=0.01)
+    win.undo.undo()
+    assert len(win.scene.parts) == count
+    win.viewport.stop_hole_mode()
+
+
+def test_drain_hole_fields_round_trip(app, tmp_path):
+    from PySide6.QtCore import QSettings
+    from gooslicer.support_defaults import DrainHoleSettings
+    from gooslicer_qt.hollowing import DrainHoleFields
+    qs = QSettings(str(tmp_path / "s.ini"), QSettings.IniFormat)
+    f = DrainHoleFields(qs)
+    assert f.value() == (DrainHoleSettings(), "normal")                       # SatelLite's defaults
+    s = DrainHoleSettings(hole_form="slot", depth=3.5, edges=12, use_angle_slot=True, angle_slot=8,
+                          use_notch=True, notch_width=0.8, notch_height=0.6, notch_angle=45,
+                          keep_subtracted=True, use_clearance=True, clearance=0.15, clearance_type=3,
+                          direction_id=1, direction=(0.0, 1.0, 0.0))
+    f.set_value(s, "custom")
+    assert all(w.isEnabled() for w in f.dir_xyz) and f.depth.isEnabled() and not f.e2.isEnabled()
+    assert not f.use_angle.isEnabled()                                         # slots don't taper by angle
+    f.save()
+    g = DrainHoleFields(qs)
+    assert g.value() == (s, "custom")
+
+
 def test_support_mode_click_and_drag(app, win, tmp_path):
     """Support mode: a press becomes a click on release, or a drag that shows where the
     contact will go; Ctrl+press removes at once (08 §6)."""

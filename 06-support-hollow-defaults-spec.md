@@ -94,8 +94,8 @@ SatelLite's template files come from the user's own install: GooSlicer copies th
 |---|---|---|
 | `/Hollowing/thickness` | 1 (mm) | "Wall thickness" |
 | `/Hollowing/accuracy` | 1 (mm) | "Accuracy" |
-| `/Hollowing/Type` | 0 | "Hollow type": 0 Inside, 1 Outside, 2 Center, 3 Open Bottom |
-| `/Hollowing/surfaceAngle` | 45 (°) | "Surface Angle", range 5–85 (used by Open Bottom) |
+| `/Hollowing/Type` | 0 | "Hollow type": 0 Inside, 1 Outside, 2 Center ("Center Hollow": self-supporting), 3 Open Bottom |
+| `/Hollowing/surfaceAngle` | 45 (°) | "Surface Angle", range 5–85; shown and used for Center only (07 §2) |
 | `/Hollowing/isFilter` | false | "Filter small shells" |
 | `/Hollowing/filterSmallShell` | 0.1 | range 0.001–5e9 |
 | `/Hollowing/filter_type` | 0 (clamped ≤ 1) | "By cavity number" or "By cavity volume" |
@@ -113,17 +113,19 @@ SatelLite's template files come from the user's own install: GooSlicer copies th
 
 | Key | Default | Note |
 |---|---|---|
-| `/Perforation/radius1`, `radius2` | 2, 2 | end radii; equal values give a cylinder **[INFERRED]** |
-| `/Perforation/extend1`, `extend2` | 2, 2 | depth either side of the surface **[INFERRED]** |
-| `/Perforation/useAngleSlot`, `angleSlot` | false, 0 | |
-| `/Perforation/useNotch`, `notchwidth`, `notchheight`, `notchangle` | false, 0.4, 0.4, 0 | |
-| `/Perforation/keepSubstract` | false | keep the removed plug as a part **[INFERRED]** |
-| `/Perforation/useClearance`, `clearanceValue`, `clearanceType` | false, 0, 1 | |
-| `/Perforation/HoleDirID`, `HoleDirX/Y/Z` | 0, (1, 0, 0) | hole direction preset and custom vector |
+| `/Perforation/radius1`, `radius2` | 2, 2 | "Radius outer circle" (at the clicked surface), "Radius inner circle" (at the far end) |
+| `/Perforation/extend1`, `extend2` | 2, 2 | how far the cut runs past the surface and past the far end ("Protrusion Length") |
+| `/Perforation/holeType`, `depth` | 1, 2 | "Hole Form": 1 Hole (through the wall), 0 Slot ("Depth of slot") [EleTriHole `DockWidgetPerf::loadParas`] |
+| `/Perforation/edgenumber` | 50 | "Edge number", 3–50 [EleTriHole] |
+| `/Perforation/useAngleSlot`, `angleSlot` | false, 0 | "Use angle": taper by this angle (holes only) |
+| `/Perforation/useNotch`, `notchwidth`, `notchheight`, `notchangle` | false, 0.4, 0.4, 0 | a key tab on the hole's side |
+| `/Perforation/keepSubstract` | false | "Keep Hole Pin": the removed plug stays as its own object |
+| `/Perforation/useClearance`, `clearanceValue`, `clearanceType` | false, 0, 1 | gap between pin and hole; type 1 pin smaller, 2 hole larger, 3 both (the panel's "Hole Direction" Inside / Outside / Center combo). The panel always ticks useClearance. |
+| `/Perforation/HoleDirID`, `HoleDirX/Y/Z` | 0, (1, 0, 0) | "Perpendicular to surface" or "Custom" vector |
 
-The geometry of the hole operation itself (`EleTriHole.dll`, `Perforator::PerforationSelection`) is not decompiled yet. It is P5 work.
+The hole geometry (`EleTriHole.dll`: `Perforator`, `CreateMesh::Create`, `BooleanImp`) is in 07 §3.
 
 ## 4. Open items
 - **For P6:** enum meanings and the support generation algorithm (EleTriStructure/EleTriAdd structure builders). Template field semantics need confirming against arc.goo: pillar count and positions, tip geometry.
-- **List order:** SatelLite's list order within a bucket (which template wins when several match). It is irrelevant for the shipped set, which has one EVO per bucket.
+- ~~List order~~ (2026-11-25) **[OBSERVED EleTriAdd FUN_1801a6fb0, FUN_180103d10]**: a template folder is listed with `QDir::entryList("*.satsup", Files, NoSort)`, so QDir's default sort applies, name ignoring case (Qt's default). For the recommendation, SatelLite maps each bucket to the **first** combo entry whose text has its tag (a later one never replaces it). If no entry has the tag, the selection is left alone. Before that, if the tallest selected part already has supports from a template that is in the list, that template is kept. GooSlicer (`load_templates`, `recommended_template`) follows the order and the first-match rule. The keep-the-current-template step isn't done, since GooSlicer's support plans don't record a template name.
 - **Runtime confirmation (optional, on request):** the user's own `QSettings` file from a SatelLite install, which shows any non-default values.

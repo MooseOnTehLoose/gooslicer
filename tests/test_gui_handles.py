@@ -69,7 +69,7 @@ def test_move_arrow(app, win, tmp_path):
     vp.set_view(-60, 25)
     pump(app)
     kind, base, ends = vp.handles()
-    assert kind == "move" and [i for i, _ in ends] == [0, 1]
+    assert kind == "move" and [i for i, _ in ends] == [0, 1, 2]
     assert abs(base[2] - p.bounds()[0][2]) < 1e-9                   # on the plate
     tip = dict(ends)[0]
     a = project(vp, tip)
@@ -102,6 +102,52 @@ def test_move_arrow(app, win, tmp_path):
     assert p.position[1] - before.position[1] == pytest.approx(-5.0, abs=0.02)
     assert p.position[0] == before.position[0]
     win.undo.undo()
+
+
+def test_z_arrow_lifts_a_bare_part(app, win, tmp_path):
+    """09 §10: the Z arrow raises a part without supports off the plate, never below it."""
+    p = _one(app, win, tmp_path)
+    vp = win.viewport
+    vp.set_handle_mode("move")
+    vp.set_view(-60, 10)
+    pump(app)
+    tip = dict(vp.handles()[2])[2]
+    a = project(vp, tip)
+    assert vp.handle_at(a) == 2
+    before = p.state()
+    n0 = win.undo.index()
+    b = project(vp, tip + np.array([0, 0, 8.0]))
+    _drag_to(vp, a, b)
+    assert vp._hdrag["value"] == pytest.approx(8.0, abs=0.05)
+    assert "lift" in vp._drag_text(vp._hdrag)
+    _release(vp, b)
+    assert win.undo.index() == n0 + 1 and win.undo.text(n0).startswith("Move Z +")
+    assert p.elevation == pytest.approx(8.0, abs=0.05)
+    assert p.bounds()[0][2] == pytest.approx(p.elevation, abs=1e-6)
+    # turning it keeps the lift
+    win.scene.rotate(p, [0, 1.0, 1.0], 30)
+    assert p.bounds()[0][2] == pytest.approx(p.elevation, abs=1e-6)
+    win.scene.rotate(p, [0, 1.0, 1.0], -30)
+    # dragging down stops at the plate
+    tip = dict(vp.handles()[2])[2]
+    a = project(vp, tip)
+    _drag_to(vp, a, project(vp, tip + np.array([0, 0, -30.0])))
+    _release(vp, a)
+    assert p.elevation == 0.0 and p.bounds()[0][2] == pytest.approx(0.0, abs=1e-6)
+    win.undo.undo()
+    assert p.elevation == pytest.approx(8.0, abs=0.05)
+    win.undo.undo()
+    assert p.state() == before and p.elevation == 0.0
+    # the Z position field lifts it too
+    win.props._set_pos(2, p.position[2] + 3.0)
+    assert p.elevation == pytest.approx(3.0) and p.bounds()[0][2] == pytest.approx(3.0)
+    win.props._set_pos(2, -100.0)
+    assert p.elevation == 0.0
+    # parts with supports have no Z arrow: their supports set the height
+    p.supports = object()
+    vp.update()
+    assert [i for i, _ in vp.handles()[2]] == [0, 1]
+    p.supports = None
 
 
 def test_escape_cancels(app, win, tmp_path):

@@ -3,8 +3,8 @@ the rotation rings (09 §8). A mixin for Viewport: it uses the view's scene, sel
 _screen and _ray.
 
 Move: X and Y arrows from the selection's bottom centre; a drag moves along that axis only
-(free, or whole millimetres with Ctrl). There is no Z arrow: parts rest on the plate or at their
-support lift.
+(free, or whole millimetres with Ctrl). A Z arrow lifts parts off the plate (never below it), but
+only while none of the selected parts has supports: their supports set their height.
 Scale: with one part, a cube on each of the part's own axes (its scale is per local axis, so world
 axes would shear a turned part) plus a uniform handle above the bounding box's top corner; with
 several parts only the uniform handle, scaling them about the selection's bottom centre. Steps of
@@ -102,8 +102,8 @@ class HandlesMixin:
 
     def handles(self):
         """The current mode's move or scale handles: (kind, centre, [(index, world end)...]) or
-        None. Move: indices 0 (X) and 1 (Y). Scale: 0–2 along the part's own axes (one part)
-        and UNIFORM."""
+        None. Move: indices 0 (X), 1 (Y) and 2 (Z, for parts without supports). Scale: 0–2 along
+        the part's own axes (one part) and UNIFORM."""
         if self.handle_mode not in ("move", "scale") or not self._handles_allowed():
             return None
         if self._hdrag is not None:
@@ -115,7 +115,8 @@ class HandlesMixin:
         length = max(0.55 * float(np.linalg.norm(hi - lo)), 4.0)
         if self.handle_mode == "move":
             base = np.array([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2]])
-            return "move", base, [(i, base + np.eye(3)[i] * length) for i in (0, 1)]
+            axes = (0, 1, 2) if all(p.supports is None for p in parts) else (0, 1)
+            return "move", base, [(i, base + np.eye(3)[i] * length) for i in axes]
         ends = []
         if len(parts) == 1:
             p = parts[0]
@@ -207,6 +208,8 @@ class HandlesMixin:
             if t is None or d["t0"] is None:
                 return
             value = snap(t - d["t0"], 1.0 if ctrl else 0.01)
+            if d["index"] == 2:                   # a lift: no part goes below the plate
+                value = max(value, -min(b.elevation for b in d["before"].values()))
             if value == d["value"]:
                 return
             d["value"] = value
@@ -214,6 +217,8 @@ class HandlesMixin:
                 b = d["before"][p.id]
                 p.position = b.position.copy()
                 p.position[d["index"]] += value
+                if d["index"] == 2:
+                    p.elevation = b.elevation + value
         else:
             along = float(np.dot(np.array([pos.x(), pos.y()]) - d["origin_xy"], d["dir"]))
             f = max(snap(along / d["d0"], 0.1 if ctrl else 0.01), MIN_FACTOR)
@@ -240,7 +245,10 @@ class HandlesMixin:
 
     def _drag_text(self, d) -> str:
         if d["kind"] == "move":
-            return f"{'XY'[d['index']]} {d['value']:+.2f} mm"
+            if d["index"] == 2:
+                lift = min(b.elevation for b in d["before"].values()) + d["value"]
+                return f"Z {d['value']:+.2f} mm (lift {lift:.2f})"
+            return f"{'XYZ'[d['index']]} {d['value']:+.2f} mm"
         pct = f"{d['value'] * 100:.0f} %"
         if d["index"] == UNIFORM or self.uniform_scale():
             return pct

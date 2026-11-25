@@ -183,6 +183,7 @@ class HollowResult:
     cavities: int
     removed_volume: float
     original_volume: float
+    pillars: int = 0                  # Center: pillars added under flat cavity ceilings
 
 
 def hollow(mesh: trimesh.Trimesh, s: HollowSettings | None = None) -> HollowResult:
@@ -192,74 +193,123 @@ def hollow(mesh: trimesh.Trimesh, s: HollowSettings | None = None) -> HollowResu
     body = to_manifold(mesh)
     t, p = float(s.thickness), float(s.accuracy)
     lo, hi = mesh.bounds
-    margin = (t if s.hollow_type in ("outside", "center") else 0.0) + 3 * p
+    margin = (t if s.hollow_type == "outside" else 0.0) + 3 * p
     g = Grid.around(lo, hi, p, margin)
-    band = t if s.hollow_type in ("inside", "open_bottom") else t / 2 if s.hollow_type == "center" else t
-    sd = signed_distance(occupancy(mesh, g), p, mesh, g, band + 2 * p)
+    sd = signed_distance(occupancy(mesh, g), p, mesh, g, t + 2 * p)
     vol0 = body.volume()
-    if s.hollow_type in ("inside", "open_bottom"):
+    pillars = 0
+    if s.hollow_type in ("inside", "open_bottom", "center"):
         field = sd - t
+        if s.hollow_type == "center":
+            bars = self_support_pillars(mesh, s)
+            pillars = len(bars)
+            if bars:
+                field = np.minimum(field, _bars_distance(bars, g, t + 2 * p) - t)
         if s.hollow_type == "open_bottom":
-            field = _open_bottom(field, p)
+            field = _open_bottom(field, mesh, g, s)
         cavity = _filter_cavities(level_surface(field, g, 0.0), s, p)
-        if s.infill and s.hollow_type == "inside":
-            cavity = cavity - lattice(cavity.bounding_box(), s)
+        if s.infill and s.hollow_type != "open_bottom" and not cavity.is_empty():
+            cavity = cavity - lattice((lo, hi), s)
         result = body - cavity
     elif s.hollow_type == "outside":
         cavity = body
         if s.infill:
-            cavity = cavity - lattice(cavity.bounding_box(), s)
+            cavity = cavity - lattice((lo, hi), s)
         result = level_surface(sd, g, -t) - cavity
-    elif s.hollow_type == "center":
-        cavity = _filter_cavities(level_surface(sd, g, t / 2), s, p)
-        if s.infill:
-            cavity = cavity - lattice(cavity.bounding_box(), s)
-        result = level_surface(sd, g, -t / 2) - cavity
     else:
         raise HollowError(f"unknown hollow type {s.hollow_type!r}")
     n = len(cavity.decompose()) if not cavity.is_empty() else 0
     if result.is_empty():
         raise HollowError("hollowing removed the whole part (wall thickness too large?)")
     return HollowResult(to_trimesh(result), n, vol0 - result.volume() if s.hollow_type != "outside"
-                        else -(result.volume()), vol0)
+                        else -(result.volume()), vol0, pillars)
 
 
-def _cell(kind: str, a: float, r: float, segs: int = 8) -> m3.Manifold:
-    """One lattice cell, [0, a]³, owning only what no neighbour also has, so tiled copies
-    overlap only where struts meet: BCC is the body centre joined to the eight corners; FCC is
-    the two diagonals of the three faces through the origin. A ball at each owned node rounds
-    the joints."""
-    def strut(p, q):
-        p, q = np.asarray(p, float), np.asarray(q, float)
-        d = q - p
-        L = float(np.linalg.norm(d))
-        c = m3.Manifold.cylinder(L, r, r, segs)
-        z = np.array([0.0, 0, 1])
-        v = np.cross(z, d / L)
-        s_, cth = float(np.linalg.norm(v)), float(np.dot(z, d / L))
-        if s_ < 1e-12:
-            R = np.eye(3) if cth > 0 else np.diag([1.0, -1, -1])
-        else:
-            k = v / s_
-            K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
-            R = np.eye(3) + s_ * K + (1 - cth) * K @ K
-        return c.transform(np.c_[R, p].tolist())
+# ------------------------------------------------------------------- self-supporting (Center)
+def self_support_pillars(mesh: trimesh.Trimesh, s: HollowSettings) -> list[tuple]:
+    """SatelLite's "Center Hollow" pillars (07 §2) [OBSERVED EleShapeEdge SelfSupportHollow]:
+    support anchors are found on an inside-out copy of the part, so they land on the underside
+    of its roofs, the faces flatter than the surface angle as seen from inside. From each, a ray
+    straight down finds the floor, and a thin cone bar joins them: radius 0.01·accuracy at the
+    roof, accuracy/√3 at the floor. The hollow's inward offset then runs around the bars too,
+    which leaves pillars of wall thickness inside the cavity. The anchor spacing is GooSlicer's
+    (4 × (thickness + accuracy)), as is keeping them two walls back from a roof's edge, where a
+    pillar would only merge into the wall; SatelLite's spacing comes from its support anchor generator [UNKNOWN].
+    Returns [(top, bottom, top radius, bottom radius)]."""
+    from .raycast import caster
+    from .supports import SupportParams, detect_contacts
+    t, acc = float(s.thickness), float(s.accuracy)
+    inv = mesh.copy()
+    inv.invert()
+    spacing = 4.0 * (t + acc)
+    prm = SupportParams(critical_angle=float(s.surface_angle), anchor_dis=spacing, anchor_dis_border=spacing,
+                        border_offset=2 * (t + acc), reinforce_lowest=False)
+    tops = np.array([c.point for c in detect_contacts(inv, prm)]).reshape(-1, 3)
+    if not len(tops):
+        return []
+    zmin = mesh.bounds[0][2]
+    tops = tops[tops[:, 2] >= zmin]
+    dist, _ = caster(mesh).vertical(tops - [0.0, 0.0, 0.001])
+    out = []
+    for top, d in zip(tops, dist):
+        # a floor further than the wall on both ends leaves room for a pillar in the cavity
+        if np.isfinite(d) and d > 2 * t + acc:
+            out.append((top, top - [0.0, 0.0, d + 0.001], 0.01 * acc, acc / math.sqrt(3)))
+    return out
 
-    def ball(p):
-        return m3.Manifold.sphere(r, segs).translate(tuple(float(x) for x in p))
 
-    h = a / 2
-    corners = [(i * a, j * a, k * a) for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+def _bars_distance(bars: list[tuple], g: Grid, reach: float) -> np.ndarray:
+    """Distance from each voxel centre to the nearest cone bar's surface (inf beyond `reach`)."""
+    out = np.full(g.shape, np.inf, np.float32)
+    for a, b, ra, rb in bars:
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        lo = np.minimum(a, b) - (reach + max(ra, rb))
+        hi = np.maximum(a, b) + (reach + max(ra, rb))
+        k0 = np.clip(np.floor((lo - g.origin) / g.pitch).astype(int), 0, np.array(g.shape) - 1)
+        k1 = np.clip(np.ceil((hi - g.origin) / g.pitch).astype(int), 0, np.array(g.shape) - 1)
+        if np.any(k1 < k0):
+            continue
+        ax = [g.origin[i] + np.arange(k0[i], k1[i] + 1) * g.pitch for i in range(3)]
+        P = np.stack(np.meshgrid(*ax, indexing="ij"), axis=-1)
+        d = b - a
+        L2 = float(d @ d)
+        u = np.clip(((P - a) @ d) / L2, 0.0, 1.0) if L2 > 0 else np.zeros(P.shape[:3])
+        dist = np.linalg.norm(P - (a + u[..., None] * d), axis=-1) - (ra + u * (rb - ra))
+        sl = tuple(slice(k0[i], k1[i] + 1) for i in range(3))
+        out[sl] = np.minimum(out[sl], dist)
+    return out
+
+
+# ------------------------------------------------------------------------------ infill
+def _bar(p, q, r: float, segs: int = 4) -> m3.Manifold:
+    p, q = np.asarray(p, float), np.asarray(q, float)
+    d = q - p
+    L = float(np.linalg.norm(d))
+    R = _rotation_from_z(d / L)
+    return m3.Manifold.cylinder(L, r, r, segs).transform(np.c_[R, p].tolist())
+
+
+def _cell(kind: str, a: float, r: float) -> m3.Manifold:
+    """One lattice cell as SatelLite builds it [OBSERVED EleTriCreate GenerateLattice]: square
+    bars (4 segments, `r` the corner radius [INFERRED]) with no balls at the joints, clipped to
+    the cell's box. BCC: the four body diagonals. FCC: both diagonals of all six faces. The
+    clip box is a hair larger than the cell so neighbouring cells overlap instead of touching."""
+    c = [np.array((i, j, k), float) * a for i in (0, 1) for j in (0, 1) for k in (0, 1)]
     if kind == "bcc":
-        parts = [strut((h, h, h), c) for c in corners] + [ball((h, h, h)), ball((0, 0, 0))]
+        bars = [(c[i], c[7 - i]) for i in range(4)]
     else:
-        faces = [((0, 0, 0), (0, a, a), (0, a, 0), (0, 0, a)),          # x = 0
-                 ((0, 0, 0), (a, 0, a), (a, 0, 0), (0, 0, a)),          # y = 0
-                 ((0, 0, 0), (a, a, 0), (a, 0, 0), (0, a, 0))]          # z = 0
-        parts = [ball((0, 0, 0))]
-        for p0, p1, q0, q1 in faces:
-            parts += [strut(p0, p1), strut(q0, q1), ball(np.add(p0, p1) / 2)]
-    return m3.Manifold.batch_boolean(parts, m3.OpType.Add)
+        bars = []
+        for axis in range(3):
+            u, v = (i for i in range(3) if i != axis)
+            for side in (0.0, a):
+                def pt(x, y, axis=axis, u=u, v=v, side=side):
+                    q = np.zeros(3)
+                    q[axis], q[u], q[v] = side, x, y
+                    return q
+                bars += [(pt(0, 0), pt(a, a)), (pt(a, 0), pt(0, a))]
+    cell = m3.Manifold.batch_boolean([_bar(p, q, r) for p, q in bars], m3.OpType.Add)
+    e = 1e-4 * a
+    return cell ^ m3.Manifold.cube((a + 2 * e,) * 3).translate((-e, -e, -e))
 
 
 def _tile(cell: m3.Manifold, a: float, counts) -> m3.Manifold:
@@ -281,28 +331,71 @@ def _tile(cell: m3.Manifold, a: float, counts) -> m3.Manifold:
 
 
 def lattice(bounds, s: HollowSettings) -> m3.Manifold:
-    """SatelLite's infill lattice (07 §2b) over a box ((x0, y0, z0, x1, y1, z1) or lo, hi): cells of
-    `infill_size` on a grid anchored at the origin, struts of `infill_radius`, one cell of slack
-    on every side so the struts run on into the walls."""
+    """SatelLite's infill lattice (07 §2b) over a part's bounding box ((x0, y0, z0, x1, y1, z1)
+    or lo, hi): cells of `infill_size` from the box's low corner, int(size/cell + 2) per axis
+    [OBSERVED StructureImp::dowork_file], bars of `infill_radius`."""
     b = np.asarray(bounds, float).reshape(2, 3)
     a = float(s.infill_size)
-    lo = np.floor(b[0] / a) * a - a
-    counts = (np.ceil((b[1] - lo) / a).astype(int) + 1).tolist()
+    counts = [int((b[1][i] - b[0][i]) / a + 2) for i in range(3)]
     if np.prod(counts) > 400_000:
         raise HollowError(f"the infill would need {np.prod(counts):,} cells; use a larger cell size")
-    return _tile(_cell(s.infill_type, a, float(s.infill_radius)), a, counts).translate(tuple(lo.tolist()))
+    return _tile(_cell(s.infill_type, a, float(s.infill_radius)), a, counts).translate(tuple(b[0].tolist()))
 
 
-def _open_bottom(field: np.ndarray, pitch: float) -> np.ndarray:
-    """Extend each column's lowest cavity run down through the floor [INFERRED behaviour of
-    "Open Bottom Hollow"; SatelLite's surface-angle rule is not reproduced, spec 07 §2]."""
-    cav = field > 0
-    has = cav.any(axis=2)
+# ---------------------------------------------------------------------------- open bottom
+def bottom_faces(mesh: trimesh.Trimesh, s: HollowSettings) -> np.ndarray:
+    """The faces SatelLite's Open Bottom removes before shelling [OBSERVED EleShapeModify
+    markOpenBottomFaces]: within a band of the lowest point (a quarter of the smaller of wall
+    thickness and accuracy, kept to 0.02–0.2 mm) by both their lowest corner and their centre,
+    and facing within about 45° of straight down or up (|n_z| ≥ 0.7). If none qualify: the
+    faces whose centres are within the band of the lowest centre."""
+    band = min(max(0.25 * min(abs(s.thickness), abs(s.accuracy)), 0.02), 0.2)
+    tri = np.asarray(mesh.triangles, float)
+    zmin = float(tri[:, :, 2].min())
+    cz = tri[:, :, 2].mean(axis=1)
+    keep = (tri[:, :, 2].min(axis=1) <= zmin + band) & (cz <= zmin + band) & \
+        (np.abs(np.asarray(mesh.face_normals)[:, 2]) >= 0.7)
+    if not keep.any():
+        keep = cz <= cz.min() + band
+    return keep
+
+
+def _open_bottom(field: np.ndarray, mesh: trimesh.Trimesh, g: Grid, s: HollowSettings) -> np.ndarray:
+    """SatelLite removes the bottom faces and shells what is left inward by the wall thickness
+    (07 §2), so the wall is measured from the remaining surface only: near the removed faces,
+    the field is recomputed as the distance to the other faces. Where the cavity then reaches
+    the removed faces, it is carried on down out of the part, so the floor opens there."""
+    from scipy.spatial import cKDTree
+    t, p = float(s.thickness), g.pitch
+    bottom = bottom_faces(mesh, s)
+    faces = np.asarray(mesh.faces)
+    rest = trimesh.Trimesh(mesh.vertices, faces[~bottom], process=False)
+    if not len(rest.faces):
+        return field
+    low = surface_samples(trimesh.Trimesh(mesh.vertices, faces[bottom], process=False), p / 2)
+    inside = field > -t - 1e-6                     # field = signed distance - t
+    idx = np.argwhere(inside)
+    pts = g.origin + idx * p
+    d_low, _ = cKDTree(low).query(pts, distance_upper_bound=t + 2 * p, workers=-1)
+    near = np.isfinite(d_low)
+    out = field.copy()
+    if near.any():
+        d_rest, _ = cKDTree(surface_samples(rest, p / 4)).query(pts[near], workers=-1)
+        i = idx[near]
+        out[i[:, 0], i[:, 1], i[:, 2]] = np.maximum(field[i[:, 0], i[:, 1], i[:, 2]], d_rest - t)
+    # columns under the removed faces where the cavity comes down to the part's floor
+    ij = np.rint((low[:, :2] - g.origin[:2]) / p).astype(np.int64)
+    ok = np.all((ij >= 0) & (ij < np.array(g.shape[:2])), axis=1)
+    cols = np.zeros(g.shape[:2], bool)
+    cols[ij[ok, 0], ij[ok, 1]] = True
+    cav = out > 0
+    has = cav.any(axis=2) & cols & inside.any(axis=2)
     first = np.where(has, cav.argmax(axis=2), field.shape[2])
+    floor = np.where(has, inside.argmax(axis=2), 0)
+    has &= first <= floor + 1
     kk = np.arange(field.shape[2])[None, None, :]
     below = has[:, :, None] & (kk < first[:, :, None])
-    out = field.copy()
-    out[below] = pitch
+    out[below] = p
     return out
 
 
@@ -325,22 +418,108 @@ def _filter_cavities(cavity: m3.Manifold, s: HollowSettings, pitch: float) -> m3
 # ----------------------------------------------------------------------------- drain holes
 @dataclass
 class DrainHole:
+    """A drain hole as SatelLite's Perforator makes it (07 §3) [OBSERVED EleTriHole
+    CreateMesh::Create]. Hole form: through the wall, from the clicked point to the next surface
+    along the axis (`length`, found by drill() when None). Slot form: settings.depth deep."""
     point: tuple[float, float, float]       # on the surface, same frame as the mesh
     axis: tuple[float, float, float]        # unit vector pointing INTO the part
     settings: DrainHoleSettings
+    length: float | None = None             # surface to far wall; None: cast a ray in drill()
 
-    def solid(self, segments: int = 32) -> m3.Manifold:
+    def depth(self) -> float:
         s = self.settings
+        return float(s.depth) if s.hole_form == "slot" else float(self.length or 0.0)
+
+    def solid(self, clearance: float = 0.0) -> m3.Manifold:
+        return to_manifold(self.mesh(clearance))
+
+    def mesh(self, clearance: float = 0.0) -> trimesh.Trimesh:
         a = np.asarray(self.axis, float)
         a = a / np.linalg.norm(a)
-        length = s.extend1 + s.extend2
-        # cylinder/cone along +Z from z=0 (outer end, radius1) to z=length (inner end, radius2)
-        c = m3.Manifold.cylinder(length, s.radius1, s.radius2, segments)
-        R = _rotation_from_z(a)
+        m = hole_mesh(self.settings, self.depth(), clearance)
         T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = np.asarray(self.point, float) - a * s.extend1
-        return c.transform(T[:3, :].tolist())
+        T[:3, :3] = _rotation_from_z(a)
+        T[:3, 3] = np.asarray(self.point, float)
+        m.apply_transform(T)
+        return m
+
+
+def _profile(s: DrainHoleSettings, R: float, clearance: float) -> np.ndarray:
+    """The hole's cross-section at radius R (r1 + clearance) as SatelLite draws it: `edges`
+    steps around the circle, and with a notch, a key tab on the +X side, the notch width (plus
+    twice the clearance) wide, its tip the notch height (plus the clearance) past the circle,
+    turned by the notch angle [angle INFERRED]."""
+    n = int(s.edges)
+    if not s.use_notch:
+        ang = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
+        return np.c_[np.cos(ang), np.sin(ang)] * R
+    w = min(float(s.notch_width), 1.999 * float(s.radius1))
+    half = 0.5 * max(w + 2 * clearance, 0.002)
+    a0 = math.asin(half / R) if half < R else math.pi / 2
+    ang = np.linspace(a0, 2 * math.pi - a0, n + 1)
+    arc = np.c_[np.cos(ang), np.sin(ang)] * R
+    r = R - clearance                                       # radius1, or radius2 when built from the far end
+    tip = math.sqrt(max(r * r - (w / 2) ** 2, 0.0)) + float(s.notch_height) + clearance
+    pts = np.vstack([arc, [[tip, -half], [tip, half]]])
+    c, sn = math.cos(math.radians(s.notch_angle)), math.sin(math.radians(s.notch_angle))
+    return pts @ np.array([[c, sn], [-sn, c]])
+
+
+def hole_mesh(s: DrainHoleSettings, depth: float, clearance: float = 0.0) -> trimesh.Trimesh:
+    """The cutter in the hole's own frame: +Z into the part, the clicked surface at z = 0, the
+    far end at z = depth (a slot's own depth for the Slot form). Radius r1 (+ clearance) at the
+    surface; tapering to r2 at the far end (the taper capped at 0.8 rad from the axis), or by
+    the taper angle when that is on (Hole form only). It runs extend1 out past the surface and extend2 past the far end (not for a
+    slot), keeping its taper, and closes in a point if the taper meets the axis first."""
+    slot = s.hole_form == "slot"
+    L = max(float(s.depth if slot else depth), 0.0)
+    e1, e2 = float(s.extend1), 0.0 if slot else float(s.extend2)
+    r1, r2 = float(s.radius1), float(s.radius2)
+    use_angle = s.use_angle_slot and not slot
+    z0, z1 = -e1, L + e2
+    if use_angle or r1 > r2:
+        tan = math.tan(math.radians(s.angle_slot)) if use_angle else \
+            math.tan(min(math.atan((r1 - r2) / L), 0.8)) if L > 1e-9 else 0.0
+        R0 = r1 + clearance
+        rad = lambda z: R0 - z * tan  # noqa: E731   narrows going in
+    elif r2 > r1:
+        tan = math.tan(min(math.atan((r2 - r1) / L), 0.8)) if L > 1e-9 else 0.0
+        R0 = r2 + clearance
+        rad = lambda z: R0 - (L - z) * tan  # noqa: E731   narrows coming out
+    else:
+        tan, R0 = 0.0, r1 + clearance
+        rad = lambda z: R0  # noqa: E731
+    base = _profile(s, R0, clearance) / R0                  # unit-radius shape, scaled per ring
+    rings, apex = [], None
+    for z in (z0, z1):
+        r = rad(z)
+        if r <= 1e-6:                                         # the taper closes before this end
+            apex = (R0 / tan if z == z1 else L - R0 / tan) if tan > 0 else z
+            r = 0.0
+        rings.append((z, r))
+    n = len(base)
+    v, f = [], []
+    pts = []
+    for z, r in rings:
+        if r == 0.0:
+            pts.append(None)
+        else:
+            pts.append(np.c_[base * r, np.full(n, z)])
+    i = np.arange(n)
+    j = (i + 1) % n
+    if pts[0] is not None and pts[1] is not None:
+        v = np.vstack([pts[0], pts[1], [[0, 0, z0]], [[0, 0, z1]]])
+        f = np.vstack([np.c_[i, j, n + j], np.c_[i, n + j, n + i],
+                       np.c_[np.full(n, 2 * n), j, i], np.c_[np.full(n, 2 * n + 1), n + i, n + j]])
+    else:                                                     # a cone ending in a point
+        k = 0 if pts[0] is not None else 1
+        zb = rings[k][0]
+        v = np.vstack([pts[k], [[0, 0, apex]], [[0, 0, zb]]])
+        f = np.vstack([np.c_[i, j, np.full(n, n)], np.c_[np.full(n, n + 1), j, i]])
+    m = trimesh.Trimesh(v, f, process=False)
+    if m.volume < 0:
+        m.invert()
+    return m
 
 
 def _rotation_from_z(a: np.ndarray) -> np.ndarray:
@@ -353,15 +532,47 @@ def _rotation_from_z(a: np.ndarray) -> np.ndarray:
     return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
 
 
+def hole_length(mesh: trimesh.Trimesh, point, axis) -> float:
+    """From the clicked point along the axis to the next surface: the wall the hole goes
+    through [OBSERVED Perforator::findNextInterPoint]. 0 if nothing is hit."""
+    from .scene import ray_triangles
+    a = np.asarray(axis, float)
+    a = a / np.linalg.norm(a)
+    p = np.asarray(point, float)
+    hit = ray_triangles(mesh, p + a * 1e-3, a)
+    return float(np.linalg.norm(hit[1] - p)) if hit is not None else 0.0
+
+
+def _clearances(s: DrainHoleSettings) -> tuple[float, float]:
+    """(hole, pin) radial offsets with "Keep Hole Pin" [OBSERVED BooleanImp]: the pin shrinks by
+    the clearance (1), the hole grows (2), or each by half (3)."""
+    c = float(s.clearance) if s.keep_subtracted else 0.0
+    return {1: (0.0, -c), 2: (c, 0.0), 3: (c / 2, -c / 2)}.get(int(s.clearance_type), (0.0, -c))
+
+
 def drill(mesh: trimesh.Trimesh, holes: list[DrainHole]) -> trimesh.Trimesh:
+    return drill_keep(mesh, holes)[0]
+
+
+def drill_keep(mesh: trimesh.Trimesh, holes: list[DrainHole]) -> tuple[trimesh.Trimesh, list[trimesh.Trimesh]]:
+    """The mesh with the holes cut, and the plugs cut out of it for holes that keep their pin."""
     if not holes:
-        return mesh
+        return mesh, []
     body = to_manifold(mesh)
-    cut = m3.Manifold.batch_boolean([h.solid() for h in holes], m3.OpType.Add)
+    for h in holes:
+        if h.length is None and h.settings.hole_form != "slot":
+            h.length = hole_length(mesh, h.point, h.axis)
+    cut = m3.Manifold.batch_boolean([h.solid(_clearances(h.settings)[0]) for h in holes], m3.OpType.Add)
     out = body - cut
     if out.is_empty():
         raise HollowError("the drain holes removed the whole part")
-    return to_trimesh(out)
+    pins = []
+    for h in holes:
+        if h.settings.keep_subtracted:
+            pin = body ^ h.solid(_clearances(h.settings)[1])
+            if not pin.is_empty():
+                pins.append(to_trimesh(pin))
+    return to_trimesh(out), pins
 
 
 # --------------------------------------------------------------------------- sealed cavities

@@ -100,14 +100,17 @@ def script_dir_for(profile_ini: str | os.PathLike) -> Path | None:
 
 def load_templates(directory: str | os.PathLike, printer: str | None = None) -> list[SupportTemplate]:
     """Templates for `printer`: its own sub-folder when one exists (only "ELEGOO Jupiter 2" ships
-    one), else the common ones [INFERRED from the folder layout]. Sorted by name, which is also
-    the order SatelLite lists them in [UNKNOWN; affects which template wins inside a bucket]."""
+    one), else the common ones [INFERRED from the folder layout]. In SatelLite's order: it lists
+    a folder with QDir::entryList("*.satsup", Files, NoSort), which falls back to QDir's default
+    sort, name ignoring case [OBSERVED EleTriAdd FUN_1801a6fb0; Qt default]. That order decides
+    which template wins inside a bucket (recommended_template)."""
     d = Path(directory)
     own = d / printer if printer else None
+    order = lambda fs: sorted(fs, key=lambda f: (f.name.lower(), f.name))  # noqa: E731
     if own and own.is_dir() and any(own.glob("*.satsup")):
-        files, tag = sorted(own.glob("*.satsup")), printer
+        files, tag = order(own.glob("*.satsup")), printer
     else:
-        files, tag = sorted(d.glob("*.satsup")), None
+        files, tag = order(d.glob("*.satsup")), None
     out = []
     for f in files:
         try:
@@ -120,8 +123,11 @@ def load_templates(directory: str | os.PathLike, printer: str | None = None) -> 
 def recommended_template(templates: list[SupportTemplate], max_height: float,
                          family: str = "evo") -> SupportTemplate | None:
     """SatelLite's 'supports recommended by the system' [OBSERVED FUN_180103d10]: the first
-    template whose name carries the bucket tag for the tallest part's Z height
-    (h ≤ 30 → 0-30, ≤ 60 → 30-60, ≤ 100 → 60-100, else 100+)."""
+    template, in list order (load_templates), whose name carries the bucket tag for the tallest
+    part's Z height (h ≤ 30 → 0-30, ≤ 60 → 30-60, ≤ 100 → 60-100, else 100+). SatelLite builds a
+    map from bucket to the first combo entry with its tag, so later matches never win; if no
+    entry has the tag, the selection is left as it was. (When the tallest part already has
+    supports made from a listed template, SatelLite keeps that one instead.)"""
     tag = "0-30" if max_height <= 30 else "30-60" if max_height <= 60 else \
         "60-100" if max_height <= 100 else "100+"
     cands = [t for t in templates if tag in t.name and (family is None or t.family == family)]
@@ -130,6 +136,9 @@ def recommended_template(templates: list[SupportTemplate], max_height: float,
 
 # --------------------------------------------------------------------------- hollowing
 HOLLOW_TYPES = ("inside", "outside", "center", "open_bottom")   # combo order [OBSERVED]
+# "center" is SatelLite's "Center Hollow", which is a self-supporting inside hollow: the wall
+# goes inward and pillars hold up any cavity ceiling flatter than the surface angle
+# [OBSERVED EleShapeModify DialogHollow::on_confirm_clicked, EleShapeEdge SelfSupportHollow].
 INFILL_TYPES = ("bcc", "fcc")
 
 
@@ -139,7 +148,8 @@ class HollowSettings:
     thickness: float = 1.0          # mm, /Hollowing/thickness
     accuracy: float = 1.0           # mm, /Hollowing/accuracy (no cross-check vs thickness found)
     hollow_type: str = "inside"     # /Hollowing/Type 0..3
-    surface_angle: float = 45.0     # degrees, /Hollowing/surfaceAngle, range 5–85
+    surface_angle: float = 45.0     # degrees, /Hollowing/surfaceAngle, 5–85: Center's self-supporting
+                                    # rule (SatelLite shows it for Center only; 07 §2)
     filter_small_shells: bool = False   # /Hollowing/isFilter
     small_shell_size: float = 0.1   # /Hollowing/filterSmallShell, range 0.001–5e9 (volume unit)
     filter_by: str = "cavity_number"    # /Hollowing/filter_type 0 = number, 1 = volume
@@ -173,27 +183,56 @@ class HollowSettings:
         return errs
 
 
+HOLE_FORMS = ("hole", "slot")          # /Perforation/holeType 1 = Hole, 0 = Slot [OBSERVED]
+CLEARANCE_SIDES = (1, 2, 3)            # /Perforation/clearanceType: 1 pin (inside), 2 hole (outside), 3 both
+
+
 @dataclass
 class DrainHoleSettings:
-    """Defaults of SatelLite's Perforation (drain hole) page [OBSERVED EleTriStructure
-    FUN_180009970]. radius1/radius2 are the two end radii (equal = cylinder), extend1/extend2
-    the depth on each side of the picked surface point [INFERRED from names]."""
+    """SatelLite's drain hole ("Perforation") settings and defaults [OBSERVED EleTriStructure
+    FUN_180009970 and EleTriHole DockWidgetPerf::loadParas; geometry in 07 §3].
+    radius1 is the radius at the clicked surface and radius2 at the far end of the hole (the
+    inner wall, or the bottom of a slot); extend1 runs past the clicked surface, extend2 past
+    the far end. SatelLite's own panel shows one "Protrusion Length" for both."""
     radius1: float = 2.0
     radius2: float = 2.0
     extend1: float = 2.0
     extend2: float = 2.0
-    use_angle_slot: bool = False
-    angle_slot: float = 0.0
-    use_notch: bool = False
+    hole_form: str = "hole"         # "hole": through the wall to the next surface; "slot": fixed depth
+    depth: float = 2.0              # /Perforation/depth, the slot's depth
+    edges: int = 50                 # /Perforation/edgenumber, 3–50
+    use_angle_slot: bool = False    # taper by angle instead of radius2 (Hole form only)
+    angle_slot: float = 0.0         # degrees
+    use_notch: bool = False         # a key tab on the hole's side, so a pin goes in one way
     notch_width: float = 0.4
     notch_height: float = 0.4
-    notch_angle: float = 0.0
-    keep_subtracted: bool = False
-    use_clearance: bool = False
-    clearance: float = 0.0
-    clearance_type: int = 1
-    direction_id: int = 0           # /Perforation/HoleDirID
+    notch_angle: float = 0.0        # degrees about the hole's axis [INFERRED use]
+    keep_subtracted: bool = False   # "Keep Hole Pin": the cut-out plug becomes a new part
+    use_clearance: bool = False     # SatelLite's dialog always turns this on; the clearance value is what counts
+    clearance: float = 0.0          # mm, the gap between the pin and the hole
+    clearance_type: int = 1         # 1 pin shrinks, 2 hole grows, 3 both by half
+    direction_id: int = 0           # /Perforation/HoleDirID: perpendicular to the surface, or custom
     direction: tuple[float, float, float] = (1.0, 0.0, 0.0)   # HoleDirX/Y/Z defaults
+
+    def validate(self) -> list[str]:
+        errs = []
+        if min(self.radius1, self.radius2) <= 0:
+            errs.append("hole radii must be positive")
+        if min(self.extend1, self.extend2) < 0:
+            errs.append("protrusions can't be negative")
+        if self.hole_form not in HOLE_FORMS:
+            errs.append(f"unknown hole form {self.hole_form!r}")
+        if self.hole_form == "slot" and self.depth <= 0:
+            errs.append("slot depth must be positive")
+        if not 3 <= int(self.edges) <= 50:
+            errs.append("edge number must be 3–50")
+        if self.use_angle_slot and not 0 <= self.angle_slot < 90:
+            errs.append("taper angle must be 0–90°")
+        if self.use_notch and min(self.notch_width, self.notch_height) <= 0:
+            errs.append("notch width and height must be positive")
+        if self.clearance < 0 or self.clearance_type not in CLEARANCE_SIDES:
+            errs.append("clearance must be zero or more, on the pin, the hole or both")
+        return errs
 
 
 @dataclass

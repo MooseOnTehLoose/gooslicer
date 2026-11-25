@@ -23,8 +23,10 @@ def test_sphere_and_offset_types(cube):
     assert r.mesh.volume == pytest.approx(sph.volume * (1 - 0.729), rel=0.01)
     out = H.hollow(cube, HollowSettings(thickness=1.0, accuracy=0.5, hollow_type="outside")).mesh
     assert np.allclose(out.bounds, [[-11] * 3, [11] * 3], atol=0.05) and out.is_watertight
-    cen = H.hollow(cube, HollowSettings(thickness=1.0, accuracy=0.5, hollow_type="center")).mesh
-    assert np.allclose(cen.bounds, [[-10.5] * 3, [10.5] * 3], atol=0.05)
+    inside = H.hollow(cube, HollowSettings(thickness=1.0, accuracy=0.5)).mesh
+    cen = H.hollow(cube, HollowSettings(thickness=1.0, accuracy=0.5, hollow_type="center"))
+    assert np.allclose(cen.mesh.bounds, cube.bounds) and cen.mesh.is_watertight      # inward, as SatelLite
+    assert cen.pillars > 0 and cen.mesh.volume > inside.volume + 100
     ob = H.hollow(cube, HollowSettings(thickness=1.0, accuracy=0.5, hollow_type="open_bottom")).mesh
     assert H.sealed_cavities([ob]) == [] and ob.volume < 8000 - 18 ** 3
 
@@ -129,10 +131,9 @@ def test_cavity_faces_each_keeps_cavities_apart():
 
 
 def test_hole_preview_mesh_matches_the_cut():
-    import numpy as np
-    import trimesh
+    """The preview is the cutter: through the solid box to its far side (20 mm), tapering from
+    r1 at the surface to r2 there, on past both ends by the extensions."""
     from gooslicer.scene import Part
-    from gooslicer.support_defaults import DrainHoleSettings
     from gooslicer_qt.hollowing import hole_preview_mesh
     part = Part.from_mesh("b", trimesh.creation.box((20, 20, 20)))
     face = int(np.argmax(part.mesh.face_normals[:, 0]))               # a +X side face
@@ -140,10 +141,99 @@ def test_hole_preview_mesh_matches_the_cut():
     s = DrainHoleSettings(radius1=2.0, radius2=1.0, extend1=1.0, extend2=4.0)
     m = hole_preview_mesh(part, face, hit, s)
     assert m.is_watertight and m.volume > 0
-    h = 5.0
-    assert np.isclose(m.volume, np.pi * h / 3 * (4 + 2 + 1), rtol=0.01)   # cone frustum
     lo, hi = m.bounds
-    assert np.isclose(hi[0], hit[0] + 1) and np.isclose(lo[0], hit[0] - 4)  # 1 out, 4 in (axis -X)
+    assert np.isclose(hi[0], hit[0] + 1) and np.isclose(lo[0], hit[0] - 24)   # 1 out, 20 through + 4
+    tan = 1 / 20
+    ra, rb = 2 + 1 * tan, 1 - 4 * tan                                  # the taper runs on
+    frustum = np.pi * 25 / 3 * (ra * ra + ra * rb + rb * rb)
+    assert np.isclose(m.volume, frustum * 50 / (2 * np.pi) * np.sin(2 * np.pi / 50), rtol=0.005)
+    ref = H.DrainHole(tuple(hit), (-1.0, 0, 0), s, 20.0).mesh()
+    assert np.isclose(ref.volume, m.volume)
+
+
+def test_drain_hole_shapes():
+    """07 §3 [OBSERVED CreateMesh::Create]."""
+    L = 5.0
+    cyl = H.hole_mesh(DrainHoleSettings(), L)
+    n = 50
+    poly = n / 2 * np.sin(2 * np.pi / n)                               # 50-gon area / r²
+    assert cyl.is_watertight and np.allclose(cyl.bounds[:, 2], [-2, L + 2])
+    assert np.isclose(cyl.volume, poly * 4 * (L + 4))
+    # the taper is capped at 0.8 rad, and closes in a point before the far extension ends
+    steep = H.hole_mesh(DrainHoleSettings(radius1=3, radius2=0.2, extend2=10), 1.0)
+    apex = 3 / np.tan(0.8)                                             # atan(2.8 / 1) > 0.8
+    assert steep.is_watertight and np.isclose(steep.bounds[1][2], apex)
+    # wider inside: built from the far end
+    wide = H.hole_mesh(DrainHoleSettings(radius2=3.0), L)
+    r = np.linalg.norm(wide.vertices[:, :2], axis=1)
+    assert np.isclose(r[np.isclose(wide.vertices[:, 2], L + 2)].max(), 3 + 2 / L)
+    # by angle: narrows going in, whatever radius2 says
+    ang = H.hole_mesh(DrainHoleSettings(radius2=3.0, use_angle_slot=True, angle_slot=10), L)
+    top = ang.vertices[np.isclose(ang.vertices[:, 2], L + 2)]
+    assert np.isclose(np.linalg.norm(top[:, :2], axis=1).max(), 2 - (L + 2) * np.tan(np.radians(10)))
+    # a slot: its own depth, no extension past the bottom, no angle
+    slot = H.hole_mesh(DrainHoleSettings(hole_form="slot", depth=3, use_angle_slot=True, angle_slot=10), 99)
+    assert np.allclose(slot.bounds[:, 2], [-2, 3]) and np.isclose(slot.volume, poly * 4 * 5)
+    # a notch: a key on +X, notch height past the circle, notch width wide
+    key = H.hole_mesh(DrainHoleSettings(use_notch=True, notch_width=1.0, notch_height=0.5), L)
+    assert key.is_watertight and np.isclose(key.bounds[1][0], np.sqrt(4 - 0.25) + 0.5)
+    assert key.volume > cyl.volume
+    turned = H.hole_mesh(DrainHoleSettings(use_notch=True, notch_width=1.0, notch_height=0.5,
+                                           notch_angle=90), L)
+    assert np.isclose(turned.bounds[1][1], np.sqrt(4 - 0.25) + 0.5)
+    assert len(H.hole_mesh(DrainHoleSettings(edges=6), L).vertices) == 2 * 6 + 2
+    assert DrainHoleSettings(edges=2).validate() and DrainHoleSettings(hole_form="x").validate()
+
+
+def test_hole_goes_through_the_wall_and_keeps_its_pin(cube):
+    shell = H.hollow(cube, HollowSettings(thickness=1.5, accuracy=0.5)).mesh
+    hole = H.DrainHole((0, 0, -10), (0, 0, 1), DrainHoleSettings())
+    assert H.hole_length(shell, hole.point, hole.axis) == pytest.approx(1.5, abs=0.02)
+    s = DrainHoleSettings(keep_subtracted=True, clearance=0.2)          # clearance on the pin
+    out, pins = H.drill_keep(shell, [H.DrainHole((0, 0, -10), (0, 0, 1), s)])
+    poly = 25 * np.sin(2 * np.pi / 50)
+    assert shell.volume - out.volume == pytest.approx(poly * 4 * 1.5, rel=0.02)
+    assert len(pins) == 1 and pins[0].volume == pytest.approx(poly * 1.8 ** 2 * 1.5, rel=0.02)
+    s = DrainHoleSettings(keep_subtracted=True, clearance=0.2, clearance_type=2)   # on the hole
+    out, pins = H.drill_keep(shell, [H.DrainHole((0, 0, -10), (0, 0, 1), s)])
+    assert shell.volume - out.volume == pytest.approx(poly * 2.2 ** 2 * 1.5, rel=0.02)
+    assert pins[0].volume == pytest.approx(poly * 4 * 1.5, rel=0.02)
+    # without keeping the pin, the clearance does nothing
+    out, pins = H.drill_keep(shell, [H.DrainHole((0, 0, -10), (0, 0, 1), DrainHoleSettings(clearance=0.5))])
+    assert pins == [] and shell.volume - out.volume == pytest.approx(poly * 4 * 1.5, rel=0.02)
+
+
+def test_open_bottom_opens_only_the_bottom_faces():
+    """07 §2 [OBSERVED markOpenBottomFaces]: the faces in a thin band at the very bottom go,
+    and the rest is shelled inward: a foot under a box opens, less its wall."""
+    box = trimesh.creation.box((20, 20, 20))
+    foot = trimesh.creation.box((6, 6, 2))
+    foot.apply_translation((0, 0, -11))
+    m = H.to_trimesh(H.to_manifold(box) + H.to_manifold(foot))
+    s = HollowSettings(thickness=1.0, accuracy=0.25, hollow_type="open_bottom")
+    marked = H.bottom_faces(m, s)
+    assert np.allclose(m.triangles_center[marked][:, 2], -12)          # the foot's sole only
+    r = H.hollow(m, s).mesh
+    assert r.is_watertight and H.sealed_cavities([r]) == []
+    loops = r.section([0, 0, 1], [0, 0, -11.99]).discrete
+    widths = sorted(float(np.ptp(lp[:, 0])) for lp in loops)
+    assert len(widths) == 2 and widths[1] == pytest.approx(6.0) and widths[0] == pytest.approx(4.0, abs=0.5)
+
+
+def test_center_pillars_hold_up_flat_ceilings():
+    """07 §2 [OBSERVED SelfSupportHollow]: a cone bar from each roof anchor down to the floor,
+    thickened by the wall; none under a roof steeper than the surface angle."""
+    slab = trimesh.creation.box((30, 30, 10))
+    s = HollowSettings(thickness=1.0, accuracy=0.5, hollow_type="center")
+    bars = H.self_support_pillars(slab, s)
+    assert bars and all(np.isclose(a[2], 5) and np.isclose(b[2], -5, atol=0.01) for a, b, *_ in bars)
+    assert all(np.isclose(ra, 0.005) and np.isclose(rb, 0.5 / np.sqrt(3)) for *_, ra, rb in bars)
+    r = H.hollow(slab, s)
+    assert r.pillars == len(bars) and r.cavities == 1 and r.mesh.is_watertight
+    sec = r.mesh.section([0, 0, 1], [0, 0, 0.0]).discrete
+    assert sum(np.ptp(lp[:, 0]) < 4 for lp in sec) == len(bars)       # one small loop per pillar
+    roof = trimesh.creation.cone(15, 15, sections=64)                  # 45° sides, no flat roof
+    assert H.self_support_pillars(roof, HollowSettings(hollow_type="center", surface_angle=30)) == []
 
 
 def _cup(lift=0.0, upside_down=False, drain=0.0, r=8.0):
@@ -217,3 +307,16 @@ def test_infill_settings():
     a = H.hollow(box, HollowSettings(thickness=1.5, accuracy=0.5, hollow_type="open_bottom"))
     b = H.hollow(box, HollowSettings(thickness=1.5, accuracy=0.5, hollow_type="open_bottom", infill=True))
     assert b.mesh.volume == pytest.approx(a.mesh.volume)
+
+
+def test_lattice_follows_satellite():
+    """07 §2b [OBSERVED GenerateLattice, StructureImp]: cells from the part's low corner,
+    int(size / cell + 2) per axis, square bars clipped to each cell, no balls at the joints."""
+    s = HollowSettings(infill=True, infill_size=4.0, infill_radius=0.5)
+    bcc = H.to_trimesh(H.lattice(((1, 2, 3), (9, 10, 11)), s))
+    assert np.allclose(bcc.bounds, [[1, 2, 3], [17, 18, 19]], atol=1e-3)     # 4 cells a side
+    one = H._cell("bcc", 4.0, 0.5)
+    bars = 4 * (4 * np.sqrt(3)) * 2 * 0.5 ** 2             # 4 square bars, corner radius 0.5
+    assert 0.75 * bars < one.volume() < bars                # less overlap at the centre and clipped ends
+    fcc = H._cell("fcc", 4.0, 0.5)
+    assert fcc.volume() > one.volume()                      # 12 face diagonals, each half in the cell

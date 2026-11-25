@@ -30,7 +30,7 @@ from . import colors as colormod
 from . import workers
 from .commands import AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, StateCommand
 from .camera import CameraPanel
-from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowDialog, drill_part_at, hole_axis_world,
+from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowDialog, drill_part_keep, hole_axis_world,
                         hole_preview_mesh)
 from .jobpanel import JobPanel
 from .memory import MemoryMonitor, StatusBar, trim_memory_soon
@@ -784,7 +784,10 @@ class MainWindow(QMainWindow):
             self._replace_mesh(pid, mesh, "Hollow")
             self.log_msg(f"Hollowed {name}: {r.cavities} cavit{'y' if r.cavities == 1 else 'ies'}, "
                          f"volume {r.original_volume:.1f} → {mesh.volume * float(np.prod(np.abs(self.scene.get(pid).scale))):.1f} mm³. "
-                         "Add drain holes (Ctrl+Shift+D) so resin can escape.")
+                         + (f"{r.pillars} pillar{'' if r.pillars == 1 else 's'} hold up the cavity's ceilings. "
+                            if r.pillars else "")
+                         + ("The floor is open. " if hs.hollow_type == "open_bottom" else
+                            "Add drain holes (Ctrl+Shift+D) so resin can escape."))
             self.statusBar().showMessage("Hollowed — add drain holes", 8000)
             self.hollowFinished.emit(True)
 
@@ -833,7 +836,7 @@ class MainWindow(QMainWindow):
         if p is None:
             return
         s, direction = getattr(self, "_hole_settings", None) or DrainHoleDialog(self.settings).value()
-        self._hole_queue.append((pid, np.asarray(hit, float), hole_axis_world(p, face, direction), s))
+        self._hole_queue.append((pid, np.asarray(hit, float), hole_axis_world(p, face, direction, s.direction), s))
         self._drill_next()
 
     def drilling(self) -> bool:
@@ -858,17 +861,23 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Drilling a drain hole in {name}…" + (f" ({left} more waiting)" if left else ""))
 
         def work():
-            mesh = drill_part_at(snap, hit, axis, s)
-            return mesh, meshmod.analyze(mesh)
+            mesh, pin = drill_part_keep(snap, hit, axis, s)
+            return mesh, meshmod.analyze(mesh), pin
 
         def done(res):
             self._drilling = False
-            mesh, rep = res
+            mesh, rep, pin = res
             now = self.scene.get(pid)
             if now is not None and now.mesh is src:         # not undone or changed meanwhile
-                self._replace_mesh(pid, mesh, "Drain hole", report=rep)
-                self.log_msg(f"Drain hole in {name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
-                             f"Ø{2 * s.radius1:.1f} mm")
+                kind = "Slot" if s.hole_form == "slot" else "Drain hole"
+                if pin is not None:
+                    self.undo.beginMacro(kind)
+                self._replace_mesh(pid, mesh, kind, report=rep)
+                if pin is not None:
+                    self._add_pin(name, pin)
+                    self.undo.endMacro()
+                self.log_msg(f"{kind} in {name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
+                             f"Ø{2 * s.radius1:.1f} mm" + (", pin kept as a new part" if pin is not None else ""))
                 self.viewport.repick_hole()                 # the surface under the cursor changed
             self._drill_finished()
 
@@ -877,6 +886,15 @@ class MainWindow(QMainWindow):
             self.log_msg(f"Drain hole failed: {msg.splitlines()[0]}")
             self._drill_finished()
         workers.submit(work, on_done=done, on_failed=failed)
+
+    def _add_pin(self, name: str, pin) -> None:
+        """A drain hole's kept plug as a new part, set down on the plate beside the others (an
+        undoable add)."""
+        part = Part.from_mesh(f"{name} pin", pin)
+        self.scene.drop_to_plate(part)
+        self.scene.place_free(part)
+        self.reports[id(part.mesh)] = meshmod.analyze(part.mesh)
+        self.undo.push(AddPartsCommand(self, [part], "Add hole pin"))
 
     def _drill_finished(self) -> None:
         if self._hole_queue:

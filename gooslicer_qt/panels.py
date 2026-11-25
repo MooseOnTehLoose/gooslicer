@@ -275,6 +275,8 @@ class PropertiesPanel(QWidget):
         grid = QGridLayout(self.transform)
         grid.setContentsMargins(0, 0, 0, 0)
         self.pos = [_spin(-1000, 1000) for _ in AXES]
+        self.pos[2].setToolTip("Height of the part's centre. Without supports, raising it lifts the part "
+                               "off the plate; it can't go below the plate.")
         self.size = [_spin(0.01, 2000) for _ in AXES]
         self.scale = [_spin(0.1, 10000, 1, " %", 5) for _ in AXES]
         for c, a in enumerate(AXES):
@@ -400,7 +402,12 @@ class PropertiesPanel(QWidget):
 
     def _set_pos(self, i, v):
         def f(p):
-            p.position[i] = v
+            if i == 2 and p.supports is None:
+                # Z of a bare part is its lift off the plate (never below it)
+                p.elevation = max(0.0, p.elevation + v - p.position[2])
+                self.win.scene.drop_to_plate(p)
+            else:
+                p.position[i] = v
         self._edit(f"Move {AXES[i]}", f)
 
     def _local_axis(self, p, i):

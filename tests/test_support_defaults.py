@@ -103,3 +103,18 @@ def test_real_templates_and_arc_sample():
                for i in (9, 10)]
         n_raft = round(rec.raft["platHeight"] / g.header.layer_height)
         assert n_raft == 10 and lit[0] > 5 * lit[1]   # layer 9 is raft, layer 10 is pillars
+
+
+def test_template_order_ignores_case_and_first_match_wins(tmp_path):
+    """06 §4: SatelLite lists templates by name ignoring case (QDir's default sort), and the
+    first one carrying the height bucket's tag wins."""
+    for n in ("b_30-60mm", "A_30-60mm", "c_0-30mm"):
+        template(tmp_path / f"{n}.satsup", n)
+    ts = SD.load_templates(tmp_path)
+    assert [t.name for t in ts] == ["A_30-60mm", "b_30-60mm", "c_0-30mm"]
+    assert SD.recommended_template(ts, 45).name == "A_30-60mm"
+    for n in ("a_0-30mm", "B_0-30mm"):
+        template(tmp_path / f"{n}.satsup", n)
+    ts = SD.load_templates(tmp_path)
+    assert [t.name for t in ts][:2] == ["a_0-30mm", "A_30-60mm"]            # not "A…", "B…", "a…"
+    assert SD.recommended_template(ts, 10).name == "a_0-30mm"

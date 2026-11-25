@@ -125,7 +125,10 @@ Moving was dragging on the plate plus number fields, and rotation already has ri
 - X and Y arrows start at the selection's bottom centre, on the plate, and point along world +X and +Y. Each is 0.55 × the selection's bounding-box diagonal long (the ring radius; at least 4 mm), with a cone tip.
 - Dragging an arrow moves along that axis only. The amount is where the mouse ray meets the vertical plane through the axis that faces the camera most, projected onto the axis.
 - Steps: free (0.01 mm). With Ctrl held, whole millimetres from where the drag started.
-- **No Z arrow.** Parts always rest on the plate or at their support lift height (`Part.elevation`), which Auto-support sets. A Z handle would be undone by the drop.
+- **Z arrow** (2026-11-25): shown only when none of the selected parts has supports, since supports set their height. Dragging it sets `Part.elevation`, the bottom's height above the plate, so the lift lasts through the drop that follows every rotate, scale or lay-flat. It never goes below the plate: the drag stops when the lowest selected part reaches it. The label reads "Z +8.00 mm (lift 8.00)".
+  - `PartState` carries the elevation, so undo, Esc and the transform commands restore it with the placement.
+  - The Mesh panel's Z position field does the same for a bare part: the new centre height becomes a lift (at least 0), then the part is dropped to it. For a part with supports it still sets the position directly.
+  - Auto-support or a support edit replaces the lift with the template's lift height; Clear supports sets it to 0.
 
 **Scale handles**
 - **One part selected:** three cube handles on lines from the part's bounding-box centre, along the part's **own** X, Y and Z axes (turned with it), just past its surface. `Part.scale` is per local axis, so scaling along world axes would shear a rotated part.
@@ -161,4 +164,4 @@ Moving was dragging on the plate plus number fields, and rotation already has ri
 ## 10. Open items
 - **SatelLite projects:** reading is done (10). Writing `.goo.3mf` for SatelLite to open is still open (10 §7).
 - **Translations:** dropped from P7 (decided 2026-11-24). Strings stay plain English; adding `tr()` later is a mechanical pass.
-- **Z placement:** a way to lift a bare part off the plate, if ever needed, would come with a Z arrow.
+- ~~Z placement~~: done (2026-11-25), the Z arrow (§8).
