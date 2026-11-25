@@ -667,3 +667,32 @@ def test_drain_hole_panel_and_preview(app, win, tmp_path):
     f.radius_lock.click()
     assert f.radii_linked and f.r2.value() == f.r1.value() == 3.0
     win.viewport.stop_hole_mode()
+
+
+def test_support_mode_click_and_drag(app, win, tmp_path):
+    """Support mode: a press becomes a click on release, or a drag that shows where the
+    contact will go; Ctrl+press removes at once (08 §6)."""
+    assert wait_import(app, win, [box_file(tmp_path, (16, 8, 6))]) == 1
+    vp = win.viewport
+    vp.set_view(-90, 89)
+    clicks, drags = [], []
+    vp.supportClicked.connect(lambda o, d, r: clicks.append(r))
+    vp.supportDragged.connect(lambda *a: drags.append(a))
+    vp.supportClicked.disconnect(win._support_click)
+    vp.supportDragged.disconnect(win._support_drag)
+    vp.start_support_mode()
+    a, b = project(vp, [-4, 0, 6]), project(vp, [4, 0, 6])
+    mouse(vp, QEvent.MouseButtonPress, a)
+    mouse(vp, QEvent.MouseButtonRelease, a)
+    assert clicks == [False] and drags == []
+    mouse(vp, QEvent.MouseButtonPress, a)
+    for k in range(1, 6):
+        mouse(vp, QEvent.MouseMove, a + (b - a) * (k / 5), buttons=Qt.LeftButton, button=Qt.NoButton)
+    assert vp.support_drag_marker is not None and vp.support_drag_marker[0] == pytest.approx(4, abs=0.3)
+    mouse(vp, QEvent.MouseButtonRelease, b)
+    assert len(drags) == 1 and clicks == [False] and vp.support_drag_marker is None
+    mouse(vp, QEvent.MouseButtonPress, a, mods=Qt.ControlModifier)
+    assert clicks == [False, True]
+    mouse(vp, QEvent.MouseButtonRelease, a, mods=Qt.ControlModifier)
+    assert clicks == [False, True] and len(drags) == 1
+    vp.stop_support_mode()

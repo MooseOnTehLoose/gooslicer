@@ -202,12 +202,18 @@ def hollow(mesh: trimesh.Trimesh, s: HollowSettings | None = None) -> HollowResu
         if s.hollow_type == "open_bottom":
             field = _open_bottom(field, p)
         cavity = _filter_cavities(level_surface(field, g, 0.0), s, p)
+        if s.infill and s.hollow_type == "inside":
+            cavity = cavity - lattice(cavity.bounding_box(), s)
         result = body - cavity
     elif s.hollow_type == "outside":
         cavity = body
-        result = level_surface(sd, g, -t) - body
+        if s.infill:
+            cavity = cavity - lattice(cavity.bounding_box(), s)
+        result = level_surface(sd, g, -t) - cavity
     elif s.hollow_type == "center":
         cavity = _filter_cavities(level_surface(sd, g, t / 2), s, p)
+        if s.infill:
+            cavity = cavity - lattice(cavity.bounding_box(), s)
         result = level_surface(sd, g, -t / 2) - cavity
     else:
         raise HollowError(f"unknown hollow type {s.hollow_type!r}")
@@ -216,6 +222,75 @@ def hollow(mesh: trimesh.Trimesh, s: HollowSettings | None = None) -> HollowResu
         raise HollowError("hollowing removed the whole part (wall thickness too large?)")
     return HollowResult(to_trimesh(result), n, vol0 - result.volume() if s.hollow_type != "outside"
                         else -(result.volume()), vol0)
+
+
+def _cell(kind: str, a: float, r: float, segs: int = 8) -> m3.Manifold:
+    """One lattice cell, [0, a]³, owning only what no neighbour also has, so tiled copies
+    overlap only where struts meet: BCC is the body centre joined to the eight corners; FCC is
+    the two diagonals of the three faces through the origin. A ball at each owned node rounds
+    the joints."""
+    def strut(p, q):
+        p, q = np.asarray(p, float), np.asarray(q, float)
+        d = q - p
+        L = float(np.linalg.norm(d))
+        c = m3.Manifold.cylinder(L, r, r, segs)
+        z = np.array([0.0, 0, 1])
+        v = np.cross(z, d / L)
+        s_, cth = float(np.linalg.norm(v)), float(np.dot(z, d / L))
+        if s_ < 1e-12:
+            R = np.eye(3) if cth > 0 else np.diag([1.0, -1, -1])
+        else:
+            k = v / s_
+            K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+            R = np.eye(3) + s_ * K + (1 - cth) * K @ K
+        return c.transform(np.c_[R, p].tolist())
+
+    def ball(p):
+        return m3.Manifold.sphere(r, segs).translate(tuple(float(x) for x in p))
+
+    h = a / 2
+    corners = [(i * a, j * a, k * a) for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+    if kind == "bcc":
+        parts = [strut((h, h, h), c) for c in corners] + [ball((h, h, h)), ball((0, 0, 0))]
+    else:
+        faces = [((0, 0, 0), (0, a, a), (0, a, 0), (0, 0, a)),          # x = 0
+                 ((0, 0, 0), (a, 0, a), (a, 0, 0), (0, 0, a)),          # y = 0
+                 ((0, 0, 0), (a, a, 0), (a, 0, 0), (0, a, 0))]          # z = 0
+        parts = [ball((0, 0, 0))]
+        for p0, p1, q0, q1 in faces:
+            parts += [strut(p0, p1), strut(q0, q1), ball(np.add(p0, p1) / 2)]
+    return m3.Manifold.batch_boolean(parts, m3.OpType.Add)
+
+
+def _tile(cell: m3.Manifold, a: float, counts) -> m3.Manifold:
+    """`counts` copies of a cell along x, y, z, built by doubling: log2(n) unions per axis."""
+    out = cell
+    for axis, n in enumerate(counts):
+        block, size, acc, off = out, 1, None, 0
+        while n:
+            if n & 1:
+                piece = block.translate(tuple(off * a if i == axis else 0.0 for i in range(3)))
+                acc = piece if acc is None else acc + piece
+                off += size
+            n >>= 1
+            if n:
+                block = block + block.translate(tuple(size * a if i == axis else 0.0 for i in range(3)))
+                size *= 2
+        out = acc
+    return out
+
+
+def lattice(bounds, s: HollowSettings) -> m3.Manifold:
+    """SatelLite's infill lattice (07 §2b) over a box ((x0, y0, z0, x1, y1, z1) or lo, hi): cells of
+    `infill_size` on a grid anchored at the origin, struts of `infill_radius`, one cell of slack
+    on every side so the struts run on into the walls."""
+    b = np.asarray(bounds, float).reshape(2, 3)
+    a = float(s.infill_size)
+    lo = np.floor(b[0] / a) * a - a
+    counts = (np.ceil((b[1] - lo) / a).astype(int) + 1).tolist()
+    if np.prod(counts) > 400_000:
+        raise HollowError(f"the infill would need {np.prod(counts):,} cells; use a larger cell size")
+    return _tile(_cell(s.infill_type, a, float(s.infill_radius)), a, counts).translate(tuple(lo.tolist()))
 
 
 def _open_bottom(field: np.ndarray, pitch: float) -> np.ndarray:
@@ -290,10 +365,16 @@ def drill(mesh: trimesh.Trimesh, holes: list[DrainHole]) -> trimesh.Trimesh:
 
 
 # --------------------------------------------------------------------------- sealed cavities
+SEALED, CUP = "sealed", "cup"
+CUP_MIN_AREA = 10.0            # mm²: smaller pockets (engraved text, pits) pull too little to matter
+
+
 @dataclass
 class Cavity:
     volume: float                     # mm³
     lowest: tuple[float, float, float]  # world point near the cavity's bottom (drain hole hint)
+    kind: str = SEALED                # SEALED, or CUP: open only upward, toward the film
+    area: float = 0.0                 # cups: largest cross-section, mm² (what the film pulls on)
 
 
 REFINE_FACTOR = 4              # a candidate cavity is re-checked at pitch / REFINE_FACTOR …
@@ -340,7 +421,44 @@ def _opens_out(meshes, g: Grid, lab: np.ndarray, i: int, outside: np.ndarray) ->
     return bool(np.isin(seeds, out[out > 0]).any())
 
 
-def _cavity_labels(meshes, pitch, min_volume):
+def _cups(occ: np.ndarray, lab: np.ndarray, outside: np.ndarray, g: Grid, min_volume: float,
+          min_area: float):
+    """Suction cups (07 §5): empty space that each layer encloses on every side, that is closed
+    below (by the part or the plate) and reaches the outside only upward. Printing it, the film
+    closes the cup's mouth, so each lift pulls on the resin inside. Sealed cavities are left to
+    _cavity_labels. Returns (labels of the held voxels, [(label, Cavity)])."""
+    empty = ~occ
+    held = np.zeros_like(occ)
+    for k in range(occ.shape[2]):
+        l2, n2 = ndimage.label(empty[:, :, k])
+        if n2:
+            edge = np.unique(np.concatenate([l2[0], l2[-1], l2[:, 0], l2[:, -1]]))
+            held[:, :, k] = (l2 > 0) & ~np.isin(l2, edge)
+    held &= np.isin(lab, outside)
+    if not held.any():
+        return None, []
+    cl, n = ndimage.label(held)
+    free = empty & ~held                                 # empty space open to the side
+    free[:, :, g.origin[2] + np.arange(occ.shape[2]) * g.pitch < g.pitch / 2] = False    # the plate
+    below = np.zeros_like(held)
+    below[:, :, 1:] = free[:, :, :-1]
+    drains = np.unique(cl[held & below])
+    v, a = g.pitch ** 3, g.pitch ** 2
+    sizes = ndimage.sum_labels(held, cl, np.arange(1, n + 1))
+    out = []
+    for i in range(1, n + 1):
+        if i in drains or sizes[i - 1] * v < min_volume:
+            continue
+        idx = np.argwhere(cl == i)
+        area = float(np.bincount(idx[:, 2]).max() * a)
+        if area < min_area:
+            continue
+        bot = idx[idx[:, 2].argmin()]
+        out.append((i, Cavity(float(sizes[i - 1] * v), tuple((g.origin + bot * g.pitch).tolist()), CUP, area)))
+    return cl, out
+
+
+def _cavity_labels(meshes, pitch, min_volume, cups: bool = False):
     lo = np.min([m.bounds[0] for m in meshes], axis=0)
     hi = np.max([m.bounds[1] for m in meshes], axis=0)
     if pitch is None:
@@ -366,25 +484,32 @@ def _cavity_labels(meshes, pitch, min_volume):
         bot = idx[idx[:, 2].argmin()]
         out.append((i, Cavity(float(sizes[i - 1] * v), tuple((g.origin + bot * pitch).tolist()))))
     out.sort(key=lambda x: -x[1].volume)
+    if cups:
+        cl, found = _cups(occ, lab, outside, g, min_volume, CUP_MIN_AREA)
+        if found:                     # cup voxels get labels after every empty-space label
+            lab = lab.copy()
+            lab[cl > 0] = cl[cl > 0] + n
+            found.sort(key=lambda x: -x[1].area)
+            out += [(i + n, c) for i, c in found]
     return g, lab, out
 
 
 def sealed_cavities(meshes: list[trimesh.Trimesh], pitch: float | None = None,
-                    min_volume: float = 1.0) -> list[Cavity]:
+                    min_volume: float = 1.0, cups: bool = False) -> list[Cavity]:
     """Enclosed voids that resin cannot drain from: empty-space components of the voxelised
     union that do not reach the grid border (6-connectivity). Openings narrower than about
     two voxels close up at that pitch (≤ 0.5 mm by default), so each candidate is confirmed at
     a quarter of the pitch in a window around it (_opens_out)."""
     if not meshes:
         return []
-    return [c for _, c in _cavity_labels(meshes, pitch, min_volume)[2]]
+    return [c for _, c in _cavity_labels(meshes, pitch, min_volume, cups)[2]]
 
 
 def cavity_faces(meshes: list[trimesh.Trimesh], pitch: float | None = None,
-                 min_volume: float = 1.0) -> tuple[list[Cavity], list[np.ndarray]]:
+                 min_volume: float = 1.0, cups: bool = False) -> tuple[list[Cavity], list[np.ndarray]]:
     """sealed_cavities, plus for each mesh a mask of the faces that line a sealed cavity: a
     point just off the face, on its outward (empty) side, lies in the cavity's voxels."""
-    cav, each = cavity_faces_each(meshes, pitch, min_volume)
+    cav, each = cavity_faces_each(meshes, pitch, min_volume, cups)
     masks = [np.zeros(len(m.faces), bool) for m in meshes]
     for per_mesh in each:
         for mask, hit in zip(masks, per_mesh):
@@ -393,11 +518,11 @@ def cavity_faces(meshes: list[trimesh.Trimesh], pitch: float | None = None,
 
 
 def cavity_faces_each(meshes: list[trimesh.Trimesh], pitch: float | None = None,
-                      min_volume: float = 1.0) -> tuple[list[Cavity], list[list[np.ndarray]]]:
+                      min_volume: float = 1.0, cups: bool = False) -> tuple[list[Cavity], list[list[np.ndarray]]]:
     """cavity_faces for each cavity on its own: [cavity][mesh] face masks."""
     if not meshes:
         return [], []
-    g, lab, found = _cavity_labels(meshes, pitch, min_volume)
+    g, lab, found = _cavity_labels(meshes, pitch, min_volume, cups)
     cav = [c for _, c in found]
     shape = np.array(g.shape)
     got_all = []

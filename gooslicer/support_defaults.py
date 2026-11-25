@@ -130,6 +130,7 @@ def recommended_template(templates: list[SupportTemplate], max_height: float,
 
 # --------------------------------------------------------------------------- hollowing
 HOLLOW_TYPES = ("inside", "outside", "center", "open_bottom")   # combo order [OBSERVED]
+INFILL_TYPES = ("bcc", "fcc")
 
 
 @dataclass
@@ -143,6 +144,12 @@ class HollowSettings:
     small_shell_size: float = 0.1   # /Hollowing/filterSmallShell, range 0.001–5e9 (volume unit)
     filter_by: str = "cavity_number"    # /Hollowing/filter_type 0 = number, 1 = volume
     max_cavities: int = 1           # /Hollowing/cavity_number, range 1–9999
+    # Infill lattice: SatelLite's Hollow dialog with "Infill structure" ticked [OBSERVED
+    # DialogInfill::setUI, EleTriInfill.dll; no ini keys found]. Not offered for Open Bottom.
+    infill: bool = False            # "Infill structure" (useHatch), off
+    infill_type: str = "bcc"        # "Fill Structure Type": BCC or FCC
+    infill_size: float = 4.0        # mm, "Fill Structure Dimensions": the lattice cell
+    infill_radius: float = 1.0      # mm, "Support Radius": the strut radius
 
     def validate(self) -> list[str]:
         errs = []
@@ -156,6 +163,13 @@ class HollowSettings:
             errs.append("surface angle must be 5–85°")
         if not 1 <= self.max_cavities <= 9999:
             errs.append("maximum cavity number must be 1–9999")
+        if self.infill:
+            if self.infill_type not in INFILL_TYPES:
+                errs.append(f"unknown infill type {self.infill_type!r}")
+            if self.infill_radius <= 0 or self.infill_size <= 0:
+                errs.append("infill cell size and strut radius must be positive")
+            elif self.infill_radius * 4 > self.infill_size:
+                errs.append("infill struts must be thinner than a quarter of the cell size")
         return errs
 
 

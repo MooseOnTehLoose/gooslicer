@@ -102,6 +102,7 @@ SatelLite's template files come from the user's own install: GooSlicer copies th
 | `/Hollowing/cavity_number` | 1 | "Maximum cavity number", 1–9999 |
 
 - The filter widgets are hidden unless the license tier is 3. On the free tier they are not offered.
+- The Infill dialog (`DialogInfill`, EleTriInfill.dll) adds its own fields, with no ini keys: Infill structure off, BCC / FCC, cell 4 mm, strut radius 1 mm (07 §2b).
 - **Correction to 04-desktop-app-plan.md:** no "accuracy ≤ thickness/2" rule was found. `set_AccuracyValue` is an empty stub (it is COMDAT-folded with the Shell and Surface2Solid dialogs). Whether the hollowing kernel (`HollowImp`, EleTriStructure) constrains accuracy is **[UNKNOWN]**.
 
 ### Structure page [OBSERVED EleTriStructure FUN_1800064a0]

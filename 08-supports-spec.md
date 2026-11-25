@@ -16,11 +16,14 @@ Status: the **EVO** structure (script type 7), the **Tree** structure (script ty
 
 ## 2. Contact detection [GOOSLICER rules, SatelLite parameter names]
 1. **Overhangs:** a face needs support when its tilt from horizontal is below `criticalAngle`: `-n_z > cos(criticalAngle)`. Those faces are sampled densely, then thinned by greedy Poisson-disk selection at `anchorDis`, lowest points first.
+   - **Border inset** (2026-11-24): samples nearer the edge of their overhang region than `borderOffset` are dropped. A region is a connected set of overhang faces; its edge is where it meets other faces, or an open mesh edge. On a region narrower than that, the limit is a quarter of the region's depth (the largest edge distance of its samples), so narrow strips keep contacts near their middle.
+   - The quarter is fitted to SatelLite's arc project **[SAMPLE, 10 §5]**, whose 430 overhang points (anchorDis 2, borderOffset 0.5) have edge distances binned at 0 / 0.1 / 0.3 / 0.45 / 0.55 / 0.7 / 1 mm as 124 / 164 / 66 / 21 / 23 / 22 / 10. With 0.1 mm sampling this rule gives 421 points binned 161 / 144 / 52 / 20 / 21 / 16 / 7. Without it, there are 474 points and 287 sit within 0.1 mm of an edge. A full 0.5 mm inset gives 317 and too few in the middle bins. The rule itself is **[GOOSLICER]**.
+   - On arc (EVO defaults) this took auto-support from 315 pillars, 106 rejected to 304 pillars, 94 rejected, still with no islands.
 2. **Lowest points** (`bReinforceLowestPts`): vertices with no lower neighbour and a downward vertex normal (`n_z ≤ −0.3`), thinned at `lowestPtsInterval`.
 3. **Dedupe** at half the smaller spacing. Priority: manual, then lowest/island, then overhang.
 4. **Islands** (§5) add contacts after the first build.
 
-Not used yet: `anchorDisBorder`, `borderOffset` (no separate border pass).
+Not used yet: `anchorDisBorder`. A row of contacts along the inset line at that spacing was tried and dropped: on arc it left only 2 of 415 points more than 0.55 mm in, against SatelLite's 55 of 430. The arc project has `anchorDisBorder` equal to `anchorDis`, so it cannot show what the setting does.
 
 ## 3. Structure (EVO)
 Per contact:
@@ -59,7 +62,7 @@ Per contact:
 
 ## 6. Editing and storage
 - `SupportPlan` stores params and contacts in the **part's local frame**, so supports follow moves, rotations and scaling. Geometry is rebuilt from the plan in a background cache.
-- Supports → Edit (S): click on the model to add a manual contact (`contact_below` finds the underside); Ctrl+click on a support to remove it (`nearest_pillar`, 1.5 mm pick radius). Every change is one undo step.
+- Supports → Edit (S): click on the model to add a manual contact (`contact_below` finds the underside); Ctrl+click on a support to remove it (`nearest_pillar`, 1.5 mm pick radius). Drag a support to move its contact: the press waits for the release, so a press that moves more than 4 px is a drag. An orange ring shows the drop point on the model, and the contact moves there, as a manual contact, only when it is dropped on the same part. A drag that doesn't start on a support does nothing. On imported SatelLite supports, the contact is found as for removal (the nearest contact above the press, within 2.5 mm). Every change is one undo step.
 - Clear supports removes the plan and drops the part back to the plate.
 - Slicing and "Slice and send" slice each part's support mesh together with the model; overlaps fill as one (non-zero rule).
 
@@ -91,18 +94,24 @@ SatelLite's tree builder was not decompiled. GooSlicer uses its own layout drive
 | `botConnect.topWidth` / `tipLength` / `distanceInPart` | 0.5 / 3 / 0.1 | same | same | `bot_top_width` / `bot_tip_length` / `bot_in_part` |
 | `tree.trunk.topWidth` / `botWidth` | 1.2 / 1.2 | same | same | `pillar_top_width` / `pillar_bottom_width` |
 | `tree.brunch.topWidth` / `botWidth` | 1.2 / 1.2 | same | same | `tip_bottom_width` / `branch_width` |
-| `tree.trunk.maxBranchAngle` / `maxHeight` | 45 / 5 | same | same | `max_branch_angle` / `max_branch_height` |
+| `tree.trunk.maxBranchAngle` / `maxHeight` / `heightType` | 45 / 5 / 0 | same | same | `max_branch_angle` / `max_branch_height` / `tree_height_type` |
 | `tree.polyEdgeNum` | 12 | 12 | 12 | `poly_edges` |
 | `cross.hasCrossConnect` / `startHeight` / `corssInterval` / `barWidth` / `barAngle` | yes / 3 / 5 / 0.3 / 45 | same | same | `cross*` |
 | raft `platOffset` (other raft keys as EVO) | 2 | 3 | 3 | `raft_offset` |
 
-Unused, roles **[UNKNOWN]**: `tree.brunch.maxBrunchNum` (1), `tree.ribsNum` (2), `tree.thickness` (0), `trunk.heightType` (0), `cross.crossType` (1), `cross.connectType` (0), `locateSurfaceType` (0), the `filter.*` keys, and the `breakPoint.*` keys (`hasBreakPoint` is off).
+Unused, roles **[UNKNOWN]**: `tree.brunch.maxBrunchNum` (1), `tree.ribsNum` (2), `tree.thickness` (0), `cross.crossType` (1), `cross.connectType` (0), `locateSurfaceType` (0), the `filter.*` keys, and the `breakPoint.*` keys (`hasBreakPoint` is off).
 
 ### Layout
 1. **Tips:** contacts, tip direction, collision tests and the straight-drop test are the EVO ones (§2–3). The tip widens from `topWidth` to the branch width (`tip_bottom_width` = `brunch.topWidth`; the Tree templates have no tip `bottomWidth`). Contacts whose drop lands on the model keep an EVO-style pillar, with a `botConnect.tipLength` cone.
 2. **Merging:** tip ends that drop to the raft are merged pairwise, highest meeting point first (a priority queue).
-   - Two nodes meet at the highest point both can reach going down at most `maxBranchAngle` from vertical. When the higher node can reach the lower one's column above it, they join at the lower node.
-   - `maxHeight` is read as **the longest drop of one branch** **[GOOSLICER interpretation]**: a merge is refused when either branch would drop more than 5 mm. Merged joints can merge again, so trees grow several levels.
+   - Two nodes meet at the highest point both can reach going down at the branch slope. When the higher node can reach the lower one's column above it, they join at the lower node. Merged joints can merge again, so trees grow several levels.
+   - The slope and height come from `trunk.heightType` **[DECOMPILED: EleTriBuilder.dll `FUN_18001e680`; the settings record is `SUPPORTVARIABLESBAR`, registered in EleTriBuilderBase `SUPPORTVARIABLESBAR::initialze`, where `heightType` is offset 0x104, `maxHeight` 0x100 and `maxBranchAngle` 0x108]**. The function places a group's joint below the mean XY of its points, at the lowest height that each point reaches with a cone:
+     - type 0 (every template): 45° from horizontal (`z − r`), no height limit;
+     - type 1: 30° from horizontal (`z − r·tan 30°`), then capped at `maxHeight` above the raft. Only here is `maxHeight` read;
+     - type 2: `maxBranchAngle` from horizontal (`z − r·tan a`).
+     A joint below the raft goes to the raft.
+   - So with the templates' type 0, `maxHeight` and `maxBranchAngle` have no effect. GooSlicer's former reading (a 5 mm limit on each branch's drop) was wrong and has been removed. On arc with Tree_Medium the tree now has 28 trunks instead of 42; the longest branch drops 42.8 mm.
+   - GooSlicer merges pairs, not whole groups, so its joints are not exactly SatelLite's **[GOOSLICER]**.
    - A merge is also refused when a branch passes through the model or comes closer than branch radius + 0.1 mm to it, when the joint is under 1 mm above the raft, or when the joint's trunk cannot drop to the raft with trunk radius + 0.1 mm clearance.
 3. **Trunks:** every remaining node drops vertically to the raft as a `trunk` pillar, with an optional plate connection.
 4. **Cross braces:** an X of `barWidth` rods at `barAngle` between neighbouring trunks (MST of Delaunay neighbours up to 10 mm apart, GooSlicer), the first at `startHeight` above the raft, then every `crossInterval`, up to 0.3 mm under the lower trunk top.
@@ -133,11 +142,20 @@ The Auto Position button (Models → Properties, below Lay flat) turns the selec
 - **Search:** 300 directions spread over the sphere, then 40 within 12° of each of the 4 best. Scores within 1 % are a tie, and ties go to the smallest turn.
 - **When it turns:** only for at least 3 % fewer contacts; otherwise the Log says the part is already at a good angle. The part keeps its centre on the plate and is dropped to it (or to its support lift height).
 - **Examples:** a 40 × 40 × 2 mm plate tilts about 50° (520 → 15 contacts). A cylinder lying on its side stands up (77 → 15). A sphere or an upright cup stays as it is. The arc sample tilts 14° (214 → 200). Lisa_head_C turns about 100° (129 → 97) in about 6 s.
-- **Not considered:** where support marks land on visible surfaces, and suction cups (hollow cups facing the film). Check the result before supporting.
+- **Not considered:** where support marks land on visible surfaces, and suction cups (hollow cups facing the film; the trapped-resin check finds them, 07 §4b). Check the result before supporting.
 
 ## 10. Open items
-- Tree: check the `maxHeight` interpretation against SatelLite, by a runtime capture or by decompiling `EleTriBuilder`. The other reading is "trunks at most 5 mm tall, everything above is branches", which would give far fewer, larger trees.
-- Border pass (`anchorDisBorder`, `borderOffset`).
-- Drag to move an existing contact (add and remove work).
+- Tree grouping. Read so far **[DECOMPILED: EleTriBuilder.dll]**:
+  - `FUN_18001ce20` seeds a group with one point, then adds the nearest unused points (k-d tree) while the group has fewer than `maxBrunchNum` members.
+  - `FUN_18001ecd0` tries to attach a point to existing groups, nearest centroid first.
+  - Both go through `FUN_18001d750`, which accepts a point when:
+    - the group, with the point added, still has its joint at least 1 mm up;
+    - no member's branch to the joint, and not the new point's branch, hits the model;
+    - the group is not already at `maxBrunchNum`. A full group can swap its farthest member for a closer point, but only in the seeding pass.
+  - The joint is placed below the new centroid, as in §8. One difference: when a point is added, height type 1 uses 45°, not 30°.
+  - No grouping radius applies, because every caller passes −1.
+  - **[UNKNOWN]** All three Tree templates set `maxBrunchNum` to 1. Read literally, that would stop every group at one member, meaning no merging at all. Either the builder's record is not `SUPPORTVARIABLESBAR` as assumed (fields 0xec/0x104/0x100/0x108 copied to builder +0x30…+0x3c by the code at 0x1800e3342), or SatelLite's trees really never merge.
+  - Settling this needs a SatelLite project sliced with a Tree template. GooSlicer keeps merging nearest pairs, highest joint first, until a sample decides it.
+- `anchorDisBorder`: needs a SatelLite project where it differs from `anchorDis`.
 - 106 rejected contacts on arc (EVO, 30° cap; 96 with the old 45° blend; 84 with tree values; no islands left in either case): mostly points with no clear tip path or a downward surface below. Worth checking that none leave an area unsupported (the island check passes today).
 - On SatelLite's own supported points (10 §5), GooSlicer's checks reject 1 of 370. So the arc rejections above are mostly points SatelLite wouldn't support either; SatelLite left 130 of its 500 detected points unsupported.

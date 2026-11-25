@@ -144,3 +144,76 @@ def test_hole_preview_mesh_matches_the_cut():
     assert np.isclose(m.volume, np.pi * h / 3 * (4 + 2 + 1), rtol=0.01)   # cone frustum
     lo, hi = m.bounds
     assert np.isclose(hi[0], hit[0] + 1) and np.isclose(lo[0], hit[0] - 4)  # 1 out, 4 in (axis -X)
+
+
+def _cup(lift=0.0, upside_down=False, drain=0.0, r=8.0):
+    """A cylinder cup, 2 mm walls and floor, 12 mm tall."""
+    outer = trimesh.creation.cylinder(radius=r + 2, height=12, sections=48)
+    inner = trimesh.creation.cylinder(radius=r, height=12, sections=48)
+    inner.apply_translation([0, 0, 2])
+    m = H.to_manifold(outer) - H.to_manifold(inner)
+    if drain:
+        m = m - H.to_manifold(trimesh.creation.cylinder(radius=drain, height=30, sections=24))
+    m = H.to_trimesh(m)
+    if upside_down:
+        m.apply_transform(trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0]))
+    m.apply_translation([0, 0, lift - m.bounds[0][2]])
+    return m
+
+
+@pytest.mark.parametrize("pose, cups", [
+    (dict(), 1),                                   # upright on the plate
+    (dict(lift=5), 1),                             # upright on supports
+    (dict(lift=5, drain=1.0), 0),                  # a drain hole in the floor empties it
+    (dict(lift=5, upside_down=True), 0),           # opens downward: resin runs out
+    (dict(upside_down=True), 1),                   # rim down on the plate: closed by the plate
+    (dict(lift=5, r=1.5), 0),                      # a pit too small to pull on the print
+])
+def test_suction_cups(pose, cups):
+    """07 §5: a pocket closed on every side but the top (toward the film) is a suction cup."""
+    found = H.sealed_cavities([_cup(**pose)], cups=True)
+    assert [c.kind for c in found] == [H.CUP] * cups
+    if cups:
+        assert found[0].area == pytest.approx(np.pi * 64, rel=0.1)
+        assert found[0].volume == pytest.approx(np.pi * 64 * 10, rel=0.1)
+    assert H.sealed_cavities([_cup(**pose)]) == []       # not unless asked for
+
+
+def test_cups_and_sealed_cavities_together():
+    shell = H.to_trimesh(H.to_manifold(trimesh.creation.box((20, 20, 20)))
+                         - H.to_manifold(trimesh.creation.box((14, 14, 14))))
+    shell.apply_translation([30, 0, 15])
+    found = H.sealed_cavities([_cup(lift=5), shell], cups=True)
+    assert sorted(c.kind for c in found) == [H.CUP, H.SEALED]
+    cav, each = H.cavity_faces_each([_cup(lift=5), shell], cups=True)
+    cup = [k for k, c in enumerate(cav) if c.kind == H.CUP][0]
+    assert each[cup][0].any() and not each[cup][1].any()      # the cup's walls are on the cup
+
+
+@pytest.mark.parametrize("kind", ["bcc", "fcc"])
+def test_infill_lattice(kind):
+    """07 §2b: SatelLite's infill fills the cavity with struts that join the walls."""
+    box = trimesh.creation.box((20, 20, 20))
+    plain = H.hollow(box, HollowSettings(thickness=1.5, accuracy=0.5))
+    r = H.hollow(box, HollowSettings(thickness=1.5, accuracy=0.5, infill=True, infill_type=kind))
+    assert r.mesh.is_watertight and r.cavities == 1
+    assert plain.mesh.volume * 1.5 < r.mesh.volume < box.volume * 0.95
+    # the struts are tied into the shell: one solid piece, inner and outer surfaces together
+    assert sum(c.volume() > 0 for c in H.to_manifold(r.mesh).decompose()) == 1   # the other is the void
+    # a cross-section through the middle cuts struts inside the cavity
+    sec = r.mesh.section([0, 0, 1], [0, 0, 1.0])
+    loops = [np.ptp(loop[:, :2], axis=0).max() for loop in sec.discrete]
+    assert sum(x < 10 for x in loops) >= 4                  # strut sections, besides the two walls
+
+
+def test_infill_settings():
+    assert HollowSettings().infill is False                     # off, as in SatelLite
+    d = HollowSettings()
+    assert (d.infill_type, d.infill_size, d.infill_radius) == ("bcc", 4.0, 1.0)
+    assert HollowSettings(infill=True, infill_radius=1.5).validate()
+    assert HollowSettings(infill=True, infill_type="gyroid").validate()
+    # Open bottom ignores it, as SatelLite doesn't offer it there
+    box = trimesh.creation.box((20, 20, 20))
+    a = H.hollow(box, HollowSettings(thickness=1.5, accuracy=0.5, hollow_type="open_bottom"))
+    b = H.hollow(box, HollowSettings(thickness=1.5, accuracy=0.5, hollow_type="open_bottom", infill=True))
+    assert b.mesh.volume == pytest.approx(a.mesh.volume)

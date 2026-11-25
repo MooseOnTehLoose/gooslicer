@@ -10,9 +10,10 @@ from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDialog, Q
                                QVBoxLayout, QWidget)
 
 from gooslicer import hollow as H
-from gooslicer.support_defaults import HOLLOW_TYPES, DrainHoleSettings, HollowSettings
+from gooslicer.support_defaults import HOLLOW_TYPES, INFILL_TYPES, DrainHoleSettings, HollowSettings
 
 TYPE_LABELS = ("Inside", "Outside", "Center", "Open bottom")
+INFILL_LABELS = ("BCC", "FCC")
 DIRECTIONS = (("Along surface normal", "normal"), ("Vertical (from below)", "vertical"))
 
 
@@ -46,6 +47,17 @@ class HollowFields(QWidget):
         self.cavities = QSpinBox()
         self.cavities.setRange(1, 9999)
         self.filter.toggled.connect(self.cavities.setEnabled)
+        self.infill = QCheckBox("Infill structure")
+        self.infill.setToolTip("Fill the cavity with a lattice of struts that brace the walls (SatelLite's "
+                               "infill). Not for Open bottom.")
+        self.infill_type = QComboBox()
+        self.infill_type.addItems(INFILL_LABELS)
+        self.infill_type.setToolTip("BCC: struts from each cell's centre to its corners. FCC: struts "
+                                    "along the diagonals of each cell's faces.")
+        self.infill_size = _dspin(1, 100, d.infill_size, step=1)
+        self.infill_size.setToolTip("Lattice cell size")
+        self.infill_radius = _dspin(0.1, 10, d.infill_radius, step=0.1)
+        self.infill_radius.setToolTip("Strut radius")
         f = QFormLayout(self)
         f.setContentsMargins(0, 0, 0, 0)
         f.addRow("Wall thickness", self.thickness)
@@ -54,11 +66,27 @@ class HollowFields(QWidget):
         f.addRow("Surface angle", self.angle)
         f.addRow(self.filter)
         f.addRow("Maximum cavities", self.cavities)
+        f.addRow(self.infill)
+        f.addRow("Infill type", self.infill_type)
+        f.addRow("Cell size", self.infill_size)
+        f.addRow("Strut radius", self.infill_radius)
         self.load()
-        for w in (self.thickness, self.accuracy, self.angle, self.cavities):
+        for w in (self.thickness, self.accuracy, self.angle, self.cavities, self.infill_size, self.infill_radius):
             w.valueChanged.connect(self.changed)
         self.kind.currentIndexChanged.connect(self.changed)
+        self.infill_type.currentIndexChanged.connect(self.changed)
         self.filter.toggled.connect(self.changed)
+        self.infill.toggled.connect(self.changed)
+        self.infill.toggled.connect(self._infill_enabled)
+        self.kind.currentIndexChanged.connect(self._infill_enabled)
+        self._infill_enabled()
+
+    def _infill_enabled(self, *_):
+        """SatelLite offers infill for every type but Open bottom."""
+        allowed = HOLLOW_TYPES[self.kind.currentIndex()] != "open_bottom"
+        self.infill.setEnabled(allowed)
+        for w in (self.infill_type, self.infill_size, self.infill_radius):
+            w.setEnabled(allowed and self.infill.isChecked())
 
     def load(self) -> None:
         """Show the saved values (SatelLite's defaults where nothing is saved)."""
@@ -70,7 +98,11 @@ class HollowFields(QWidget):
             hollow_type=kind if kind in HOLLOW_TYPES else d.hollow_type,
             surface_angle=v("surfaceAngle", d.surface_angle),
             filter_small_shells=str(self.qs.value("hollow/isFilter", "false")).lower() == "true",
-            max_cavities=v("cavities", d.max_cavities, int)))
+            max_cavities=v("cavities", d.max_cavities, int),
+            infill=str(self.qs.value("hollow/infill", "false")).lower() == "true",
+            infill_type=self.qs.value("hollow/infillType", d.infill_type)
+            if self.qs.value("hollow/infillType", d.infill_type) in INFILL_TYPES else d.infill_type,
+            infill_size=v("infillSize", d.infill_size), infill_radius=v("infillRadius", d.infill_radius)))
 
     def set_value(self, s: HollowSettings) -> None:
         self.blockSignals(True)
@@ -81,6 +113,11 @@ class HollowFields(QWidget):
         self.filter.setChecked(s.filter_small_shells)
         self.cavities.setValue(s.max_cavities)
         self.cavities.setEnabled(s.filter_small_shells)
+        self.infill.setChecked(s.infill)
+        self.infill_type.setCurrentIndex(INFILL_TYPES.index(s.infill_type))
+        self.infill_size.setValue(s.infill_size)
+        self.infill_radius.setValue(s.infill_radius)
+        self._infill_enabled()
         self.blockSignals(False)
 
     def value(self) -> HollowSettings:
@@ -88,13 +125,18 @@ class HollowFields(QWidget):
                               hollow_type=HOLLOW_TYPES[self.kind.currentIndex()],
                               surface_angle=self.angle.value(),
                               filter_small_shells=self.filter.isChecked(),
-                              max_cavities=self.cavities.value())
+                              max_cavities=self.cavities.value(),
+                              infill=self.infill.isChecked() and self.infill.isEnabled(),
+                              infill_type=INFILL_TYPES[self.infill_type.currentIndex()],
+                              infill_size=self.infill_size.value(), infill_radius=self.infill_radius.value())
 
     def save(self):
         s = self.value()
         for k, val in (("thickness", s.thickness), ("accuracy", s.accuracy), ("type", s.hollow_type),
                        ("surfaceAngle", s.surface_angle), ("isFilter", s.filter_small_shells),
-                       ("cavities", s.max_cavities)):
+                       ("cavities", s.max_cavities), ("infill", self.infill.isChecked()),
+                       ("infillType", s.infill_type), ("infillSize", s.infill_size),
+                       ("infillRadius", s.infill_radius)):
             self.qs.setValue(f"hollow/{k}", val)
 
 

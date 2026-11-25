@@ -339,6 +339,21 @@ def test_supports_auto_edit_slice(app, tmp_path, monkeypatch):
     assert _wait(app, lambda: w.supports.entry(part) is not None, 60)
     w.undo.undo()
     assert len(part.supports) == n0
+    # drag a support: its contact moves to the drop point on the same part
+    assert _wait(app, lambda: w.supports.entry(part) is not None, 60)
+    cs = part.supports.world_contacts(part)
+    c0 = min(cs, key=lambda c: c.point[0])
+    up = np.array([0.0, 0, 1])
+    drop = np.array([b[1][0] - 1.0, b[0][1] + 1.0, 1.0])
+    w._support_drag(np.array([c0.point[0], c0.point[1], 1.0]), up, drop, up)
+    after = part.supports.world_contacts(part)
+    assert len(after) == n0
+    assert not any(np.allclose(c.point, c0.point) for c in after)
+    assert any(np.allclose(c.point[:2], drop[:2], atol=1e-6) and c.kind == "manual" for c in after)
+    w._support_drag(drop - [30, 30, 0], up, drop, up)       # not on a support: nothing happens
+    assert len(part.supports.world_contacts(part)) == n0
+    w.undo.undo()
+    assert any(np.allclose(c.point, c0.point) for c in part.supports.world_contacts(part))
     # slicing includes supports and raft: first layer is the raft
     job = w.make_slice_job()
     assert job.height == pytest.approx(part.bounds()[1][2], abs=0.01)
@@ -1630,6 +1645,49 @@ def test_preferences_window(app, tmp_path, monkeypatch):
     w.close()
 
 
+def test_trapped_resin_check_reports_suction_cups(app, tmp_path, monkeypatch):
+    """07 §5: the trapped-resin check also shows suction cups, labelled as such; sealing
+    leaves them, and the slice warning says what to do."""
+    import trimesh
+    from PySide6.QtWidgets import QMessageBox
+
+    from gooslicer import hollow as H
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from gooslicer_qt.main import MainWindow
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    cup = H.to_trimesh(H.to_manifold(trimesh.creation.cylinder(radius=10, height=12, sections=48))
+                       - H.to_manifold(trimesh.creation.cylinder(radius=8, height=12, sections=48,
+                                       transform=trimesh.transformations.translation_matrix([0, 0, 2]))))
+    stl = tmp_path / "cup.stl"
+    cup.export(stl)
+    w.import_files([str(stl)])
+    assert _wait(app, lambda: len(w.scene.parts) == 1)
+    assert [c.kind for c in w.trapped_resin()] == [H.CUP]
+    jp = w.job_panel
+    jp.trapped_btn.click()
+    assert _wait(app, lambda: jp.trapped_btn.isEnabled(), 60)
+    assert "1 suction cup" in jp.trapped_result.text() and "open toward the plate" in jp.trapped_result.text()
+    assert [lab.text for lab in w.viewport.guide_labels()] == ["Suction cup 1"]
+    assert w.viewport.cavity_meshes and "open toward the film" in w.flaws["cavity"][0].detail
+    jp.seal_btn.click()
+    assert _wait(app, lambda: jp.seal_btn.isEnabled() and "seal" in jp.trapped_result.text().lower(), 60)
+    assert "nothing to seal" in jp.trapped_result.text() and "1 suction cup" in jp.trapped_result.text()
+    assert w.viewport.cavity_meshes and len(w.trapped_resin()) == 1     # still shown
+    asked = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: asked.append(a[2]) or QMessageBox.No)
+    w.show_cavities(*_cavities(w))
+    assert not w._confirm_no_trapped_resin() and "1 suction cup" in asked[0] and "film" in asked[0]
+    w.close()
+
+
+def _cavities(w):
+    from gooslicer_qt.main import _cavities_and_faces
+    cav, red = _cavities_and_faces([p.world_mesh() for p in w.scene.parts])
+    return cav, red, w._plate_fingerprint()
+
+
 def test_hollowing_and_supports_buttons_share_a_width(app, tmp_path, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
@@ -1894,3 +1952,26 @@ def test_vertex_data_float32_and_memory_trim(app):
     M.trim_memory_soon()                                    # merged into one, after TRIM_DELAY_MS
     assert M._trim_timer.isActive()
     assert _wait(app, lambda: not M._trim_timer.isActive(), 5)
+
+
+def test_hollow_dialog_infill_fields(app, tmp_path):
+    """07 §2b: the Hollow dialog's infill fields, as SatelLite's: off by default, not for Open
+    bottom, and kept between sessions."""
+    from gooslicer.support_defaults import HollowSettings
+    from gooslicer_qt.hollowing import HollowFields
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    f = HollowFields(s)
+    assert f.value() == HollowSettings() and not f.infill_size.isEnabled()
+    f.infill.setChecked(True)
+    assert f.infill_type.isEnabled() and f.infill_size.isEnabled() and f.infill_radius.isEnabled()
+    f.infill_type.setCurrentIndex(1)
+    f.infill_size.setValue(6.0)
+    f.infill_radius.setValue(0.8)
+    v = f.value()
+    assert (v.infill, v.infill_type, v.infill_size, v.infill_radius) == (True, "fcc", 6.0, 0.8)
+    f.kind.setCurrentIndex(3)                                   # Open bottom
+    assert not f.infill.isEnabled() and not f.infill_size.isEnabled() and f.value().infill is False
+    f.kind.setCurrentIndex(0)
+    f.save()
+    g = HollowFields(s)
+    assert g.value() == v

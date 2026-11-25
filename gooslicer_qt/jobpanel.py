@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
+from . import flaws as flawmod
 from .panels import InfoButton, show_popup
 
 from .supporting import recommended_choice, support_choices, support_note, support_params
@@ -37,8 +38,9 @@ class JobPanel(QWidget):
         self.drain_btn.setToolTip("Click on a part to drill drain holes so resin can escape "
                                   "(Ctrl+Shift+D)")
         self.trapped_btn = QPushButton("Check for voids")
-        self.trapped_btn.setToolTip("Look for sealed cavities that would trap uncured resin; they "
-                                    "are shown in red")
+        self.trapped_btn.setToolTip("Look for sealed cavities and suction cups (pockets open only "
+                                    "toward the film) that would trap uncured resin; they are shown "
+                                    "in red")
         self.seal_btn = QPushButton("Seal cavity")
         self.seal_btn.setToolTip("Fill every sealed cavity, making the part solid there instead of "
                                  "hollow (Edit → Undo brings it back)")
@@ -275,12 +277,12 @@ class JobPanel(QWidget):
             if cav is None:
                 self.trapped_result.setText("The check failed; see the Log.")
             elif not cav:
-                self.trapped_result.setText("✓ No sealed cavities: resin can drain from every part.")
+                self.trapped_result.setText("✓ No sealed cavities or suction cups: resin can drain from "
+                                            "every part.")
             else:
                 self.trapped_result.setText(
-                    f"⚠ {len(cav)} sealed cavit{'y' if len(cav) == 1 else 'ies'} would trap uncured "
-                    "resin, shown in red. Add a drain hole near the bottom of each (Add drain "
-                    "holes); details are in the Log.")
+                    f"⚠ {flawmod.trapped_summary(cav)} would trap uncured resin, shown in red. "
+                    + flawmod.trapped_fix(cav) + "; details are in the Log.")
         self.win.check_trapped_resin_async(done)
 
     def seal_cavities(self) -> None:
@@ -301,7 +303,8 @@ class JobPanel(QWidget):
         label = self.islands_result if kind == "island" else self.trapped_result
         if label.isHidden():
             return
-        what = ("unsupported island", "unsupported islands") if kind == "island" else ("sealed cavity", "sealed cavities")
+        what = ("unsupported island", "unsupported islands") if kind == "island" \
+            else ("trapped-resin flaw", "trapped-resin flaws")
         if left:
             label.setText(f"⚠ {left} {what[0] if left == 1 else what[1]} left, shown in red (the rest "
                           "were dismissed in Flaws).")

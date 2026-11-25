@@ -59,6 +59,7 @@ HOLE_ALPHA_HIDDEN = 0.4                # its part inside the model, through the 
 CAVITY_XRAY = 0.45                     # sealed cavities are inside the model: shown through it
 LABEL_ISLAND = "Unsupported island"    # text at the outer end of each guide line
 LABEL_CAVITY = "Sealed cavity"
+LABEL_CUP = "Suction cup"
 LABEL_GAP_PX = 6                       # between a guide line's end and its label
 COL_GUIDE_SELECTED = (0.95, 0.20, 0.18)  # a guide line whose label was clicked
 
@@ -216,6 +217,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     holePicked = Signal(int, int, object)          # part id, local face index, world hit point
     holeModeEnded = Signal()
     supportClicked = Signal(object, object, bool)  # ray origin, ray direction, remove (Ctrl)
+    supportDragged = Signal(object, object, object, object)  # start ray (o, d), drop ray (o, d)
     supportModeEnded = Signal()
     filesDropped = Signal(list)
     rotateFinished = Signal(object, str)           # {id: (before, after)}, undo text
@@ -237,6 +239,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self.lay_flat_mode = False
         self.hole_mode = False
         self.support_mode = False
+        self._spress = None             # support mode: a left press waiting to become a click or a drag
+        self.support_drag_marker = None  # world point a dragged contact would move to
         # drain-hole preview: hole_preview_maker(part, face, hit) -> world trimesh or None; the
         # last hover is kept so the preview can follow settings changes
         self.hole_preview_maker = None
@@ -262,6 +266,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self.cavity_lines = np.zeros((0, 3))       # segments from each cavity to the build area's edge
         self.island_numbers: list | None = None    # flaw number of each island segment (None: 1, 2, …)
         self.cavity_numbers: list | None = None
+        self.cavity_cups: set = set()             # cavity numbers that are suction cups
         self._guide_buf = None
         self._guide_src = None
         self.selected_guides: set = set()          # guide keys picked by clicking their label
@@ -473,8 +478,24 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             self._draw_guide_labels(painter, vp, w, h)
             self._draw_rings(painter, vp, w, h)
             self._draw_handles(painter, vp)
+            if self.support_drag_marker is not None:
+                self._draw_drag_marker(painter, vp)
         finally:
             painter.end()
+
+    def _draw_drag_marker(self, p: QPainter, vp) -> None:
+        """Where a dragged support contact will go."""
+        xy, ok = self._screen(self.support_drag_marker[None], vp)
+        if not ok[0]:
+            return
+        p.setRenderHint(QPainter.Antialiasing)
+        c = QPointF(*xy[0])
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("#15171a"), 3.0))
+        p.drawEllipse(c, 6.0, 6.0)
+        p.setPen(QPen(QColor("#ffb347"), 1.8))
+        p.drawEllipse(c, 6.0, 6.0)
+        p.drawPoint(c)
 
     def _draw_hole_preview(self, vp) -> None:
         """The drain hole a click would drill: translucent blue, its part inside the model shown
@@ -601,7 +622,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         for kind, lines, text in (("island", self.island_lines, LABEL_ISLAND),
                                   ("cavity", self.cavity_lines, LABEL_CAVITY)):
             for num, a, b in zip(self._numbers(kind), lines[0::2], lines[1::2]):
-                out.append(((kind, num), a, b, text))
+                out.append(((kind, num), a, b, LABEL_CUP if kind == "cavity" and num in self.cavity_cups else text))
         return out
 
     def guide_labels(self, vp=None, w=None, h=None) -> list[GuideLabel]:
@@ -985,7 +1006,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             o, d = self._ray(e.position())
             part, face, hit = self.scene.pick(o, d)
             if self.support_mode:
-                self.supportClicked.emit(o, d, bool(e.modifiers() & Qt.ControlModifier))
+                if e.modifiers() & Qt.ControlModifier:
+                    self.supportClicked.emit(o, d, True)
+                else:                   # a click adds on release; a drag moves a contact
+                    self._spress = {"pos": QPointF(e.position()), "ray": (o, d), "moved": False}
                 return
             if self.hole_mode:
                 if part is not None:
@@ -1029,6 +1053,14 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             return
         if self._hdrag is not None and e.buttons() & Qt.LeftButton:
             self._drag_handle(pos, bool(e.modifiers() & Qt.ControlModifier))
+            return
+        if self._spress is not None and e.buttons() & Qt.LeftButton:
+            if (pos - self._spress["pos"]).manhattanLength() > 4:
+                self._spress["moved"] = True
+            if self._spress["moved"]:
+                _, _, hit = self.scene.pick(*self._ray(pos))
+                self.support_drag_marker = None if hit is None else np.asarray(hit, float)
+                self.update()
             return
         if self.hole_mode and not e.buttons():
             # a fast mouse sends many moves: pick only where the cursor ends up once they're in
@@ -1082,6 +1114,15 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if self._hdrag is not None and e.button() == Qt.LeftButton:
             self._end_handle()
             return
+        if self._spress is not None and e.button() == Qt.LeftButton:
+            sp, self._spress = self._spress, None
+            self.support_drag_marker = None
+            self.update()
+            if sp["moved"]:
+                self.supportDragged.emit(*sp["ray"], *self._ray(e.position()))
+            else:
+                self.supportClicked.emit(*sp["ray"], False)
+            return
         if e.button() == Qt.RightButton and self._rpress is not None:
             pos, self._rpress = self._rpress, None
             part, _, _ = self.scene.pick(*self._ray(pos))
@@ -1119,6 +1160,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self.setCursor(Qt.CrossCursor)
 
     def stop_support_mode(self):
+        self._spress = None
+        self.support_drag_marker = None
         if self.support_mode:
             self.support_mode = False
             self.unsetCursor()

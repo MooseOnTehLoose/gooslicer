@@ -167,13 +167,17 @@ def _check_tree(model, p):
     contacts, res, islands = S.auto_support(model, p)
     assert islands == [] and res.mesh is not None and res.mesh.is_watertight
     pls, _, nodes, roots = S.plan_tree(model, contacts, p)
-    tan = math.tan(math.radians(p.max_branch_angle))
+    slope = {1: 30.0, 2: p.max_branch_angle}.get(p.tree_height_type, 45.0)     # ° from horizontal
+    run = 1 / math.tan(math.radians(slope))
     for nd in nodes:
         if nd.parent >= 0:
             a, b = nd.pos, nodes[nd.parent].pos
             drop = a[2] - b[2]
-            assert -1e-9 <= drop <= p.max_branch_height + 1e-6
-            assert np.linalg.norm(a[:2] - b[:2]) <= drop * tan + 1e-6
+            assert drop >= -1e-9
+            if p.tree_height_type == 1:                    # joints no higher than maxHeight
+                assert b[2] <= p.base_z + p.max_branch_height + 1e-6
+            else:
+                assert np.linalg.norm(a[:2] - b[:2]) <= drop * run + 1e-6
     for pl in pls:
         if not pl.on_model:
             assert pl.path[-1][2] == pytest.approx(p.base_z) and np.allclose(pl.path[0], pl.tip_end)
@@ -297,3 +301,36 @@ def test_tip_follows_the_normal_up_to_the_cap(tilt, cap, expect):
 
 def test_default_cap_is_satellites():
     assert S.SupportParams().max_tip_angle == 30.0
+
+
+@pytest.mark.parametrize("height_type", [1, 2])
+def test_tree_height_types(height_type):
+    """SatelLite's trunk.heightType (EleTriBuilder FUN_18001e680, 08 §8): 1 caps joints at
+    maxHeight above the raft, 2 sets the branch slope from maxBranchAngle."""
+    from dataclasses import replace
+    p = replace(S.SupportParams.tree_defaults(), tree_height_type=height_type, max_branch_height=3.0,
+                max_branch_angle=60.0)
+    _check_tree(_lifted(_tee()), p)
+
+
+def test_tree_default_has_no_height_limit():
+    p = S.SupportParams.tree_defaults()
+    assert p.tree_height_type == 0
+    plate = _lifted(trimesh.creation.box((30, 4, 1)), 20)
+    _, _, nodes, _ = S.plan_tree(plate, S.detect_contacts(plate, p), p)
+    drops = [nd.pos[2] - nodes[nd.parent].pos[2] for nd in nodes if nd.parent >= 0]
+    assert drops and max(drops) > p.max_branch_height       # the old 5 mm drop limit is gone
+
+
+def test_contacts_keep_back_from_overhang_edges():
+    """08 §2: no overhang contact nearer the region's edge than borderOffset, or a quarter of
+    the region's depth on narrow strips, which still get supported."""
+    p = S.SupportParams()
+    plate = _lifted(trimesh.creation.box((10, 10, 1)), 10)
+    cs = [c for c in S.detect_contacts(plate, p) if c.kind == S.OVERHANG]
+    assert cs
+    xy = np.array([c.point[:2] for c in cs])
+    assert (5 - np.abs(xy).max(axis=1) >= p.border_offset - 1e-6).all()
+    strip = _lifted(trimesh.creation.box((10, 0.8, 1)), 10)      # 0.4 mm deep: inset 0.1 mm
+    cs = [c for c in S.detect_contacts(strip, p) if c.kind == S.OVERHANG]
+    assert len(cs) >= 3 and all(0.4 - abs(c.point[1]) >= 0.1 - 1e-6 for c in cs)

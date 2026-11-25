@@ -73,8 +73,9 @@ class SupportParams:
     # tree structure (script type 0); names OBSERVED, roles GOOSLICER (08 §8)
     style: str = "evo"                  # "evo" (script 7) or "tree" (script 0)
     branch_width: float = 1.2           # structure.tree.brunch.topWidth / botWidth
-    max_branch_angle: float = 45.0      # structure.tree.trunk.maxBranchAngle, ° from vertical
-    max_branch_height: float = 5.0      # structure.tree.trunk.maxHeight: longest drop of one branch
+    max_branch_angle: float = 45.0      # structure.tree.trunk.maxBranchAngle, ° from horizontal (height type 2)
+    max_branch_height: float = 5.0      # structure.tree.trunk.maxHeight: highest joint above the raft (type 1)
+    tree_height_type: int = 0           # structure.tree.trunk.heightType: how joints are placed (08 §8)
     bot_tip_length: float = 3.0         # botConnect.tipLength (tree supports landing on the model)
     cross: bool = True                  # structure.cross.hasCrossConnect
     cross_start: float = 3.0            # cross.startHeight, above the raft
@@ -170,6 +171,7 @@ class SupportParams:
             poly_edges=g(s, tr + "polyEdgeNum", d.poly_edges),
             max_branch_angle=g(s, tr + "trunk.maxBranchAngle", d.max_branch_angle),
             max_branch_height=g(s, tr + "trunk.maxHeight", d.max_branch_height),
+            tree_height_type=g(s, tr + "trunk.heightType", d.tree_height_type),
             cross=g(s, "structure.cross.hasCrossConnect", d.cross),
             cross_start=g(s, "structure.cross.startHeight", d.cross_start),
             cross_interval=g(s, "structure.cross.corssInterval", d.cross_interval),
@@ -221,9 +223,9 @@ def detect_contacts(mesh: trimesh.Trimesh, p: SupportParams) -> list[Contact]:
     need = -n[:, 2] > math.cos(math.radians(p.critical_angle))
     zmin = mesh.bounds[0][2]
     if need.any():
-        pts, fidx = _sample_faces(mesh, np.nonzero(need)[0], max(0.1, p.anchor_dis / 4))
-        keep = _poisson(pts, p.anchor_dis, order=pts[:, 2])
-        for i in keep:
+        spacing = max(0.1, p.anchor_dis / 4)
+        pts, fidx = _sample_faces(mesh, np.nonzero(need)[0], spacing)
+        for i in _border_pass(mesh, need, pts, fidx, p, spacing):
             out.append(Contact(pts[i], n[fidx[i]].copy(), OVERHANG))
     if p.reinforce_lowest:
         for v, nn in _lowest_points(mesh, p.lowest_interval):
@@ -248,6 +250,45 @@ def _sample_faces(mesh, faces: np.ndarray, spacing: float):
         pts.append(T[:, 0] + r[:, :1] * (T[:, 1] - T[:, 0]) + r[:, 1:] * (T[:, 2] - T[:, 0]))
         idx.append(faces[rep])
     return np.vstack(pts), np.concatenate(idx)
+
+
+BORDER_DEPTH = 0.25     # inset as a share of a region's depth, fitted to SatelLite's arc project (08 §2)
+
+
+def _border_distance(mesh, need: np.ndarray, pts: np.ndarray, fidx: np.ndarray, step: float):
+    """For each sample: its distance to the edge of its overhang region, and the region's id.
+    An edge is where an overhang face meets a face that is not one, or an open mesh edge."""
+    m = mesh.copy()
+    m.merge_vertices()
+    inv = m.edges_unique_inverse                       # 3 per face, in face order
+    need3 = np.repeat(need, 3)
+    count = np.bincount(inv[need3], minlength=len(m.edges_unique))
+    edges = m.vertices[m.edges_unique[count == 1]]
+    region = np.full(len(m.faces), -1)
+    adj = m.face_adjacency[need[m.face_adjacency[:, 0]] & need[m.face_adjacency[:, 1]]]
+    for k, comp in enumerate(trimesh.graph.connected_components(adj, nodes=np.nonzero(need)[0], min_len=1)):
+        region[comp] = k
+    if not len(edges):
+        return np.full(len(pts), np.inf), region[fidx]
+    L = np.linalg.norm(edges[:, 1] - edges[:, 0], axis=1)
+    k = np.maximum(1, np.ceil(L / step).astype(int))
+    rep = np.repeat(np.arange(len(edges)), k + 1)
+    t = np.concatenate([np.linspace(0, 1, j + 1) for j in k])
+    border = edges[rep, 0] + t[:, None] * (edges[rep, 1] - edges[rep, 0])
+    d, _ = cKDTree(border).query(pts)
+    return d, region[fidx]
+
+
+def _border_pass(mesh, need, pts, fidx, p: SupportParams, spacing: float) -> list[int]:
+    """Overhang contacts kept back from their region's edge [GOOSLICER rule fitted to SatelLite,
+    08 §2]: no sample nearer the edge than borderOffset, or a quarter of the region's depth
+    when that is less (narrow strips), then Poisson selection at anchorDis, lowest first."""
+    d, reg = _border_distance(mesh, need, pts, fidx, spacing / 2)
+    deep = np.zeros(reg.max() + 2)
+    np.maximum.at(deep, reg + 1, np.where(np.isfinite(d), d, 0.0))
+    target = np.where(np.isfinite(d), np.minimum(p.border_offset, BORDER_DEPTH * deep[reg + 1]), 0.0)
+    idx = np.nonzero(d >= target - 1e-9)[0]
+    return idx[_poisson(pts[idx], p.anchor_dis, order=pts[idx, 2])].tolist()
 
 
 def _poisson(pts: np.ndarray, r: float, order: np.ndarray) -> list[int]:
@@ -546,8 +587,12 @@ def _segment_clear(model, a: np.ndarray, b: np.ndarray, clearance: float) -> boo
     if L < 1e-6:
         return True
     rc = caster(model)
-    frac, _ = rc.segments(np.array([a, b]), np.array([b, a]))
-    if np.isfinite(frac).all() and (frac < 1.0).all():        # crosses the surface
+    # in pieces of at most 1 mm: one long query would gather every face in a ball around it
+    k = max(1, int(math.ceil(L)))
+    ends = a + np.linspace(0.0, 1.0, k + 1)[:, None] * v
+    fwd, _ = rc.segments(ends[:-1], ends[1:])
+    back, _ = rc.segments(ends[1:][::-1], ends[:-1][::-1])
+    if np.isfinite(fwd).any() and np.isfinite(back).any():    # crosses the surface
         return False
     t = np.linspace(0.25, 1.0, max(2, int(L / 0.5)))
     pts = a + t[:, None] * v
@@ -557,28 +602,33 @@ def _segment_clear(model, a: np.ndarray, b: np.ndarray, clearance: float) -> boo
 def plan_tree(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams):
     """Tree layout [GOOSLICER, 08 §8]. Tips and the straight-drop test are the EVO ones
     (`plan_pillars`). Tip ends that drop to the raft are merged pairwise, highest meeting point
-    first: two branches meet where both can reach going down at most maxBranchAngle from
-    vertical. A merge is taken only when neither branch drops more than maxHeight, both stay
-    clear of the model, the joint stays at least 1 mm above the raft, and the joint can still
-    drop straight to the raft with trunk clearance. Whatever is left drops as a vertical trunk.
+    first: two branches meet at the highest point both reach at the branch slope, which
+    SatelLite's heightType sets (EleTriBuilder FUN_18001e680, 08 §8): 0 = 45°; 1 = 30° from
+    horizontal, with joints no higher than maxHeight above the raft; 2 = maxBranchAngle from
+    horizontal. A merge is taken only when both branches stay clear of the model, the joint stays
+    at least 1 mm above the raft, and the joint can still drop straight to the raft with trunk
+    clearance. Whatever is left drops as a vertical trunk.
     Returns (pillars, rejected, nodes, roots)."""
     import heapq
     pillars, rejected = plan_pillars(model, contacts, p)
     ground = [i for i, pl in enumerate(pillars) if not pl.on_model]
     nodes = [_Node(pillars[i].tip_end.copy()) for i in ground]
-    tan_a = math.tan(math.radians(min(max(p.max_branch_angle, 1.0), 80.0)))
+    slope = {1: 30.0, 2: p.max_branch_angle}.get(int(p.tree_height_type), 45.0)   # ° from horizontal
+    tan_a = 1.0 / math.tan(math.radians(min(max(slope, 10.0), 89.0)))             # run per unit drop
     base = p.base_z
     zmin_join = base + 1.0
+    cap = base + p.max_branch_height if int(p.tree_height_type) == 1 else math.inf
     clearance = p.branch_width / 2 + 0.1
-    reach = 2 * p.max_branch_height * tan_a
+    top = max((nd.pos[2] for nd in nodes), default=base)
+    reach = 2 * (min(top, cap) - zmin_join) * tan_a + 1e-6
     active = set(range(len(nodes)))
     heap: list = []
 
     def push(i, j):
         m = _meet(nodes[i].pos, nodes[j].pos, tan_a)
+        if m[2] > cap:                  # height type 1: joints no higher than maxHeight
+            m = np.array([(nodes[i].pos[0] + nodes[j].pos[0]) / 2, (nodes[i].pos[1] + nodes[j].pos[1]) / 2, cap])
         if m[2] < zmin_join:
-            return
-        if max(nodes[i].pos[2], nodes[j].pos[2]) - m[2] > p.max_branch_height + 1e-9:
             return
         heapq.heappush(heap, (-m[2], i, j, m))
 
@@ -591,11 +641,11 @@ def plan_tree(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams)
         if i not in active or j not in active:
             continue
         a, b = nodes[i].pos, nodes[j].pos
-        ok = all(_segment_clear(model, q, m, clearance) for q in (a, b) if np.linalg.norm(q - m) > 1e-6)
+        _, hit = caster(model).vertical(m[None] - [0, 0, 1e-3])   # cheap test first: model under the joint
+        ok = hit[0] < 0 and all(_segment_clear(model, q, m, clearance)
+                                for q in (a, b) if np.linalg.norm(q - m) > 1e-6)
         if ok:              # the joint's trunk must reach the raft clear of the model
-            _, hit = caster(model).vertical(m[None] - [0, 0, 1e-3])
-            ok = hit[0] < 0 and _segment_clear(model, m, np.array([m[0], m[1], base]),
-                                                 p.pillar_bottom_width / 2 + 0.1)
+            ok = _segment_clear(model, m, np.array([m[0], m[1], base]), p.pillar_bottom_width / 2 + 0.1)
         if not ok:
             continue
         k = len(nodes)

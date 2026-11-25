@@ -30,6 +30,27 @@ SatelLite uses OpenVDB / `HollowOctree`, which has no Linux wheel. GooSlicer's p
 - **Scaled parts:** hollowing and drilling work in the part's scaled frame, so the thickness is true millimetres even with non-uniform scale.
 - **Limit:** grids above 60 M voxels are refused with a message asking for a coarser accuracy.
 
+## 2b. Infill lattice (2026-11-25)
+**SatelLite** [OBSERVED: EleTriInfill.dll `DialogInfill::setUI`, `handleResult`, `createLattice`]:
+- `DialogInfill` extends the Hollow dialog with an "Infill Format" group:
+  - "Infill structure" checkbox (`useHatch`);
+  - "Fill Structure Type": BCC or FCC;
+  - "Fill Structure Dimensions": 4 mm, 3 decimals, step 1;
+  - "Support Radius": 1 mm.
+- No ini keys were found, so these are the dialog's defaults each time.
+- With the box ticked and a type other than Open Bottom (index 3), `createLattice` hands the parts and these values to `StructureImp` (EleTriStructure.dll) with hollowing on. Otherwise it is a plain hollow. A failure reports "Failed to add padding structure." The lattice geometry, in `StructureImp`, was not decompiled.
+
+**GooSlicer** [GOOSLICER geometry, SatelLite's fields and defaults]:
+- `HollowSettings.infill`, `infill_type` ("bcc" / "fcc"), `infill_size` and `infill_radius`. They are saved under `hollow/infill*` in GooSlicer's settings.
+- The Hollow dialog (and Preferences) show them below the cavity filter. They are disabled for Open bottom, where `hollow()` also ignores them.
+- **Lattice:** cells of `infill_size` on a grid anchored at the origin, struts of `infill_radius` (8-sided), and a ball at each node.
+  - BCC: each cell's centre joined to its eight corners.
+  - FCC: the two diagonals of every cell face.
+  - Each cell owns only the pieces no neighbour shares: its centre, or its three faces through its origin corner, plus that corner's ball. Copies then meet without coincident faces. The cell is tiled across the cavity's bounds plus one cell of slack by doubling (log₂ n unions per axis). More than 400,000 cells is refused.
+- **Applied** as `cavity − lattice` before the cavity is cut out. So struts exist only inside the cavity and run on into the walls, making one solid. The cavity's empty space stays connected, so it still counts as one cavity and still needs a drain hole.
+- **Measured:** 20 mm cube, 1.5 mm wall, accuracy 0.5: watertight in about 1 s. With the defaults, BCC raises the solid volume from 3,092 to 6,426 mm³ and FCC to 6,977. A 1 mm radius in a 4 mm cell is dense, so a larger cell or thinner struts save resin. arc with a 2 mm wall: 2.8 s.
+- **Validation:** strut radius at most a quarter of the cell size.
+
 ## 3. Drain holes
 - **Placement:** Add drain holes… (Hollowing pane or Edit menu) opens the drain-hole settings in a panel floating over the top-left of the 3D view. The settings are outer and inner radius, extend outside, depth inside and direction. The panel isn't a dialog: the view stays live, so parts can be clicked, orbited and zoomed while it's open.
   - Under the cursor, the hole a click would cut is drawn as a translucent blue 3D frustum: the outer radius at extend outside, narrowing to the inner radius at depth inside. Its part inside the model shows fainter through the surface.
@@ -48,7 +69,20 @@ SatelLite uses OpenVDB / `HollowOctree`, which has no Linux wheel. GooSlicer's p
 - **Models tab → Hollowing** pane, above Supports: Hollow… (the selected part), Add drain holes…, Check for voids (in the background, with the result under the button) and Seal cavity.
 - **Seal cavity** [GOOSLICER]: `cavity_shells` finds, per part, every connected shell whose area (≥ 80 %) lines a sealed cavity, such as the inner shell hollowing leaves, and deletes it, so the part is solid there again. All parts change in one undo step ("Seal cavities"), then the check runs again. A cavity whose wall is also the outside of a part (an open-bottom shell closed off by another part, say) has no such shell; it is reported as not sealed and stays red.
 - **Fine confirmation** [GOOSLICER]: an opening narrower than about two voxels closes up at the coarse pitch, and the space behind it looks sealed. On a supported model (`samples/Lisa_torso.stl`, at the 0.5 mm pitch a wide plate gets), two flat pockets about 1.5 mm³ each, in creases under the model, were reported this way; at 0.4 mm or finer they are open. So each candidate is re-voxelised at a quarter of the pitch in a window around it, 4 mm (at least 3 voxels) wider than the cavity on every side, so a gap through a wall reaches space outside the part. If the cavity's empty space joins empty space the coarse pass found open, it is dropped. A window over 24 M fine voxels gets a coarser fine pitch; if that would be over half the coarse pitch, the candidate is kept unconfirmed (only very large cavities, which are hollows, not slivers).
-- **Limits:** openings narrower than about a quarter voxel (≈ 0.1 mm), or longer than the 4 mm margin, aren't resolved, so a very small hole can still be reported as sealed, as can a narrow gap into a very large cavity. Open cups (resin held by suction against the film) are not detected.
+- **Limits:** openings narrower than about a quarter voxel (≈ 0.1 mm), or longer than the 4 mm margin, aren't resolved, so a very small hole can still be reported as sealed, as can a narrow gap into a very large cavity. Suction cups are found separately (§4b).
+
+## 4b. Suction cups [GOOSLICER] (2026-11-24)
+A cup is a pocket closed on every side except the top, the side the film is on. While its walls print, the film closes the mouth, so every lift pulls on the resin inside, which can tear the print off its supports. The trapped-resin check finds cups on the same voxel grid as sealed cavities (`hollow._cups`, `cups=True`):
+- **Held space:** in each voxel layer, empty space that the part encloses on every side within that layer (4-connected, not reaching the grid's edge).
+- **Cups:** 6-connected pieces of held space that belong to the outside (not a sealed cavity), and that no voxel of open space lies directly below. Open space is empty space that is not held. Layers within half a voxel of the plate, or below it, count as closed, so a cup standing rim-down on the plate is a cup too.
+- So a drain hole anywhere in the floor clears it. A cup opening downward drains.
+- **Size limit:** a cup's largest layer must be at least 10 mm² (`CUP_MIN_AREA`), and its volume at least 1 mm³. Smaller pockets, such as engraved text or pits, pull too little to matter.
+- **In the app:**
+  - Cups are listed with the sealed cavities and drawn the same way (red walls, numbered guide lines), labelled "Suction cup N". The detail gives the volume, the area across and the lowest point.
+  - The panel, the Log and the slice warning name both kinds ("1 sealed cavity and 2 suction cups"). Their advice adds "or turn the part so its cups open toward the plate".
+  - Seal cavity leaves cups as they are, since they have no shell to delete, and says so.
+- **Checked on:** a 20 mm cup with 2 mm walls is found upright on the plate, upright on supports, and rim-down on the plate. It is not found with a Ø2 mm drain in its floor, or rim-down on supports. A Ø3 mm pit is not found. On the real models, arc has no cups. Lisa_torso has one, a 9 × 18 × 2 mm recess facing up halfway up the torso, found in 1.6 s.
+- **Limits:** a gap narrower than about two voxels isn't seen, so a cup with a very thin slit still counts as a cup. Supports aren't part of the check.
 
 ## 5. Measured accuracy and speed
 | Case | Result |
@@ -64,5 +98,4 @@ These are fast enough that the plan's C++ fallback isn't needed.
 
 ## 6. Open items
 - Optional: decompile `EleTriHole.dll` (hole presets, notch and slot geometry) and SatelLite's Open Bottom surface-angle rule.
-- Optional internal infill grid.
-- Cup detection.
+- Infill: SatelLite's lattice geometry (`StructureImp`, EleTriStructure.dll) is not decompiled, so GooSlicer's struts may differ in shape. The "Support Radius" might also be read differently there.

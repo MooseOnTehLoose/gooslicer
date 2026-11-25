@@ -151,7 +151,7 @@ Each phase ends with passing tests and a short demo. Specs are written before th
 - Hollow types Inside / Outside / Center / Open Bottom (surface angle 5–85°). Defaults: wall 1 mm, accuracy 1 mm (06 §2). SatelLite's dialog enforces no accuracy ≤ thickness/2 rule. GooSlicer may warn about it but does not claim SatelLite parity for it.
 - Optional internal infill grid can come later.
 - Drain holes: click on the surface to place one, with diameter and depth, applied as a manifold boolean.
-- Trapped-volume detection: a 3D flood fill of empty space on a voxel grid (replaces the per-layer plan; it also finds cavities that are open only sideways), with a warning before slicing. Open "cups" that hold resin without being sealed are not flagged yet.
+- Trapped-volume detection: a 3D flood fill of empty space on a voxel grid (replaces the per-layer plan; it also finds cavities that are open only sideways), with a warning before slicing. Open "cups" facing the film are flagged too (07 §4b).
 - ✔ Tests: hollowing a 20 mm cube gives the expected wall volume within tolerance; the output mesh is watertight; a part with no drain hole gets the trapped-resin warning.
 
 **Reference job for P4–P6 [SAMPLE].** The pair `samples/arc-1a-attitude-4.stl` (binary STL, 40 074 triangles, 32.5 × 23.4 × 52.9 mm) and `samples/arc.goo` was sliced by SatelLite with auto supports on the 16K. It has 1140 layers and is 57.0 mm tall.

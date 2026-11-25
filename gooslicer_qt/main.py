@@ -155,9 +155,9 @@ def _islands_and_faces(meshes, layer_height):
 
 
 def _cavities_and_faces(meshes):
-    """The trapped-resin check, plus the surface lining each sealed cavity as red meshes:
-    (cavities, [[meshes] per cavity])."""
-    cav, each = hollowmod.cavity_faces_each(meshes)
+    """The trapped-resin check, plus the surface lining each sealed cavity or suction cup as
+    red meshes: (cavities, [[meshes] per cavity])."""
+    cav, each = hollowmod.cavity_faces_each(meshes, cups=True)
     return cav, [_red(meshes, masks) for masks in each]
 
 
@@ -350,6 +350,7 @@ class MainWindow(QMainWindow):
         self.viewport.extra_meshes = self.supports.display
         self.supports.updated.connect(self._supports_updated)
         self.viewport.supportClicked.connect(self._support_click)
+        self.viewport.supportDragged.connect(self._support_drag)
         self.viewport.supportModeEnded.connect(lambda: self.statusBar().clearMessage())
         self.viewport.filesDropped.connect(self.open_files)
         self.setAcceptDrops(True)       # drops anywhere in the window, not only on the 3D view
@@ -456,14 +457,14 @@ class MainWindow(QMainWindow):
         self._act(e, "edit.hollow", "&Hollow…", self.hollow_dialog)
         self._act(e, "edit.drain_holes", "Add drain &holes…", self.drain_hole_mode)
         self._act(e, "edit.check_voids", "Check for &voids", self.check_trapped_resin,
-                  "Look for sealed cavities that would trap uncured resin")
+                  "Look for sealed cavities and suction cups that would trap uncured resin")
         e.addSeparator()
         self.prefs_action = self._act(e, "edit.preferences", "&Preferences…", self.open_preferences,
                                       "Every GooSlicer option, by category")
 
         sm = mb.addMenu("&Supports")
         self._act(sm, "supports.auto", "&Auto-support…", self.auto_support_dialog)
-        self._act(sm, "supports.edit", "&Edit supports (click to add, Ctrl+click to remove)", self.support_edit_mode)
+        self._act(sm, "supports.edit", "&Edit supports (click to add, drag to move, Ctrl+click to remove)", self.support_edit_mode)
         self._act(sm, "supports.clear", "&Clear supports of selected", self.clear_supports)
         sm.addSeparator()
         self._act(sm, "supports.islands", "&Detect islands", self.check_islands,
@@ -759,7 +760,9 @@ class MainWindow(QMainWindow):
         if not p:
             return
         pid, name = p.id, p.name
-        self.log_msg(f"Hollowing {name} ({hs.hollow_type}, wall {hs.thickness} mm, accuracy {hs.accuracy} mm)…")
+        infill = (f", {hs.infill_type.upper()} infill {hs.infill_size:g} mm cells, struts r {hs.infill_radius:g} mm"
+                  if hs.infill and hs.hollow_type != "open_bottom" else "")
+        self.log_msg(f"Hollowing {name} ({hs.hollow_type}, wall {hs.thickness} mm, accuracy {hs.accuracy} mm{infill})…")
         self.statusBar().showMessage(f"Hollowing {name}…")
 
         def done(res):
@@ -870,7 +873,7 @@ class MainWindow(QMainWindow):
             self.statusBar().clearMessage()
 
     def trapped_resin(self) -> list:
-        return hollowmod.sealed_cavities([x.world_mesh() for x in self.scene.parts])
+        return hollowmod.sealed_cavities([x.world_mesh() for x in self.scene.parts], cups=True)
 
     # ------------------------------------------------------------------- flaws
     @staticmethod
@@ -903,6 +906,7 @@ class MainWindow(QMainWindow):
             vp.island_meshes, vp.island_lines, vp.island_numbers = meshes, lines, nums
         else:
             vp.cavity_meshes, vp.cavity_lines, vp.cavity_numbers = meshes, lines, nums
+            vp.cavity_cups = {f.number for f in fl if f.is_cup}
         vp.update()
         if hasattr(self, "flaws_panel"):
             self.flaws_panel.refresh(self.flaws["island"] + self.flaws["cavity"], vp.guide_selection())
@@ -979,7 +983,7 @@ class MainWindow(QMainWindow):
     def check_trapped_resin(self) -> bool:
         cav = self._trapped_resin_shown()
         if not cav:
-            self.log_msg("No sealed cavities: resin can drain from every part.")
+            self.log_msg("No sealed cavities or suction cups: resin can drain from every part.")
             self.statusBar().showMessage("No trapped resin", 5000)
             return True
         self._report_cavities(cav)
@@ -1001,7 +1005,7 @@ class MainWindow(QMainWindow):
             if cav:
                 self._report_cavities(cav)
             else:
-                self.log_msg("No sealed cavities: resin can drain from every part.")
+                self.log_msg("No sealed cavities or suction cups: resin can drain from every part.")
             on_done(cav)
 
         def failed(msg):
@@ -1022,8 +1026,12 @@ class MainWindow(QMainWindow):
             cav, removes = res
             cav = [c for c in cav if not self._is_dismissed("cavity", c.lowest)]
             if not cav:
-                self.show_cavities([], [], None)
-                on_done("✓ No sealed cavities: nothing to seal.")
+                cups = sum(f.is_cup for f in self.flaws["cavity"])
+                if not cups:
+                    self.show_cavities([], [], None)
+                on_done("✓ No sealed cavities: nothing to seal." + (
+                    f" {cups} suction cup{'' if cups == 1 else 's'} can't be sealed: add a drain hole or "
+                    "turn the part." if cups else ""))
                 return
             todo = [(pid, mesh, rm) for (pid, mesh), rm in zip(parts, removes)
                     if rm.any() and self.scene.get(pid) is not None and self.scene.get(pid).mesh is mesh]
@@ -1037,6 +1045,8 @@ class MainWindow(QMainWindow):
                 if left is None:
                     on_done("The check after sealing failed; see the Log.")
                     return
+                cups = [c for c in left if c.kind == hollowmod.CUP]
+                left = [c for c in left if c.kind != hollowmod.CUP]
                 sealed = max(len(cav) - len(left), 0)
                 msg = (f"Sealed {sealed} cavit{'y' if sealed == 1 else 'ies'}: "
                        "the part is solid there now (Edit → Undo brings the hollow back)." if sealed
@@ -1045,6 +1055,9 @@ class MainWindow(QMainWindow):
                     msg += (f" ⚠ {len(left)} cavit{'y' if len(left) == 1 else 'ies'} could not be sealed "
                             "(shown in red): its wall is also the outside of a part. Add a drain hole "
                             "instead.")
+                if cups:
+                    msg += (f" {len(cups)} suction cup{'' if len(cups) == 1 else 's'} can't be sealed: "
+                            "add a drain hole or turn the part.")
                 self.log_msg("Seal cavities: " + msg)
                 on_done(msg)
             self.check_trapped_resin_async(rechecked)
@@ -1056,7 +1069,7 @@ class MainWindow(QMainWindow):
 
     def _report_cavities(self, cav):
         lines = [f"• {f.title}: {f.detail}" for f in flawmod.cavity_flaws(cav[:8], [[]] * len(cav[:8]))]
-        self.log_msg(f"{len(cav)} sealed cavit{'y' if len(cav) == 1 else 'ies'} will trap resin:\n" + "\n".join(lines))
+        self.log_msg(f"{flawmod.trapped_summary(cav)} will trap resin:\n" + "\n".join(lines))
         return lines
 
     def _confirm_no_trapped_resin(self) -> bool:
@@ -1065,9 +1078,8 @@ class MainWindow(QMainWindow):
             return True
         lines = self._report_cavities(cav)
         return QMessageBox.warning(
-            self, APP, f"{len(cav)} sealed cavit{'y' if len(cav) == 1 else 'ies'} will trap uncured resin "
-            "(it can crack the print or burst during curing):\n\n" + "\n".join(lines) +
-            "\n\nAdd a drain hole near each lowest point (Edit → Add drain holes). Slice anyway?",
+            self, APP, f"{flawmod.trapped_summary(cav)} will trap uncured resin:\n\n" + "\n".join(lines) +
+            "\n\n" + flawmod.trapped_advice(cav) + " Slice anyway?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
 
     # ------------------------------------------------------------------- supports
@@ -1145,8 +1157,8 @@ class MainWindow(QMainWindow):
         if not self.scene.parts:
             return
         self.viewport.start_support_mode()
-        self.statusBar().showMessage("Supports: click a part to add a support, Ctrl+click a support "
-                                     "to remove it (Esc to finish)")
+        self.statusBar().showMessage("Supports: click a part to add a support, drag a support to move "
+                                     "it, Ctrl+click a support to remove it (Esc to finish)")
 
     def _support_hit(self, o, d):
         """Nearest support hit: (distance, part, world point) or None."""
@@ -1163,41 +1175,70 @@ class MainWindow(QMainWindow):
                     best = (dist, p, hit[1])
         return best
 
+    def _contact_at(self, o, d):
+        """The support under a ray: (part, its world contacts, index of the contact) or None."""
+        sup = self._support_hit(o, d)
+        if sup is None:
+            return None
+        _, p, local_hit = sup
+        e = self.supports.cache.get(p.id)
+        cs = p.supports.world_contacts(p) if p.supports is not None else []
+        if not cs or e is None:
+            return None
+        if e.result.pillars:
+            i = supportmod.nearest_pillar(e.result.pillars, local_hit)
+            if i is None:
+                return None
+            target = e.result.pillars[i].contact.point + self.supports.offset(p, e)
+            j = int(np.argmin([np.linalg.norm(c.point - target) for c in cs]))
+        else:
+            # imported geometry (SatelLite) has no pillars: the contact above the click in plan view
+            w = local_hit + self.supports.offset(p, e)
+            xy = np.array([np.linalg.norm(c.point[:2] - w[:2]) if c.point[2] >= w[2] - 0.5 else np.inf
+                           for c in cs])
+            j = int(np.argmin(xy))
+            if xy[j] > 2.5:
+                return None
+        return p, cs, j
+
+    @staticmethod
+    def _world_normal(part, face) -> np.ndarray:
+        nw = part.rotation @ (part.mesh.face_normals[face] / part.scale)
+        return nw / np.linalg.norm(nw)
+
+    def _support_drag(self, o0, d0, o1, d1):
+        """A drag that starts on a support moves its contact to where it is dropped on the
+        same part (08 §6)."""
+        found = self._contact_at(np.asarray(o0, float), np.asarray(d0, float))
+        if found is None:
+            self.statusBar().showMessage("Supports: start a drag on a support to move it", 4000)
+            return
+        p, cs, j = found
+        part, face, hit = self.scene.pick(np.asarray(o1, float), np.asarray(d1, float))
+        if part is None or part.id != p.id:
+            self.statusBar().showMessage("Supports: drop the support on the same part", 4000)
+            return
+        moved = supportmod.Contact(np.asarray(hit, float), self._world_normal(part, face), supportmod.MANUAL)
+        before = SupportsCommand.snapshot(p)
+        plan = p.supports.with_contacts(p, cs[:j] + [moved] + cs[j + 1:])
+        self.undo.push(SupportsCommand(self, p.id, before, (plan, p.elevation, p.state()), "Move support"))
+
     def _support_click(self, o, d, remove: bool):
         o, d = np.asarray(o, float), np.asarray(d, float)
         part, face, hit = self.scene.pick(o, d)
         sup = self._support_hit(o, d)
         if remove:
-            if sup is None:
+            found = self._contact_at(o, d)
+            if found is None:
                 return
-            _, p, local_hit = sup
-            e = self.supports.cache.get(p.id)
-            cs = p.supports.world_contacts(p)
-            if not cs:
-                return
-            if e.result.pillars:
-                i = supportmod.nearest_pillar(e.result.pillars, local_hit)
-                if i is None:
-                    return
-                target = e.result.pillars[i].contact.point + self.supports.offset(p, e)
-                j = int(np.argmin([np.linalg.norm(c.point - target) for c in cs]))
-            else:
-                # imported geometry (SatelLite) has no pillars: the contact above the click in plan view
-                w = local_hit + self.supports.offset(p, e)
-                xy = np.array([np.linalg.norm(c.point[:2] - w[:2]) if c.point[2] >= w[2] - 0.5 else np.inf
-                               for c in cs])
-                j = int(np.argmin(xy))
-                if xy[j] > 2.5:
-                    return
+            p, cs, j = found
             before = SupportsCommand.snapshot(p)
             plan = p.supports.with_contacts(p, cs[:j] + cs[j + 1:])
             self.undo.push(SupportsCommand(self, p.id, before, (plan, p.elevation, p.state()), "Remove support"))
             return
         if part is None or (sup is not None and sup[0] < float(np.linalg.norm(hit - o))):
             return
-        n_local = part.mesh.face_normals[face]
-        nw = part.rotation @ (n_local / part.scale)
-        nw /= np.linalg.norm(nw)
+        nw = self._world_normal(part, face)
         before = SupportsCommand.snapshot(part)
         if part.supports is None:
             params = supportmod.SupportParams()
