@@ -66,22 +66,24 @@ class RemovePartsCommand(QUndoCommand):
 
 
 class MeshCommand(QUndoCommand):
-    """Replace a part's mesh (e.g. repair), keeping placement."""
+    """Replace a part's mesh (e.g. repair), keeping placement; optionally set its see-through
+    view too (Hollow turns it on), which undo puts back."""
 
-    def __init__(self, win, pid: int, new_mesh, text="Repair mesh"):
+    def __init__(self, win, pid: int, new_mesh, text="Repair mesh", see_through: bool | None = None):
         super().__init__(text)
         p = win.scene.get(pid)
         self.win, self.pid = win, pid
-        self.old = (p.mesh, p.state())
+        self.old = (p.mesh, p.state(), p.see_through)
         p.set_mesh(new_mesh)
-        self.new = (p.mesh, p.state())
-        p.mesh, _ = self.old
+        self.new = (p.mesh, p.state(), p.see_through if see_through is None else see_through)
+        p.mesh, _, _ = self.old
         p.set_state(self.old[1])
 
-    def _apply(self, mesh, state):
+    def _apply(self, mesh, state, see_through):
         p = self.win.scene.get(self.pid)
         p.mesh = mesh
         p.set_state(state)
+        p.see_through = see_through
         self.win.scene_changed(mesh_changed=self.pid)
 
     def redo(self):
@@ -89,6 +91,28 @@ class MeshCommand(QUndoCommand):
 
     def undo(self):
         self._apply(*self.old)
+
+
+class SeeThroughCommand(QUndoCommand):
+    """Draw parts see-through, or solid again."""
+
+    def __init__(self, win, ids, on: bool):
+        super().__init__("See-through" if on else "Solid view")
+        self.win, self.on = win, on
+        self.before = {i: win.scene.get(i).see_through for i in ids if win.scene.get(i)}
+
+    def _set(self, vals: dict):
+        for i, v in vals.items():
+            p = self.win.scene.get(i)
+            if p is not None:
+                p.see_through = v
+        self.win.viewport.update()
+
+    def redo(self):
+        self._set({i: self.on for i in self.before})
+
+    def undo(self):
+        self._set(self.before)
 
 
 def mirrored(part: Part, axis: int = 1):

@@ -20,6 +20,8 @@ from .raycast import caster
 
 # Support kinds
 OVERHANG, LOWEST, ISLAND, MANUAL = "overhang", "lowest", "island", "manual"
+# Tip shapes (08 §11) [GOOSLICER, after Lychee's list]; "cone" is SatelLite's only form
+TIP_SHAPES = ("cone", "cylinder", "cube", "cross")
 
 
 @dataclass
@@ -39,9 +41,13 @@ class SupportParams:
     tip_ball: bool = True               # topConnect.topBall
     tip_ball_diameter: float = 0.35     # topConnect.topBallDiameter
     tip_in_part: float = 0.1            # topConnect.distanceInPart
+    tip_shape: str = "cone"             # GooSlicer (08 §11): cone, cylinder, cube or cross
     # bottom connection (supports that land on the model)
     bot_top_width: float = 0.3          # botConnect.topWidth
     bot_in_part: float = 0.1            # botConnect.distanceInPart
+    bot_tip_shape: str = "cone"         # GooSlicer (08 §11): base tip shape
+    bot_ball: bool = False              # GooSlicer: break point ball on base tips
+    bot_ball_diameter: float = 0.35
     # pillar
     pillar_top_width: float = 0.7       # structure.cluster.topWidth
     pillar_bottom_width: float = 0.7    # structure.cluster.bottomWidth
@@ -409,6 +415,44 @@ def _sphere(c, r: float, n: int = 12) -> m3.Manifold:
     return m3.Manifold.sphere(r, n).translate(list(map(float, c)))
 
 
+def _tip_frame(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Two unit vectors across `axis`: u level and square to the way the tip leans (X for a
+    vertical tip), v completing the frame. Cube sides and cross blades line up with them."""
+    u = np.cross(axis, [0.0, 0.0, 1.0])
+    if np.linalg.norm(u) < 1e-6:
+        u = np.array([1.0, 0.0, 0.0])
+    u = u / np.linalg.norm(u)
+    v = np.cross(axis, u)
+    return u, v / np.linalg.norm(v)
+
+
+def _sections(shape: str, r: float) -> list[np.ndarray]:
+    """Convex pieces of a tip's cross-section at half-width r (08 §11)."""
+    if shape == "cube":
+        return [np.array([[-r, -r], [r, -r], [r, r], [-r, r]])]
+    t = r / 3                               # cross blades: a third of the diameter thick
+    return [np.array([[-r, -t], [r, -t], [r, t], [-r, t]]),
+            np.array([[-t, -r], [t, -r], [t, r], [-t, r]])]
+
+
+def tip_piece(a, b, ra: float, rb: float, shape: str, n: int) -> list[m3.Manifold]:
+    """One support tip from a (the support end, half-width ra) to b (the contact end, rb) in
+    the given shape (08 §11). A cylinder keeps rb all the way."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if shape not in ("cube", "cross"):
+        return [_frustum(a, b, rb if shape == "cylinder" else ra, rb, n)]
+    d = b - a
+    L = float(np.linalg.norm(d))
+    if L < 1e-6:
+        return []
+    u, v = _tip_frame(d / L)
+    out = []
+    for qa, qb in zip(_sections(shape, ra), _sections(shape, rb)):
+        pts = np.vstack([a + qa[:, :1] * u + qa[:, 1:] * v, b + qb[:, :1] * u + qb[:, 1:] * v])
+        out.append(m3.Manifold.hull_points(pts.tolist()))
+    return out
+
+
 def plan_pillars(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams) -> tuple[list[Pillar], list[Contact]]:
     """Tip direction = the outward normal, tilted no further than max_tip_angle from vertical
     (SatelLite's rule, 10 §5). The pillar drops vertically from the tip end to the raft, or onto
@@ -520,11 +564,12 @@ def build_supports(model: trimesh.Trimesh, contacts: list[Contact], p: SupportPa
 
 
 def _tip_solids(pl: Pillar, p: SupportParams, n: int) -> list[m3.Manifold]:
-    """Contact tip: frustum from the tip end into the model, optional ball, joint sphere."""
+    """Contact tip from the tip end into the model in its shape (08 §11), the optional break
+    point ball, and the joint sphere."""
     c = pl.contact
     nrm = c.normal / max(np.linalg.norm(c.normal), 1e-12)
     start = c.point - nrm * p.tip_in_part
-    out = [_frustum(pl.tip_end, start, p.tip_bottom_width / 2, p.tip_top_width / 2, n)]
+    out = tip_piece(pl.tip_end, start, p.tip_bottom_width / 2, p.tip_top_width / 2, p.tip_shape, n)
     if p.tip_ball:
         out.append(_sphere(c.point, max(p.tip_ball_diameter, p.tip_top_width) / 2))
     out.append(_sphere(pl.tip_end, max(p.pillar_top_width / 2, p.tip_bottom_width / 2), n))
@@ -540,7 +585,10 @@ def _pillar_solids(pl: Pillar, p: SupportParams, n: int, cone_len: float | None 
         cl = min(L, max(0.0, pl.tip_end[2] - pl.foot[2]) * 0.5)
         mid = pl.foot + np.array([0, 0, cl])
         out.append(_frustum(mid, pl.tip_end, rp_bot, rp_top, n))
-        out.append(_frustum(pl.foot - np.array([0, 0, p.bot_in_part]), mid, p.bot_top_width / 2, rp_bot, n))
+        out += tip_piece(mid, pl.foot - np.array([0, 0, p.bot_in_part]), rp_bot, p.bot_top_width / 2,
+                         p.bot_tip_shape, n)
+        if p.bot_ball:
+            out.append(_sphere(pl.foot, max(p.bot_ball_diameter, p.bot_top_width) / 2))
     else:
         out.append(_frustum(pl.foot - np.array([0, 0, 0.01]), pl.tip_end, rp_bot, rp_top, n))
         out += _plat_foot(pl.foot, pl.tip_end[2] - pl.foot[2], p, n)

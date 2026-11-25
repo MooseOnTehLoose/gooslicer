@@ -1,10 +1,14 @@
 """Supports in the GUI: template dialog, per-part geometry cache with background rebuilds, undo."""
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QUndoCommand
-from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+                               QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
                                QRadioButton, QVBoxLayout)
 
 from gooslicer import supports as S
@@ -43,21 +47,206 @@ def support_note(t, max_height: float, have_templates: bool) -> str:
     return txt
 
 
-def support_params(t) -> tuple[S.SupportParams, str]:
-    """(parameters, template name) for a support_choices() entry."""
+def support_params(t, tips: dict | None = None) -> tuple[S.SupportParams, str]:
+    """(parameters, template name) for a support_choices() entry, with the user's tip
+    overrides (08 §11) on top."""
     if t is None:
-        return S.SupportParams(), ""
-    if t == "tree":
-        return S.SupportParams.tree_defaults(), ""
-    return S.SupportParams.from_template(t), t.name
+        p, name = S.SupportParams(), ""
+    elif t == "tree":
+        p, name = S.SupportParams.tree_defaults(), ""
+    else:
+        p, name = S.SupportParams.from_template(t), t.name
+    return apply_tips(p, tips), name
+
+
+# ------------------------------------------------------------------ tip settings (08 §11)
+TIP_SHAPE_LABELS = {"cone": "Cone", "cylinder": "Cylinder", "cube": "Cube", "cross": "Cross"}
+# field: (type, minimum, maximum); the order is the dialog's
+TIP_FIELDS = {
+    "tip_shape": (str, None, None), "tip_top_width": (float, 0.05, 5.0),
+    "tip_bottom_width": (float, 0.05, 5.0), "tip_length": (float, 0.1, 20.0),
+    "tip_in_part": (float, 0.0, 2.0), "tip_ball": (bool, None, None),
+    "tip_ball_diameter": (float, 0.05, 5.0), "max_tip_angle": (float, 0.0, 85.0),
+    "bot_tip_shape": (str, None, None), "bot_top_width": (float, 0.05, 5.0),
+    "bot_in_part": (float, 0.0, 2.0), "bot_ball": (bool, None, None),
+    "bot_ball_diameter": (float, 0.05, 5.0),
+}
+TIPS_KEY = "supportTips"
+
+
+def clean_tips(d) -> dict:
+    """Only known fields, of the right type and in range; anything else is dropped."""
+    out = {}
+    for k, v in (d or {}).items() if isinstance(d, dict) else ():
+        if k not in TIP_FIELDS:
+            continue
+        typ, lo, hi = TIP_FIELDS[k]
+        if typ is str:
+            if v in S.TIP_SHAPES:
+                out[k] = v
+        elif typ is bool:
+            if isinstance(v, bool):
+                out[k] = v
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = float(min(max(v, lo), hi))
+    return out
+
+
+def apply_tips(p: S.SupportParams, tips: dict | None) -> S.SupportParams:
+    t = clean_tips(tips)
+    return replace(p, **t) if t else p
+
+
+def load_tips(settings) -> dict:
+    try:
+        return clean_tips(json.loads(settings.value(TIPS_KEY, "") or "{}"))
+    except (TypeError, ValueError):
+        return {}
+
+
+def save_tips(settings, tips: dict) -> None:
+    tips = clean_tips(tips)
+    if tips:
+        settings.setValue(TIPS_KEY, json.dumps(tips, sort_keys=True))
+    else:
+        settings.remove(TIPS_KEY)
+
+
+def tip_summary(p: S.SupportParams, custom: bool) -> str:
+    """One line for the panel: shape, contact diameter, break point."""
+    txt = f"{TIP_SHAPE_LABELS.get(p.tip_shape, p.tip_shape)}, {p.tip_top_width:g} mm"
+    if p.tip_ball:
+        txt += f", break point {p.tip_ball_diameter:g} mm"
+    return txt + (" (custom)" if custom else "")
+
+
+class TipSettingsDialog(QDialog):
+    """How supports meet the model (08 §11): shown with the support type's values (`base`)
+    plus the saved overrides; `overrides()` returns the fields that differ from `base`."""
+
+    def __init__(self, base: S.SupportParams, tips: dict | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Tip settings")
+        self.base = base
+        lay = QVBoxLayout(self)
+        note = QLabel("How supports connect to the model. Changed values apply on top of every "
+                      "support type until you use the template values again.")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        self.w: dict = {}
+        top = QGroupBox("Tip (on overhangs)")
+        lay.addWidget(top)
+        f = QFormLayout(top)
+        self._shape(f, "tip_shape", "Shape", "Cone narrows from the support to the contact; "
+                    "Cylinder keeps the contact diameter all the way; Cube gives a square mark; "
+                    "Cross gives a thin \u201c+\u201d mark that is easy to sand off")
+        self._num(f, "tip_top_width", "Contact diameter", " mm", "Width where the tip touches the "
+                  "model: bigger holds better but leaves a bigger mark")
+        self._num(f, "tip_bottom_width", "Support end diameter", " mm", "Width where the tip meets "
+                  "the support (not used by Cylinder)")
+        self._num(f, "tip_length", "Length", " mm", "From the support to the model")
+        self._num(f, "tip_in_part", "Penetration", " mm", "How far the tip sinks into the model")
+        self._ball(f, "tip_ball", "tip_ball_diameter")
+        self._num(f, "max_tip_angle", "Max tilt", "°", "Tips lean along the surface normal, "
+                  "up to this angle from vertical, so they meet sloped surfaces square on", 0)
+        bot = QGroupBox("Base tip (supports that land on the model)")
+        lay.addWidget(bot)
+        g = QFormLayout(bot)
+        self._shape(g, "bot_tip_shape", "Shape", "Shape of the tip where a support stands on the model")
+        self._num(g, "bot_top_width", "Contact diameter", " mm", "Width where it touches the model")
+        self._num(g, "bot_in_part", "Penetration", " mm", "How far it sinks into the model")
+        self._ball(g, "bot_ball", "bot_ball_diameter")
+        self.set_values(apply_tips(base, tips))
+        self.reset_btn = QPushButton("Use template values")
+        self.reset_btn.setToolTip("Clear every change and use the support type's own tip values")
+        self.reset_btn.clicked.connect(lambda: self.set_values(self.base))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        row = QHBoxLayout()
+        lay.addLayout(row)
+        row.addWidget(self.reset_btn)
+        row.addStretch(1)
+        row.addWidget(bb)
+
+    def _shape(self, f, key, label, tip):
+        c = QComboBox()
+        f.addRow(label, c)
+        for k, v in TIP_SHAPE_LABELS.items():
+            c.addItem(v, k)
+        c.setToolTip(tip)
+        self.w[key] = c
+
+    def _num(self, f, key, label, suffix, tip, decimals=3):
+        _, lo, hi = TIP_FIELDS[key]
+        b = QDoubleSpinBox()
+        f.addRow(label, b)
+        b.setRange(lo, hi)
+        b.setDecimals(decimals)
+        b.setSingleStep(0.05 if decimals else 5)
+        b.setSuffix(suffix)
+        b.setToolTip(tip)
+        self.w[key] = b
+
+    def _ball(self, f, key, dkey):
+        row = QHBoxLayout()
+        f.addRow("Break point", row)
+        box = QCheckBox()
+        row.addWidget(box)
+        _, lo, hi = TIP_FIELDS[dkey]
+        b = QDoubleSpinBox()
+        row.addWidget(b, 1)
+        b.setRange(lo, hi)
+        b.setDecimals(3)
+        b.setSingleStep(0.05)
+        b.setSuffix(" mm")
+        tip = ("A ball on the contact, wider than the tip: the support snaps at the neck and "
+               "leaves a small cap that is easy to sand")
+        box.setToolTip(tip)
+        b.setToolTip("Ball diameter; make it larger than the contact diameter")
+        box.toggled.connect(b.setEnabled)
+        self.w[key], self.w[dkey] = box, b
+
+    def set_values(self, p: S.SupportParams) -> None:
+        for k, wd in self.w.items():
+            v = getattr(p, k)
+            if isinstance(wd, QComboBox):
+                wd.setCurrentIndex(max(0, wd.findData(v)))
+            elif isinstance(wd, QCheckBox):
+                wd.setChecked(bool(v))
+            else:
+                wd.setValue(float(v))
+        for k in ("tip_ball", "bot_ball"):
+            self.w[k + "_diameter"].setEnabled(self.w[k].isChecked())
+
+    def values(self) -> dict:
+        out = {}
+        for k, wd in self.w.items():
+            if isinstance(wd, QComboBox):
+                out[k] = wd.currentData()
+            elif isinstance(wd, QCheckBox):
+                out[k] = wd.isChecked()
+            else:
+                out[k] = round(wd.value(), 4)
+        return out
+
+    def overrides(self) -> dict:
+        out = {}
+        for k, v in self.values().items():
+            b = getattr(self.base, k)
+            if abs(v - b) > 5e-4 if isinstance(v, float) else v != b:
+                out[k] = v
+        return out
 
 
 class SupportDialog(QDialog):
     """Pick a SatelLite template (from GooSlicer's copy of the user's install) or the built-in values.
     The recommended template follows SatelLite's height rule (06 §1)."""
 
-    def __init__(self, templates, max_height: float, has_selection: bool, parent=None):
+    def __init__(self, templates, max_height: float, has_selection: bool, parent=None,
+                 tips: dict | None = None):
         super().__init__(parent)
+        self.tips = tips
         self.setWindowTitle("Auto-support")
         self.templates = [t for t in templates if t.family in ("evo", "tree")]
         self.combo = QComboBox()
@@ -90,7 +279,7 @@ class SupportDialog(QDialog):
         self.note.setText(support_note(self.combo.currentData(), h, bool(self.templates)))
 
     def params(self) -> tuple[S.SupportParams, str]:
-        return support_params(self.combo.currentData())
+        return support_params(self.combo.currentData(), self.tips)
 
     def apply_to_all(self) -> bool:
         return self.all.isChecked()

@@ -57,6 +57,7 @@ DEFAULTS: dict[str, str] = {
     "view.top": "7",
     "view.front": "1",
     "view.side": "3",
+    "view.see_through": "X",
     "view.logs": "",
     "view.layers": "",
     "view.restore_windows": "",

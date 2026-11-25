@@ -334,3 +334,52 @@ def test_contacts_keep_back_from_overhang_edges():
     strip = _lifted(trimesh.creation.box((10, 0.8, 1)), 10)      # 0.4 mm deep: inset 0.1 mm
     cs = [c for c in S.detect_contacts(strip, p) if c.kind == S.OVERHANG]
     assert len(cs) >= 3 and all(0.4 - abs(c.point[1]) >= 0.1 - 1e-6 for c in cs)
+
+
+def _section_area(solids, z):
+    import manifold3d as m3
+    return m3.Manifold.batch_boolean(solids, m3.OpType.Add).slice(z).area()
+
+
+def test_tip_shapes():
+    """08 §11: the contact mark of each tip shape, and the shape at the support end."""
+    a, b, ra, rb = [0, 0, 0], [0, 0, 1], 0.3, 0.16
+    near_contact, near_support = 0.999, 0.001
+    marks = {sh: _section_area(S.tip_piece(a, b, ra, rb, sh, 64), near_contact) for sh in S.TIP_SHAPES}
+    assert marks["cone"] == pytest.approx(math.pi * rb ** 2, rel=0.02)
+    assert marks["cylinder"] == pytest.approx(marks["cone"], rel=0.01)
+    assert marks["cube"] == pytest.approx((2 * rb) ** 2, rel=0.02)
+    t = 2 * rb / 3
+    assert marks["cross"] == pytest.approx(2 * (2 * rb) * t - t * t, rel=0.03)
+    # a cylinder stays at the contact diameter; the others widen to the support end
+    assert _section_area(S.tip_piece(a, b, ra, rb, "cylinder", 64), near_support) == pytest.approx(marks["cone"], rel=0.02)
+    assert _section_area(S.tip_piece(a, b, ra, rb, "cube", 64), near_support) == pytest.approx((2 * ra) ** 2, rel=0.02)
+    # cube sides square to the lean: a tip leaning along +X has a side along Y
+    lean = S.tip_piece([0, 0, 0], [1, 0, 1], ra, rb, "cube", 16)[0].to_mesh()
+    v = np.asarray(lean.vert_properties)[:, :3]
+    assert np.ptp(v[:, 1]) == pytest.approx(2 * ra, abs=1e-6)
+
+
+def test_tip_shape_and_base_tip_in_supports():
+    """Shapes and break points reach the built supports, and survive the plan's dict form."""
+    from dataclasses import replace
+    m = _lifted(trimesh.creation.box((10, 10, 2)))
+    c = [S.Contact(np.array([0.0, 0, m.bounds[0][2]]), np.array([0, 0, -1.0]), S.MANUAL)]
+    vols = {}
+    for sh in S.TIP_SHAPES:
+        p = replace(S.SupportParams(), tip_shape=sh, tip_ball=False)
+        r = S.build_supports(m, c, p)
+        assert len(r.pillars) == 1 and r.mesh is not None
+        vols[sh] = r.mesh.volume
+    assert len({round(v, 4) for v in vols.values()}) == 4
+    p = replace(S.SupportParams(), tip_shape="cross", bot_tip_shape="cube", bot_ball=True, bot_ball_diameter=0.6)
+    assert S.SupportParams.from_dict(p.to_dict()) == p
+    # a support landing on the model gets the base tip shape and its break point
+    shelf = trimesh.util.concatenate([trimesh.creation.box((10, 10, 1)),
+                                      trimesh.creation.box((10, 10, 1)).apply_translation([0, 0, 8])])
+    sc = [S.Contact(np.array([0.0, 0, 7.5]), np.array([0, 0, -1.0]), S.MANUAL)]
+    q = replace(S.SupportParams(), raft=False)
+    r0 = S.build_supports(shelf, sc, q)
+    r1 = S.build_supports(shelf, sc, replace(q, bot_tip_shape="cube", bot_ball=True, bot_ball_diameter=0.8))
+    assert r0.pillars[0].on_model and r1.pillars[0].on_model
+    assert r1.mesh.volume > r0.mesh.volume

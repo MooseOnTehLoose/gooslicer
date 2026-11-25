@@ -203,13 +203,12 @@ def test_hollow_drill_and_trapped_resin(app, tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
     monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
-    from gooslicer_qt.hollowing import DrainHoleDialog, HollowDialog
+    from gooslicer_qt.hollowing import DrainHoleDialog, HollowFields
     from gooslicer_qt.main import MainWindow
     s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
     w = MainWindow(settings=s)
     # dialogs start at SatelLite's defaults
-    d = HollowDialog(s)
-    assert d.value() == HollowSettings()
+    assert HollowFields(s).value() == HollowSettings()
     hs, direction = DrainHoleDialog(s).value()
     assert (hs.radius1, hs.radius2, hs.extend1, hs.extend2, direction) == (2, 2, 2, 2, "normal")
 
@@ -223,8 +222,44 @@ def test_hollow_drill_and_trapped_resin(app, tmp_path, monkeypatch):
     assert w.trapped_resin() == []
     done = []
     w.hollowFinished.connect(done.append)
-    w.hollow_selected(HollowSettings(thickness=1.5, accuracy=0.5))
+    # Hollow opens its settings over the 3D view's top-left and stays until Done or Esc
+    w.viewport.set_selection([])
+    w.hollow_dialog()
+    hp = w.hollow_panel
+    app.processEvents()
+    assert (not hp.isHidden()) and hp.parentWidget() is w.viewport and hp.pos().x() == 12
+    assert not hp.hollow_btn.isEnabled()                       # nothing selected yet
+    w.select([part.id])
+    app.processEvents()
+    assert hp.hollow_btn.isEnabled() and hp.hollow_btn.text() == "Hollow"
+    hp.fields.set_value(HollowSettings(thickness=1.5, accuracy=0.5))
+    assert not part.see_through
+    hp.hollow_btn.click()
+    assert (not hp.status.isHidden()) and "Hollowing 1 part" in hp.status.text()
     assert _wait(app, lambda: done, 60) and done == [True]
+    app.processEvents()
+    assert (not hp.isHidden()) and not (not hp.status.isHidden())       # still open for the next part
+    assert part.see_through                                    # hollowed parts are drawn see-through
+    w.undo.undo()
+    assert not part.see_through
+    w.undo.redo()
+    assert part.see_through
+    # the right-click menu and View → See-through switch it; undoable
+    sm = next(a for a in w.part_menu(part.id).actions() if a.text() == "See-through")
+    assert sm.isCheckable() and sm.isChecked()
+    w.toggle_see_through()
+    assert not part.see_through
+    w.undo.undo()
+    assert part.see_through
+    # opening the drain-hole tool closes the Hollow panel; Esc closes it too
+    w.drain_hole_mode()
+    assert not (not hp.isHidden()) and (not w.hole_panel.isHidden())
+    w.viewport.stop_hole_mode()
+    w.hollow_dialog()
+    assert (not hp.isHidden())
+    from PySide6.QtTest import QTest
+    QTest.keyClick(w.viewport, QtCore.Qt.Key_Escape)
+    assert not (not hp.isHidden())
     wm = part.world_mesh()
     assert wm.is_watertight
     assert wm.volume == pytest.approx(20 * 20 * 10 - 17 * 17 * 7, rel=0.02)
@@ -1107,6 +1142,13 @@ def test_supports_and_slicing_sections(app, tmp_path, monkeypatch):
     jp.support_type.setCurrentIndex(0)
     jp.generate_btn.click()
     assert called[-1] == ("cube", False, "")
+    # the Tips line shows the type's tip; saved tip overrides reach Generate (08 §11)
+    assert jp.tips_label.text() == "Cone, 0.32 mm, break point 0.35 mm" and jp.tips_btn.isEnabled()
+    s.setValue("supportTips", '{"tip_shape": "cube", "tip_ball": false}')
+    jp.refresh()
+    assert jp.tips_label.text() == "Cube, 0.32 mm (custom)" and jp.params()[0].tip_shape == "cube"
+    s.remove("supportTips")
+    jp.refresh()
     # Remove supports sits right of Generate; the island check below them, in Supports
     sup_box = jp.generate_btn.parentWidget()
     assert sup_box.title() == "Supports" and sup_box.isAncestorOf(jp.islands_btn)
@@ -1599,10 +1641,10 @@ def test_preferences_window(app, tmp_path, monkeypatch):
     d.show_page("Hollowing")
     d.hollow.thickness.setValue(3.5)
     assert float(s.value("hollow/thickness")) == 3.5
-    from gooslicer_qt.hollowing import HollowDialog
-    assert HollowDialog(s).value().thickness == 3.5               # the Hollow dialog starts there
+    from gooslicer_qt.hollowing import HollowFields
+    assert HollowFields(s).value().thickness == 3.5               # the Hollow panel starts there
     d.reset_page()
-    assert HollowDialog(s).value() == HollowSettings()
+    assert HollowFields(s).value() == HollowSettings()
     d.show_page("Drain holes")
     d.drain.r1.setValue(2.25)
     assert float(s.value("drain/radius1")) == 2.25

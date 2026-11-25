@@ -27,7 +27,7 @@ Not used yet: `anchorDisBorder`. A row of contacts along the inset line at that 
 
 ## 3. Structure (EVO)
 Per contact:
-- **Tip:** a frustum from `topConnect.topWidth` at the model (sunk `distanceInPart` along the normal) to `bottomWidth` at the tip end, `tipLength` long. Optional ball of `topBallDiameter` at the contact, and a joint sphere at the tip end.
+- **Tip:** (for the `cone` shape; other shapes in §11) a frustum from `topConnect.topWidth` at the model (sunk `distanceInPart` along the normal) to `bottomWidth` at the tip end, `tipLength` long. Optional ball of `topBallDiameter` at the contact, and a joint sphere at the tip end.
 - **Tip direction:** the outward normal, tilted no further than `max_tip_angle` from vertical (default 30°), keeping the normal's heading. This is SatelLite's rule, measured on a SatelLite project **[SAMPLE, 10 §5]**; the parameter's name is GooSlicer's. Until 2026-11-24 GooSlicer blended the normal with straight down and capped at 45° **[GOOSLICER]**, which halved most tips' angle.
 - **Collision avoidance:** the tip ray must stay clear of the model for `tipLength`. Candidates are tried in order: the capped normal, halfway to vertical (also capped), straight down **[GOOSLICER]**. A tip end found inside the model (rays can slip through seams) is rejected.
 - **Ray queries** (`raycast.py`, 2026-11-24) [GOOSLICER]: trimesh's ray tester without Embree tests nearly every face for a long ray and held ~9 GB for hundreds of rays on a 300k-face model. A `Caster`, built once per mesh, bins faces on XY grids by size level for vertical rays and keeps k-d trees of face centres for short segments, querying in chunks so memory stays bounded.
@@ -159,3 +159,37 @@ The Auto Position button (Models → Properties, below Lay flat) turns the selec
 - `anchorDisBorder`: needs a SatelLite project where it differs from `anchorDis`.
 - 106 rejected contacts on arc (EVO, 30° cap; 96 with the old 45° blend; 84 with tree values; no islands left in either case): mostly points with no clear tip path or a downward surface below. Worth checking that none leave an area unsupported (the island check passes today).
 - On SatelLite's own supported points (10 §5), GooSlicer's checks reject 1 of 370. So the arc rejections above are mostly points SatelLite wouldn't support either; SatelLite left 130 of its 500 detected points unsupported.
+
+## 11. Tip types [GOOSLICER, after Lychee's support components]
+SatelLite's templates have one tip form, the round frustum of §3, and no tip-shape key **[OBSERVED: no such key in the shipped templates]**. GooSlicer adds tip shapes and puts the tip settings that matter most within reach. The list follows Lychee Slicer's public documentation of its support components (doc.mango3d.io, "Support Components"): tip shape (Cone, Cylinder, Cube, Cross), tip diameter, tip length, penetration, break point, and a base tip for supports that land on the model. Only the documented features are used; that page gives names, not geometry, so all geometry below is GooSlicer's.
+
+**Tip (where a support meets an overhang)**
+| Setting | Field | Default |
+|---|---|---|
+| Shape | `tip_shape`: `cone`, `cylinder`, `cube`, `cross` | `cone` (SatelLite's) |
+| Contact diameter | `tip_top_width` | template |
+| Diameter at the support end | `tip_bottom_width` (not used by `cylinder`) | template |
+| Length | `tip_length` | template |
+| Penetration | `tip_in_part`, along the surface normal | template |
+| Break point | `tip_ball`, `tip_ball_diameter`: a ball centred on the contact | template |
+| Max tilt | `max_tip_angle`, ° from vertical (§3) | 30° |
+
+**Base tip (where a support lands on the model, §3)**
+| Setting | Field | Default |
+|---|---|---|
+| Shape | `bot_tip_shape` | `cone` |
+| Contact diameter | `bot_top_width` | template |
+| Penetration | `bot_in_part`, straight down | template |
+| Break point | `bot_ball`, `bot_ball_diameter` | off, 0.35 mm |
+
+**Shapes.** Each runs from the support end (the tip end, or the bottom of an on-model pillar) to the contact, sunk by the penetration.
+- `cone`: a round frustum with `poly_edges` sides from the support-end diameter to the contact diameter. Same as §3.
+- `cylinder`: round, at the contact diameter all the way. The joint sphere at the tip end meets the wider pillar. Every contact gets the same mark and the same strength, whatever the tip length.
+- `cube`: a square frustum, with the side equal to the diameter at each end. One pair of sides faces the direction the tip leans, or X for a vertical tip. The contact mark is square.
+- `cross`: two crossed blades forming a "+". Each blade is as long as the diameter and a third of it thick, at both ends, and the blades are aligned like the cube's sides. The mark is a thin "+", which needs less sanding than a round mark of the same span. Its stiffness across the blades is lower.
+
+**Break point.** A ball larger than the tip, centred on the contact and so half inside the model, with the tip joining it at the narrower contact diameter. The support snaps at the neck, leaving the ball's cap on the model, which is easier to sand than a torn crater. This is SatelLite's `topBall`; GooSlicer adds the same ball to base tips.
+
+**Where it's set.** The Supports panel's "Tip settings…" dialog shows the selected support type's values. Values the user changes are saved as overrides (`supportTips` in the settings) and apply on top of every template, until "Use template values" clears them. The panel's Tips line sums up the result, with "(custom)" when overrides apply. Generate supports, Fix islands, Models → Auto-support, Auto Position and manual supports on a bare part all use the overridden values. They are stored in the part's `SupportPlan`, so a saved project rebuilds the same tips. Imported SatelLite support geometry (§6) is not changed.
+
+Not taken from Lychee: mid-section and base shapes, Adaptive Base, Join Cone, Angle Factor, the Relative Calculator, and mini supports (GooSlicer's tight-gap double cone of §3 is its nearest form).

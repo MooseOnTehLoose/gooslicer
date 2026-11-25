@@ -133,6 +133,8 @@ def save(path: str | os.PathLike, project: Project, *, support_meshes: dict | No
                     entry = {"object": objects[id(part.mesh)], "item": i, "name": part.name,
                              "position": part.position.tolist(), "rotation": part.rotation.tolist(),
                              "scale": part.scale.tolist(), "elevation": float(part.elevation)}
+                    if part.see_through:
+                        entry["seeThrough"] = True
                     if part.supports is not None:
                         if id(part.supports) not in plans:
                             plans[id(part.supports)] = len(plan_list)
@@ -313,7 +315,7 @@ def _build(doc: dict, model: bytes, progress) -> Project:
                     np.asarray(d["position"], float).reshape(3).copy(),
                     np.asarray(d["rotation"], float).reshape(3, 3).copy(),
                     np.asarray(d["scale"], float).reshape(3).copy(),
-                    elevation=float(d.get("elevation", 0.0)))
+                    elevation=float(d.get("elevation", 0.0)), see_through=d.get("seeThrough") is True)
         if np.any(part.scale <= 0):
             raise ProjectError(f"part {part.name!r} has a scale that isn't positive")
         if "plan" in d:

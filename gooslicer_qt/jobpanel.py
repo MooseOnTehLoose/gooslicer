@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QFrame, QGridL
 from . import flaws as flawmod
 from .panels import InfoButton, show_popup
 
-from .supporting import recommended_choice, support_choices, support_note, support_params
+from .supporting import (TipSettingsDialog, load_tips, recommended_choice, save_tips,
+                         support_choices, support_note, support_params, tip_summary)
 
 
 def format_duration(seconds: int) -> str:
@@ -70,9 +71,18 @@ class JobPanel(QWidget):
         self.islands_result = QLabel()
         self.islands_result.setWordWrap(True)
         self.islands_result.hide()
+        self.tips_label = QLabel()
+        self.tips_label.setWordWrap(True)
+        self.tips_btn = QPushButton("Tip settings…")
+        self.tips_btn.setToolTip("How supports connect to the model: tip shape, contact diameter, "
+                                 "length, penetration and break point")
         form = QFormLayout()
-        form.addRow("Support type", self.support_type)
         sl.addLayout(form)
+        form.addRow("Support type", self.support_type)
+        trow = QHBoxLayout()
+        form.addRow("Tips", trow)
+        trow.addWidget(self.tips_label, 1)
+        trow.addWidget(self.tips_btn)
         sl.addWidget(self.support_note)
         sl.addLayout(self._button_grid([self.generate_btn, self.remove_btn, self.islands_btn, self.fix_btn]))
         sl.addWidget(self.islands_result)
@@ -158,6 +168,7 @@ class JobPanel(QWidget):
         self.seal_btn.clicked.connect(self.seal_cavities)
         self.support_type.currentIndexChanged.connect(self._type_picked)
         self.generate_btn.clicked.connect(self.generate)
+        self.tips_btn.clicked.connect(self.edit_tips)
         self.remove_btn.clicked.connect(lambda: self.win.clear_supports())
         self.islands_btn.clicked.connect(self.check_islands)
         self.fix_btn.clicked.connect(self.fix_islands)
@@ -199,6 +210,21 @@ class JobPanel(QWidget):
         c.blockSignals(False)
         self._update_support_text(parts, h)
 
+    def tips(self) -> dict:
+        """The user's tip overrides (08 §11)."""
+        return load_tips(self.win.settings)
+
+    def params(self):
+        """(SupportParams, template name) of the picked support type with the tip overrides."""
+        return support_params(self.support_type.currentData(), self.tips())
+
+    def edit_tips(self) -> None:
+        base, _ = support_params(self.support_type.currentData())
+        dlg = TipSettingsDialog(base, self.tips(), self)
+        if dlg.exec() == TipSettingsDialog.Accepted:
+            save_tips(self.win.settings, dlg.overrides())
+            self._update_support_text()
+
     def _update_support_text(self, parts=None, h=None) -> None:
         parts = self._targets() if parts is None else parts
         h = self._height(parts) if h is None else h
@@ -212,6 +238,8 @@ class JobPanel(QWidget):
         note = support_note(self.support_type.currentData(), h, bool(self._templates))
         # the button keeps one short label (the Hollowing and Supports buttons share a width)
         self.support_note.setText(f"{note} Supports go on {target}." if target else note)
+        tips = self.tips()
+        self.tips_label.setText(tip_summary(self.params()[0], bool(tips)))
         self.hollow_btn.setEnabled(bool(self.win.selected_ids()))
         self.drain_btn.setEnabled(n > 0)
         self.trapped_btn.setEnabled(n > 0 and not self._trapped_busy)
@@ -255,7 +283,7 @@ class JobPanel(QWidget):
         parts = self._targets()
         if not parts:
             return
-        params, name = support_params(self.support_type.currentData())
+        params, name = self.params()
         for p in parts:
             self.win.auto_support(p, params, name)
 
@@ -339,7 +367,7 @@ class JobPanel(QWidget):
         self.fix_btn.setEnabled(False)
         self.islands_result.setText("Checking for islands…")
         self.islands_result.show()
-        params, name = support_params(self.support_type.currentData())
+        params, name = self.params()
 
         def done(msg: str):
             self.islands_btn.setEnabled(True)

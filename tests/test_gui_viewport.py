@@ -477,7 +477,7 @@ def test_right_click_menu_on_a_part(app, win, tmp_path, monkeypatch):
     mouse(vp, QEvent.MouseButtonPress, at, Qt.RightButton)
     mouse(vp, QEvent.MouseButtonRelease, at, Qt.RightButton, Qt.NoButton)
     assert asked == [p.id] and win.selected_ids() == [p.id]
-    assert shown == [["Add instance", "Mirror"]]
+    assert shown == [["Add instance", "Mirror", "See-through"]]
     # a right drag orbits and opens nothing
     yaw = vp.camera.yaw
     mouse(vp, QEvent.MouseButtonPress, at, Qt.RightButton)
@@ -822,3 +822,38 @@ def test_view_colors_and_transparency(app, win, tmp_path):
     vp.set_selection([part.id])
     sel = at()
     assert sel.redF() > 0.5 and sel.blueF() > 0.5 and sel.greenF() < 0.1
+
+
+def test_tip_settings_overrides(app, tmp_path):
+    """08 §11: the tip dialog shows the support type's values; changed ones are saved as
+    overrides that apply on top of any type, until 'Use template values'."""
+    from PySide6.QtCore import QSettings
+    from gooslicer import supports as S
+    from gooslicer_qt.supporting import (TipSettingsDialog, load_tips, save_tips, support_params,
+                                         tip_summary)
+    qs = QSettings(str(tmp_path / "s.ini"), QSettings.IniFormat)
+    base = S.SupportParams()
+    d = TipSettingsDialog(base, load_tips(qs))
+    assert d.overrides() == {} and d.values()["tip_shape"] == "cone"
+    d.w["tip_shape"].setCurrentIndex(d.w["tip_shape"].findData("cross"))
+    d.w["tip_top_width"].setValue(0.5)
+    d.w["bot_ball"].setChecked(True)
+    assert d.w["bot_ball_diameter"].isEnabled()
+    assert d.overrides() == {"tip_shape": "cross", "tip_top_width": 0.5, "bot_ball": True}
+    save_tips(qs, d.overrides())
+    tips = load_tips(qs)
+    p, _ = support_params(None, tips)
+    assert (p.tip_shape, p.tip_top_width, p.bot_ball, p.tip_length) == ("cross", 0.5, True, base.tip_length)
+    t, _ = support_params("tree", tips)                       # the same overrides on a tree type
+    assert t.style == "tree" and t.tip_shape == "cross" and t.tip_length == S.SupportParams.tree_defaults().tip_length
+    assert tip_summary(p, True) == "Cross, 0.5 mm, break point 0.35 mm (custom)"
+    # reopened with the saved overrides; 'Use template values' clears them
+    d2 = TipSettingsDialog(base, tips)
+    assert d2.overrides() == tips
+    d2.reset_btn.click()
+    assert d2.overrides() == {}
+    save_tips(qs, d2.overrides())
+    assert load_tips(qs) == {} and qs.value("supportTips") is None
+    # bad stored values are ignored
+    qs.setValue("supportTips", '{"tip_shape": "star", "tip_length": 999, "bogus": 1}')
+    assert load_tips(qs) == {"tip_length": 20.0}

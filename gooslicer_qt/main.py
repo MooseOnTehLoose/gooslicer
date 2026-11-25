@@ -28,9 +28,10 @@ from gooslicer.scene import Part, Scene, prepare, ray_triangles, rotation_betwee
 
 from . import colors as colormod
 from . import workers
-from .commands import AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, StateCommand
+from .commands import (AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, SeeThroughCommand,
+                       StateCommand)
 from .camera import CameraPanel
-from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowDialog, drill_part_keep, hole_axis_world,
+from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowPanel, drill_part_keep, hole_axis_world,
                         hole_preview_mesh)
 from .jobpanel import JobPanel
 from .memory import MemoryMonitor, StatusBar, trim_memory_soon
@@ -323,6 +324,7 @@ class MainWindow(QMainWindow):
         self._dismissed_parts = None     # the parts (meshes, placement) the dismissals are for
         self._hole_queue: list = []      # drain-hole clicks waiting to be drilled
         self._drilling = False
+        self._hollowing: set[int] = set()   # parts being hollowed
         self._layout_done = False
         self._slice_thread = None
         self._progress = QProgressBar()             # only shown while slicing
@@ -494,6 +496,8 @@ class MainWindow(QMainWindow):
         self._act(v, "view.top", "&Top", lambda: self.viewport.set_view(-90, 89))
         self._act(v, "view.front", "F&ront", lambda: self.viewport.set_view(-90, 0))
         self._act(v, "view.side", "&Side", lambda: self.viewport.set_view(0, 0))
+        self._act(v, "view.see_through", "See-t&hrough", self.toggle_see_through,
+                  "Draw the selected models (all if none is selected) see-through, or solid again")
         v.addSeparator()
         self._act(v, "view.logs", "&Logs", self.log_window.popup, "Open the log in its own window")
         self._act(v, "view.layers", "&Layers", self.layers_window.popup,
@@ -570,6 +574,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "job_panel"):
             self.job_panel.refresh()
             self._check_held()
+        self._update_hollow_panel()
 
     def _handle_live(self) -> None:
         """A handle drag moved or scaled parts: the Mesh panel follows (the rest updates when the
@@ -645,7 +650,23 @@ class MainWindow(QMainWindow):
         a.setToolTip("Duplicate the model")
         a = m.addAction("Mirror", lambda: self.mirror_part(pid, 1))
         a.setToolTip("Mirror the model along Y (front to back)")
+        p = self.scene.get(pid)
+        a = m.addAction("See-through", lambda on: self.set_see_through([pid], on))
+        a.setCheckable(True)
+        a.setChecked(bool(p and p.see_through))
+        a.setToolTip("Draw the model see-through, to look at its inside (hollowed models start so)")
         return m
+
+    def set_see_through(self, ids, on: bool) -> None:
+        ids = [i for i in ids if self.scene.get(i) and self.scene.get(i).see_through != on]
+        if ids:
+            self.undo.push(SeeThroughCommand(self, ids, on))
+
+    def toggle_see_through(self) -> None:
+        """View → See-through: the selected parts (all if none is selected) switch together."""
+        ps = [p for p in (self.scene.get(i) for i in self.selected_ids()) if p] or list(self.scene.parts)
+        if ps:
+            self.set_see_through([p.id for p in ps], not all(p.see_through for p in ps))
 
     def _part_context(self, pid: int, global_pos) -> None:
         self.select([pid])
@@ -677,7 +698,7 @@ class MainWindow(QMainWindow):
         ids = [i for i in self.selected_ids() if self.scene.get(i)]
         if not ids or getattr(self, "_orienting", False):
             return
-        params, _ = support_params(self.job_panel.support_type.currentData())
+        params, _ = self.job_panel.params()
         jobs = [(p.id, p.name, p.world_vertices().copy(), np.asarray(p.mesh.faces).copy())
                 for p in (self.scene.get(i) for i in ids)]
         self._orienting = True
@@ -745,13 +766,13 @@ class MainWindow(QMainWindow):
         self.statusBar().clearMessage()
 
     # ------------------------------------------------------- hollow / drain holes
-    def _replace_mesh(self, pid, mesh, text, report=None):
+    def _replace_mesh(self, pid, mesh, text, report=None, see_through=None):
         """Swap in a new mesh as an undo step. Pass the mesh's analysis if it was made off the
         GUI thread (it takes about a second for 300k triangles)."""
         if self.scene.get(pid) is None:
             return
         self.reports.pop(id(self.scene.get(pid).mesh), None)
-        self.undo.push(MeshCommand(self, pid, mesh, text))
+        self.undo.push(MeshCommand(self, pid, mesh, text, see_through=see_through))
         new = self.scene.get(pid).mesh
         self.reports[id(new)] = report if report is not None else meshmod.analyze(new)
         meshmod.slim(new)
@@ -759,29 +780,64 @@ class MainWindow(QMainWindow):
         self._sync_panels()
 
     def hollow_dialog(self):
-        p = self.primary()
-        if not p:
-            QMessageBox.information(self, APP, "Select a part to hollow.")
+        """Show the Hollow settings over the top-left of the 3D view until Done (or Esc), as
+        the drain-hole tool does: select a part, press Hollow, repeat."""
+        if not self.scene.parts:
             return
-        dlg = HollowDialog(self.settings, self)
-        if dlg.exec() != HollowDialog.Accepted:
-            return
-        dlg.save()
-        self.hollow_selected(dlg.value())
+        panel = getattr(self, "hollow_panel", None)
+        if panel is None:
+            panel = self.hollow_panel = HollowPanel(self.settings, self.viewport)
+            panel.fields.changed.connect(panel.fields.save)
+            panel.hollow.connect(lambda: self.hollow_selected(self.hollow_panel.fields.value()))
+            panel.finished.connect(self.end_hollow_mode)
+            self.viewport.escapePressed.connect(self.end_hollow_mode)
+        self.viewport.stop_hole_mode()
+        if self.viewport.support_mode:
+            self.viewport.stop_support_mode()
+        self.viewport.lay_flat_mode = False
+        panel.fields.load()
+        self._update_hollow_panel()
+        panel.place()
+        panel.show()
+        self.viewport.setFocus()
+        self.statusBar().showMessage("Hollow: select a part and press Hollow (Esc or Done to finish)")
+
+    def end_hollow_mode(self) -> None:
+        panel = getattr(self, "hollow_panel", None)
+        if panel is not None and not panel.isHidden():
+            panel.hide()
+            self.statusBar().clearMessage()
+
+    def _update_hollow_panel(self) -> None:
+        panel = getattr(self, "hollow_panel", None)
+        if panel is not None:
+            panel.set_state(len([i for i in self.selected_ids() if self.scene.get(i)]),
+                            len(self._hollowing))
 
     def hollow_selected(self, hs):
-        p = self.primary()
-        if not p:
-            return
+        """Hollow every selected part in the background; each becomes an undo step and is
+        drawn see-through afterwards."""
+        for pid in self.selected_ids():
+            p = self.scene.get(pid)
+            if p is not None and pid not in self._hollowing:
+                self._hollow_part(p, hs)
+
+    def _hollow_part(self, p, hs):
         pid, name = p.id, p.name
+        self._hollowing.add(pid)
+        self._update_hollow_panel()
         infill = (f", {hs.infill_type.upper()} infill {hs.infill_size:g} mm cells, struts r {hs.infill_radius:g} mm"
                   if hs.infill and hs.hollow_type != "open_bottom" else "")
         self.log_msg(f"Hollowing {name} ({hs.hollow_type}, wall {hs.thickness} mm, accuracy {hs.accuracy} mm{infill})…")
         self.statusBar().showMessage(f"Hollowing {name}…")
 
         def done(res):
+            self._hollowing.discard(pid)
+            self._update_hollow_panel()
             mesh, r = res
-            self._replace_mesh(pid, mesh, "Hollow")
+            if self.scene.get(pid) is None:
+                return
+            self._replace_mesh(pid, mesh, "Hollow", see_through=True)
             self.log_msg(f"Hollowed {name}: {r.cavities} cavit{'y' if r.cavities == 1 else 'ies'}, "
                          f"volume {r.original_volume:.1f} → {mesh.volume * float(np.prod(np.abs(self.scene.get(pid).scale))):.1f} mm³. "
                          + (f"{r.pillars} pillar{'' if r.pillars == 1 else 's'} hold up the cavity's ceilings. "
@@ -792,6 +848,8 @@ class MainWindow(QMainWindow):
             self.hollowFinished.emit(True)
 
         def failed(msg):
+            self._hollowing.discard(pid)
+            self._update_hollow_panel()
             self.log_msg("Hollow failed: " + msg.splitlines()[0])
             QMessageBox.warning(self, APP, "Hollow failed: " + msg.splitlines()[0])
             self.statusBar().clearMessage()
@@ -814,6 +872,7 @@ class MainWindow(QMainWindow):
                 part, face, hit, *self.hole_panel.fields.value())
         if self.viewport.support_mode:
             self.viewport.stop_support_mode()
+        self.end_hollow_mode()
         self.viewport.lay_flat_mode = False
         panel.fields.load()
         self._hole_settings = panel.fields.value()
@@ -1129,7 +1188,7 @@ class MainWindow(QMainWindow):
             return
         sel = [self.scene.get(i) for i in self.selected_ids()]
         h = max(float(np.ptp(p.world_vertices()[:, 2])) for p in (sel or self.scene.parts))
-        dlg = SupportDialog(self.support_templates(), h, bool(sel), self)
+        dlg = SupportDialog(self.support_templates(), h, bool(sel), self, tips=self.job_panel.tips())
         if dlg.exec() != SupportDialog.Accepted:
             return
         params, name = dlg.params()
@@ -1274,7 +1333,7 @@ class MainWindow(QMainWindow):
         nw = self._world_normal(part, face)
         before = SupportsCommand.snapshot(part)
         if part.supports is None:
-            params = supportmod.SupportParams()
+            params = support_params(None, self.job_panel.tips())[0]
             st = part.state()
             dz = params.lift - part.bounds()[0][2]
             st.position[2] += dz

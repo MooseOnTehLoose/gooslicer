@@ -89,6 +89,7 @@ class Part:
     elevation: float = 0.0                   # height of the part's bottom above the plate: the supports'
                                              # lift, or a bare part raised with the Z arrow
     supports: object = None                  # gooslicer.supports.SupportPlan | None
+    see_through: bool = False                # drawn see-through in the 3D view (hollowed parts start so)
     _cache: tuple | None = field(default=None, repr=False)
     _bcache: tuple | None = field(default=None, repr=False)
 
@@ -198,7 +199,7 @@ class Scene:
     def duplicate(self, part_id: int, offset=None) -> Part:
         src = self.get(part_id)
         dup = Part(f"{src.name} copy", src.mesh, src.position.copy(), src.rotation.copy(), src.scale.copy(),
-                   elevation=src.elevation, supports=src.supports)
+                   elevation=src.elevation, supports=src.supports, see_through=src.see_through)
         dup.position += np.asarray(offset if offset is not None else (src.size()[0] + 2.0, 0, 0))
         return self.add(dup, place=False)
 

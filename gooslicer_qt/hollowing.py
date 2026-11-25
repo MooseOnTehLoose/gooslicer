@@ -456,40 +456,40 @@ class DrainHoleFields(QWidget):
             self.qs.setValue(f"drain/{k}", val)
 
 
-class DrainHolePanel(QFrame):
-    """The drain-hole settings floating over the top-left of the 3D view while holes are added:
-    the view stays live, so parts can be clicked, orbited and zoomed with it open."""
+class FloatingPanel(QFrame):
+    """Settings floating over the top-left of the 3D view while a tool is in use: the view
+    stays live, so parts can be clicked, orbited and zoomed with it open. Subclasses fill
+    `self.body` and may add buttons left of Done to `self.buttons`."""
     finished = Signal()
     entered = Signal()          # the cursor is over the panel, not the model
 
-    def __init__(self, settings, parent=None):
+    def __init__(self, title: str, fields, hint: str, done_tip: str, parent=None):
         super().__init__(parent)
-        self.setObjectName("drainHolePanel")
         self.setFrameShape(QFrame.StyledPanel)
         self.setAutoFillBackground(True)
         self.setCursor(Qt.ArrowCursor)
-        title = QLabel("Drain holes")
-        f = title.font()
-        f.setBold(True)
-        title.setFont(f)
-        self.fields = DrainHoleFields(settings)
-        self.fields.resized.connect(self.place)
-        hint = QLabel("Click a part to drill a hole where the blue preview is. "
-                      "Right-drag orbits, the wheel zooms.")
-        hint.setWordWrap(True)
-        hint.setEnabled(False)
-        self.done_btn = QPushButton("Done")
-        self.done_btn.setToolTip("Stop adding drain holes (Esc)")
-        self.done_btn.clicked.connect(self.finished)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
-        lay.addWidget(title)
-        lay.addWidget(self.fields)
-        lay.addWidget(hint)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        row.addWidget(self.done_btn)
-        lay.addLayout(row)
+        t = QLabel(title)
+        lay.addWidget(t)
+        f = t.font()
+        f.setBold(True)
+        t.setFont(f)
+        self.fields = fields
+        lay.addWidget(fields)
+        self.hint = QLabel(hint)
+        lay.addWidget(self.hint)
+        self.hint.setWordWrap(True)
+        self.hint.setEnabled(False)
+        self.buttons = QHBoxLayout()
+        lay.addLayout(self.buttons)
+        self.buttons.addStretch(1)
+        self.done_btn = QPushButton("Done")
+        self.buttons.addWidget(self.done_btn)
+        self.done_btn.setToolTip(done_tip)
+        self.done_btn.clicked.connect(self.finished)
+
+    def fit_width(self) -> None:
         self.setFixedWidth(max(300, self.sizeHint().width()))
 
     def enterEvent(self, e):
@@ -501,6 +501,53 @@ class DrainHolePanel(QFrame):
         self.adjustSize()
         self.move(12, 12)
         self.raise_()
+
+
+class DrainHolePanel(FloatingPanel):
+    """The drain-hole settings, shown while holes are added."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__("Drain holes", DrainHoleFields(settings),
+                         "Click a part to drill a hole where the blue preview is. "
+                         "Right-drag orbits, the wheel zooms.",
+                         "Stop adding drain holes (Esc)", parent)
+        self.setObjectName("drainHolePanel")
+        self.fields.resized.connect(self.place)
+        self.fit_width()
+
+
+class HollowPanel(FloatingPanel):
+    """The Hollow settings (06 §2), shown until Done: select a part in the view and press
+    Hollow, as many times as needed. Hollowed parts are drawn see-through."""
+    hollow = Signal()
+
+    def __init__(self, settings, parent=None):
+        super().__init__("Hollow", HollowFields(settings),
+                         "Click a part to select it (Ctrl+click for more), then Hollow. Hollowed "
+                         "parts turn see-through so the cavity shows. Right-drag orbits, the wheel zooms.",
+                         "Stop hollowing (Esc)", parent)
+        self.setObjectName("hollowPanel")
+        self.status = QLabel()
+        self.layout().insertWidget(self.layout().indexOf(self.hint) + 1, self.status)
+        self.status.setWordWrap(True)
+        self.status.hide()
+        self.hollow_btn = QPushButton("Hollow")
+        self.buttons.insertWidget(1, self.hollow_btn)
+        self.hollow_btn.setDefault(True)
+        self.hollow_btn.clicked.connect(self.hollow)
+        self.fit_width()
+
+    def set_state(self, selected: int, busy: int) -> None:
+        """Hollow needs a selection; `busy` parts are being hollowed."""
+        self.hollow_btn.setEnabled(selected > 0)
+        self.hollow_btn.setText("Hollow" if selected <= 1 else f"Hollow {selected} parts")
+        self.hollow_btn.setToolTip("Hollow the selected part" if selected == 1 else
+                                   "Hollow the selected parts" if selected else "Select a part first")
+        if busy:
+            self.status.setText(f"Hollowing {busy} part{'' if busy == 1 else 's'}…")
+        self.status.setVisible(bool(busy))
+        if not self.isHidden():
+            self.place()
 
 
 class _FieldsDialog(QDialog):
@@ -520,13 +567,6 @@ class _FieldsDialog(QDialog):
 
     def save(self):
         self.fields.save()
-
-
-class HollowDialog(_FieldsDialog):
-    """Fields and defaults as SatelLite's Hollow dialog (06 §2)."""
-
-    def __init__(self, settings, parent=None):
-        super().__init__(HollowFields(settings), "Hollow part", parent)
 
 
 class DrainHoleDialog(_FieldsDialog):

@@ -47,6 +47,7 @@ A GooSlicer project is a standard 3MF package (3MF Core 1.3, unit millimetre) wi
   "view": { "...": "the 3D view's camera (yaw, pitch, distance, target)" }
 }
 ```
+- `parts[i]` may also carry `"seeThrough": true` for a part drawn see-through (07 §1); it is left out otherwise.
 - `parts[i]` matches build item `i` and names its object. Parts are restored in this order. Position, rotation and scale are stored exactly here; the build item's transform is for other programs, so GooSlicer never has to split a matrix back into them.
 - `plans` holds each `SupportPlan` once, as stored: points and normals in the part's local frame. A part's `plan` is its index; parts that share a plan (Duplicate) share it again on load.
 - `print_settings` is the full set, including values the user changed from the resin profile. On load the printer and resin are selected by name and then these values are applied on top. A printer or resin that no longer exists is logged and the saved values are still applied to the closest match (the same printer family, the first resin).
