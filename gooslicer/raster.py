@@ -62,16 +62,18 @@ def _fdot6(v: np.ndarray) -> np.ndarray:
 
 
 def _edges(polys_px: list[np.ndarray]):
-    """All polygon edges as int64 FDot6 arrays (x0, y0, x1, y1)."""
-    segs = []
-    for p in polys_px:
-        if len(p) < 3:
-            continue
-        q = _fdot6(p)
-        segs.append(np.hstack([q, np.roll(q, -1, axis=0)]))
-    if not segs:
+    """All polygon edges as int64 FDot6 arrays (x0, y0, x1, y1). Done for every polygon at once:
+    layers with hundreds of small outlines (support pillars) spent most of their time in
+    per-polygon numpy calls."""
+    polys = [p for p in polys_px if len(p) >= 3]
+    if not polys:
         return None
-    return np.vstack(segs)
+    lengths = np.fromiter((len(p) for p in polys), np.int64, len(polys))
+    q = _fdot6(np.concatenate(polys))
+    nxt = np.arange(1, len(q) + 1)
+    ends = np.cumsum(lengths)
+    nxt[ends - 1] = ends - lengths              # each polygon's last point joins its first
+    return np.hstack([q, q[nxt]])
 
 
 def _tdiv(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -185,17 +187,28 @@ def encode_spans(r, L, R, width: int, height: int) -> bytes:
     return rle.encode_lengths(values, lengths)
 
 
+def _to_pixels_all(polys_mm: list[np.ndarray], spec: RasterSpec) -> list[np.ndarray]:
+    """spec.to_pixels for every polygon (of 3+ points) in one call; the same values, per point."""
+    polys = [p for p in polys_mm if len(p) >= 3]
+    if not polys:
+        return []
+    lengths = [len(p) for p in polys]
+    return np.split(spec.to_pixels(np.concatenate(polys)), np.cumsum(lengths)[:-1])
+
+
 def rasterize_rle(polys_mm: list[np.ndarray], spec: RasterSpec) -> bytes:
     """Polygons in plate mm -> encoded GOO layer image."""
-    px = [spec.to_pixels(p) for p in polys_mm if len(p) >= 3]
+    px = _to_pixels_all(polys_mm, spec)
     r, L, R = spans(px, spec.res_x, spec.res_y)
     return encode_spans(r, L, R, spec.res_x, spec.res_y)
 
 
 def rasterize_bitmap(polys_mm: list[np.ndarray], spec: RasterSpec) -> np.ndarray:
     """Same fill as a (res_y, res_x) uint8 array — for previews/tests on small specs."""
-    img = np.zeros((spec.res_y, spec.res_x), np.uint8)
-    px = [spec.to_pixels(p) for p in polys_mm if len(p) >= 3]
-    for row, a, b in zip(*spans(px, spec.res_x, spec.res_y)):
-        img[row, a:b] = 255
+    px = _to_pixels_all(polys_mm, spec)
+    row, a, b = spans(px, spec.res_x, spec.res_y)
+    d = np.zeros((spec.res_y, spec.res_x + 1), np.int32)     # +1 at each span start, -1 after
+    np.add.at(d, (row, a), 1)
+    np.add.at(d, (row, b), -1)
+    img = np.where(np.cumsum(d[:, :-1], axis=1) > 0, 255, 0).astype(np.uint8)
     return img

@@ -22,7 +22,7 @@ from gooslicer import slicer as slicermod
 from gooslicer import profile_store, support_defaults
 from gooslicer import supports as supportmod
 from gooslicer.raster import RasterSpec
-from gooslicer.scene import Part, Scene, rotation_between
+from gooslicer.scene import Part, Scene, ray_triangles, rotation_between
 
 from . import workers
 from .commands import AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, StateCommand
@@ -30,6 +30,7 @@ from .camera import CameraPanel
 from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowDialog, drill_part_at, hole_axis_world,
                         hole_preview_mesh, hollow_part)
 from .jobpanel import JobPanel
+from .memory import MemoryMonitor, StatusBar, trim_memory_soon
 from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, ToolWindow, show_popup
 from .printers import PrinterControlPanel
 from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
@@ -157,18 +158,13 @@ def _cavities_and_faces(meshes):
     return cav, [_red(meshes, masks) for masks in each]
 
 
-def _warm(part_mesh):
-    """Build the ray-picking index off the GUI thread (seconds for 1M+ triangles)."""
-    part_mesh.triangles_tree  # noqa: B018 (cached property)
-    return part_mesh
-
-
 def _load_and_analyze(path: str):
     out = []
     for name, m in meshmod.load_meshes(path):
         part = Part.from_mesh(name, m)
-        _warm(part.mesh)
-        out.append((part, meshmod.analyze(m)))
+        rep = meshmod.analyze(part.mesh)
+        meshmod.slim(part.mesh)                 # picking needs no index (scene.ray_triangles)
+        out.append((part, rep))
     return out
 
 
@@ -313,6 +309,10 @@ class MainWindow(QMainWindow):
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.hide()
         self._cancel_btn.clicked.connect(self.cancel_slice)
+        self.setStatusBar(StatusBar(self))                     # memory use at the left
+        self.memory_monitor = MemoryMonitor(self)
+        self.memory_monitor.updated.connect(self.statusBar().set_usage)
+        self.memory_monitor.start()
         self.statusBar().addPermanentWidget(self._progress)
         self.statusBar().addPermanentWidget(self._cancel_btn)
 
@@ -678,7 +678,8 @@ class MainWindow(QMainWindow):
         self.undo.push(MeshCommand(self, pid, mesh, text))
         new = self.scene.get(pid).mesh
         self.reports[id(new)] = report if report is not None else meshmod.analyze(new)
-        workers.submit(_warm, new)
+        meshmod.slim(new)
+        trim_memory_soon()
         self._sync_panels()
 
     def hollow_dialog(self):
@@ -1077,12 +1078,11 @@ class MainWindow(QMainWindow):
             if e is None or e.result.mesh is None:
                 continue
             off = self.supports.offset(p, e)
-            loc, _, _ = e.result.mesh.ray.intersects_location((np.asarray(o) - off)[None], np.asarray(d)[None],
-                                                             multiple_hits=False)
-            if len(loc):
-                dist = float(np.linalg.norm(loc[0] + off - o))
+            hit = ray_triangles(e.result.mesh, np.asarray(o) - off, np.asarray(d))
+            if hit is not None:
+                dist = float(np.linalg.norm(hit[1] + off - o))
                 if best is None or dist < best[0]:
-                    best = (dist, p, loc[0])
+                    best = (dist, p, hit[1])
         return best
 
     def _support_click(self, o, d, remove: bool):
@@ -1307,7 +1307,8 @@ class MainWindow(QMainWindow):
             self.undo.push(MeshCommand(self, pid, fixed))
             # MeshCommand.set_mesh copies the mesh; register the stored one too
             self.reports[id(self.scene.get(pid).mesh)] = rep
-            workers.submit(_warm, self.scene.get(pid).mesh)
+            meshmod.slim(self.scene.get(pid).mesh)
+            trim_memory_soon()
             self.log_msg(f"Repaired {self.scene.get(pid).name}: "
                          + ("OK" if rep.ok else "; ".join(rep.problems())))
             self.statusBar().showMessage(f"Repaired {name}" + ("" if rep.ok else " — problems remain (see the Mesh pane)"),
@@ -1710,6 +1711,7 @@ class MainWindow(QMainWindow):
             self._slice_thread.cancel()
             self._slice_thread.wait(10000)
         self.camera.shutdown()
+        self.memory_monitor.stop()
         self.lan.shutdown()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState(LAYOUT_VERSION))

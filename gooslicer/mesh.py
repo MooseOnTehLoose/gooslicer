@@ -99,6 +99,22 @@ def _duplicate_faces(faces: np.ndarray) -> int:
     return int((f[1:] == f[:-1]).all(axis=1).sum())
 
 
+KEEP_CACHED = ("face_normals",)   # needed to draw a part and drill it; cheap to hold (3 floats a face)
+
+
+def slim(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Drop trimesh's cached per-face arrays except KEEP_CACHED. They're rebuilt if anything
+    asks again. Loading and checking a part leaves about 120 bytes a face behind (corner
+    coordinates, cross products, edge lists), more than the mesh itself."""
+    if len(mesh.faces):
+        mesh.face_normals  # noqa: B018 (computed now, kept: drawing needs them)
+    cache = getattr(getattr(mesh, "_cache", None), "cache", None)
+    if isinstance(cache, dict):
+        for k in [k for k in cache if k not in KEEP_CACHED]:
+            cache.pop(k, None)
+    return mesh
+
+
 def analyze(mesh: trimesh.Trimesh) -> MeshReport:
     faces = np.asarray(mesh.faces)
     counts = _edge_use_counts(faces) if len(faces) else np.zeros(0, int)

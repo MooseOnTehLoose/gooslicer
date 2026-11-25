@@ -16,7 +16,7 @@ import trimesh
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.spatial import Delaunay, cKDTree
 
-from .hollow import to_manifold, to_trimesh
+from .raycast import caster
 
 # Support kinds
 OVERHANG, LOWEST, ISLAND, MANUAL = "overhang", "lowest", "island", "manual"
@@ -319,6 +319,26 @@ class SupportResult:
     trunks: int = 0                 # tree: vertical trunks to the raft (EVO: 0)
 
 
+def join_solids(solids: list[m3.Manifold]) -> trimesh.Trimesh | None:
+    """One mesh holding every solid as its own closed shell, where they overlap too. Slicing
+    (manifold sections, non-zero fill), the island check and the 3D view all treat overlapping
+    closed shells as their union, so the boolean union is not needed. Unioning a typical support
+    set took 1–2 s each time (thousands of small brace rods); joining takes a few ms."""
+    vs, fs, off = [], [], 0
+    for s in solids:
+        mm = s.to_mesh()
+        v = np.asarray(mm.vert_properties)[:, :3]
+        f = np.asarray(mm.tri_verts)
+        if not len(f):
+            continue
+        vs.append(v)
+        fs.append(f.astype(np.int64) + off)
+        off += len(v)
+    if not fs:
+        return None
+    return trimesh.Trimesh(np.vstack(vs).astype(np.float64), np.vstack(fs), process=False)
+
+
 def _frustum(a, b, ra: float, rb: float, n: int) -> m3.Manifold:
     """Cone frustum from point a (radius ra) to point b (radius rb)."""
     a, b = np.asarray(a, float), np.asarray(b, float)
@@ -366,7 +386,7 @@ def plan_pillars(model: trimesh.Trimesh, contacts: list[Contact], p: SupportPara
         hn = np.linalg.norm(h, axis=1)[:, None]
         h = np.where(hn > 1e-9, h / np.maximum(hn, 1e-9), 0)
         D[flat] = np.column_stack([h * math.sin(math.radians(45)), np.full(flat.sum(), -lim)])
-    ray = model.ray
+    rc = caster(model)
     o = P + N * 0.02
     # 1) the tip must not pass through the model: try the blended direction, then straight
     #    down, then the normal (clamped as above) [GOOSLICER]
@@ -375,27 +395,25 @@ def plan_pillars(model: trimesh.Trimesh, contacts: list[Contact], p: SupportPara
         todo = np.nonzero(~ok)[0]
         if not len(todo):
             break
-        hit = np.full(len(todo), np.inf)
-        loc, ri, _ = ray.intersects_location(o[todo], cand[todo], multiple_hits=False)
-        if len(ri):
-            hit[ri] = np.linalg.norm(loc - o[todo][ri], axis=1)
+        hit, _ = rc.rays(o[todo], cand[todo], p.tip_length)
         good = hit >= p.tip_length
         D[todo[good]] = cand[todo[good]]
         ok[todo[good]] = True
     E = P + D * p.tip_length
     if ok.any():            # the tip end must be in free space (rays can slip through seams)
         inside = np.zeros(len(P), bool)
-        inside[ok] = model.contains(E[ok])
+        inside[ok] = rc.contains(E[ok])
         ok &= ~inside
     hit_tip = np.where(ok, np.inf, 0.0)
     # 2) vertical drop from the tip end
     base = p.base_z
     floor = np.full(len(P), -np.inf)
     floor_up = np.ones(len(P), bool)
-    loc, ri, tri = ray.intersects_location(E, np.tile(down, (len(E), 1)), multiple_hits=False)
+    dist, tri = rc.vertical(E)
+    ri = np.flatnonzero(tri >= 0)
     if len(ri):
-        floor[ri] = loc[:, 2]
-        floor_up[ri] = model.face_normals[tri][:, 2] > 0.05    # landing on an upward surface
+        floor[ri] = E[ri, 2] - dist[ri]
+        floor_up[ri] = rc.normals[tri[ri], 2] > 0.05          # landing on an upward surface
     for i, c in enumerate(contacts):
         if hit_tip[i] < p.tip_length or (floor[i] > base and p.inner_support and floor_up[i]
                                          and E[i, 2] - floor[i] < p.min_on_model_length):
@@ -419,13 +437,15 @@ def _short_link(model, c: Contact, p: SupportParams) -> Pillar | None:
     """Tight gap: a vertical double cone from the contact straight down onto an upward-facing
     model surface less than tipLength + minimum length below [GOOSLICER]."""
     o = np.asarray(c.point, float) - np.array([0, 0, 0.02])
-    loc, _, tri = model.ray.intersects_location(o[None], np.array([[0.0, 0, -1]]), multiple_hits=False)
-    if not len(loc) or model.face_normals[tri[0]][2] <= 0.05:
+    rc = caster(model)
+    dist, tri = rc.vertical(o[None])
+    if tri[0] < 0 or rc.normals[tri[0]][2] <= 0.05:
         return None
-    gap = float(o[2] - loc[0][2])
+    gap = float(dist[0])
     if gap < 0.15 or gap > p.tip_length + p.min_on_model_length:
         return None
-    return Pillar(c, np.array([c.point[0], c.point[1], c.point[2] - gap / 2]), loc[0].copy(), True)
+    return Pillar(c, np.array([c.point[0], c.point[1], c.point[2] - gap / 2]),
+                  np.array([o[0], o[1], o[2] - gap]), True)
 
 
 def _clamp_dir(N: np.ndarray, lim: float) -> np.ndarray:
@@ -456,8 +476,7 @@ def build_supports(model: trimesh.Trimesh, contacts: list[Contact], p: SupportPa
     if p.raft and ground:
         raft, holes = _raft(ground, p)
         solids.append(raft)
-    body = m3.Manifold.batch_boolean(solids, m3.OpType.Add)
-    return SupportResult(to_trimesh(body), pillars, rejected, len(braces), holes)
+    return SupportResult(join_solids(solids), pillars, rejected, len(braces), holes)
 
 
 def _tip_solids(pl: Pillar, p: SupportParams, n: int) -> list[m3.Manifold]:
@@ -527,13 +546,13 @@ def _segment_clear(model, a: np.ndarray, b: np.ndarray, clearance: float) -> boo
     L = float(np.linalg.norm(v))
     if L < 1e-6:
         return True
-    loc, _, _ = model.ray.intersects_location(np.array([a, b]), np.array([v / L, -v / L]), multiple_hits=False)
-    if len(loc) and (np.linalg.norm(loc - a, axis=1) < L).any() and (np.linalg.norm(loc - b, axis=1) < L).any():
+    rc = caster(model)
+    frac, _ = rc.segments(np.array([a, b]), np.array([b, a]))
+    if np.isfinite(frac).all() and (frac < 1.0).all():        # crosses the surface
         return False
     t = np.linspace(0.25, 1.0, max(2, int(L / 0.5)))
     pts = a + t[:, None] * v
-    _, dist, _ = trimesh.proximity.closest_point(model, pts)
-    return bool((dist >= clearance).all()) and not model.contains(pts[-1:])[0]
+    return bool(rc.clear_of(pts, clearance).all()) and not rc.contains(pts[-1:])[0]
 
 
 def plan_tree(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams):
@@ -568,7 +587,6 @@ def plan_tree(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams)
         xy = np.array([nd.pos[:2] for nd in nodes])
         for i, j in cKDTree(xy).query_pairs(reach):
             push(i, j)
-    down = np.array([[0.0, 0, -1]])
     while heap:
         _, i, j, m = heapq.heappop(heap)
         if i not in active or j not in active:
@@ -576,8 +594,8 @@ def plan_tree(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams)
         a, b = nodes[i].pos, nodes[j].pos
         ok = all(_segment_clear(model, q, m, clearance) for q in (a, b) if np.linalg.norm(q - m) > 1e-6)
         if ok:              # the joint's trunk must reach the raft clear of the model
-            loc, _, _ = model.ray.intersects_location(m[None] - [0, 0, 1e-3], down, multiple_hits=False)
-            ok = not len(loc) and _segment_clear(model, m, np.array([m[0], m[1], base]),
+            _, hit = caster(model).vertical(m[None] - [0, 0, 1e-3])
+            ok = hit[0] < 0 and _segment_clear(model, m, np.array([m[0], m[1], base]),
                                                  p.pillar_bottom_width / 2 + 0.1)
         if not ok:
             continue
@@ -632,8 +650,7 @@ def build_tree_supports(model: trimesh.Trimesh, contacts: list[Contact], p: Supp
     if p.raft and feet:
         raft, holes = _raft(feet, p)
         solids.append(raft)
-    body = m3.Manifold.batch_boolean(solids, m3.OpType.Add)
-    return SupportResult(to_trimesh(body), pillars, rejected, len(braces), holes, trunks=len(roots))
+    return SupportResult(join_solids(solids), pillars, rejected, len(braces), holes, trunks=len(roots))
 
 
 def _brace_pairs(feet: list[Pillar], max_dist: float, min_dist: float) -> list[tuple[int, int]]:
@@ -787,17 +804,17 @@ def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.0
     from scipy import ndimage
 
     from .raster import RasterSpec, rasterize_bitmap
-    mfs = []
-    for m in meshes:
-        try:
-            mfs.append(to_manifold(m))
-        except ValueError:
-            continue
-    if not mfs:
+    from .slicer import _Body
+    # each mesh is sliced on its own and the outlines filled together (non-zero winding), which
+    # is their union without a boolean; meshes that aren't closed are sectioned as the slicer does
+    meshes = [m for m in meshes if len(m.faces)]
+    bodies = [_Body(np.asarray(m.vertices), np.asarray(m.faces)) for m in meshes]
+    if not bodies:
         return []
-    body = m3.Manifold.batch_boolean(mfs, m3.OpType.Add)
-    bb = body.bounding_box()
-    x0, y0, zmin, x1, y1, zmax = (float(v) for v in bb)
+    lo = np.min([m.bounds[0] for m in meshes if len(m.faces)], axis=0)
+    hi = np.max([m.bounds[1] for m in meshes if len(m.faces)], axis=0)
+    x0, y0, zmin = (float(v) for v in lo)
+    x1, y1, zmax = (float(v) for v in hi)
     um = pixel * 1000
     spec = RasterSpec(int(math.ceil((x1 - x0) / pixel)) + 4, int(math.ceil((y1 - y0) / pixel)) + 4,
                       um, um, mirror_x=False, mirror_y=True, origin_x=x0 - 2 * pixel, origin_y=y0 - 2 * pixel)
@@ -811,8 +828,15 @@ def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.0
     ids = None                      # island id per ungrounded pixel of the previous layer (0 = none)
     found: list[Island] = []        # every ungrounded region, indexed by id - 1
     cells: list[list[np.ndarray]] = []   # flat pixel indices per island, every layer
+    zs = []
     while z < zmax:
-        polys = [np.asarray(q, float) for q in body.slice(z).to_polygons() if len(q) >= 3]
+        zs.append(z)
+        z += h
+        if z < zmin - h:            # skip empty air below the body (nothing to ground or track)
+            n_skip = int((zmin - h - z) / h)
+            z += n_skip * h
+    for z in zs:
+        polys = [q for b in bodies for q in b.section(z)]
         cur = rasterize_bitmap(polys, spec) > 0 if polys else np.zeros((spec.res_y, spec.res_x), bool)
         if ground is None:
             ground, ids = cur, np.zeros(cur.shape, np.int32)
@@ -847,10 +871,6 @@ def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.0
                     cells[i - 1].append(np.flatnonzero(m))
                     new_ids[m] = i
             ground, ids = np.isin(lab, g), new_ids
-        z += h
-        if z < zmin - h:            # skip empty air below the body (nothing to ground or track)
-            n_skip = int((zmin - h - z) / h)
-            z += n_skip * h
     out = []
     for isl, cl in zip(found, cells):
         if not (isl.height > max_hang + 1e-9 or isl.area >= max_area):
@@ -936,19 +956,21 @@ def auto_support(model: trimesh.Trimesh, p: SupportParams, extra: list[Contact] 
 def island_contact(model: trimesh.Trimesh, point) -> Contact | None:
     """The underside of the island containing `point` (a point inside it): cast down."""
     o = np.array([[point[0], point[1], point[2] + 1e-3]])
-    loc, _, tri = model.ray.intersects_location(o, np.array([[0.0, 0, -1]]), multiple_hits=False)
-    if not len(loc) or model.face_normals[tri[0]][2] >= 0:
+    rc = caster(model)
+    dist, tri = rc.vertical(o)
+    if tri[0] < 0 or rc.normals[tri[0]][2] >= 0:
         return None
-    return Contact(loc[0], model.face_normals[tri[0]].copy(), ISLAND)
+    return Contact(o[0] - [0, 0, dist[0]], rc.normals[tri[0]].copy(), ISLAND)
 
 
 def contact_below(model: trimesh.Trimesh, point) -> Contact | None:
     """The model surface point straight below (or at) `point`, approached from underneath."""
     o = np.array([[point[0], point[1], model.bounds[0][2] - 1.0]])
-    loc, _, tri = model.ray.intersects_location(o, np.array([[0.0, 0, 1]]), multiple_hits=False)
-    if not len(loc):
+    rc = caster(model)
+    dist, tri = rc.vertical(o, up=True)
+    if tri[0] < 0:
         return None
-    return Contact(loc[0], model.face_normals[tri[0]].copy(), MANUAL)
+    return Contact(o[0] + [0, 0, dist[0]], rc.normals[tri[0]].copy(), MANUAL)
 
 
 # ------------------------------------------------------------------------- per-part plan

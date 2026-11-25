@@ -1832,3 +1832,65 @@ def test_profiles_copied_so_satellite_can_go(app, tmp_path, monkeypatch):
     assert w.set_resin_dir(str(more))
     assert [r.name for r in w.print_settings.resins] == ["Other"]
     w.close()
+
+
+def test_memory_in_status_bar(app, tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    from gooslicer_qt import memory as M
+    # a child process is counted with GooSlicer
+    child = subprocess.Popen([sys.executable, "-c", "import time; b = bytearray(200_000_000); time.sleep(30)"])
+    try:
+        assert _wait(app, lambda: child.pid in M.descendants(os.getpid()), 5)
+        assert _wait(app, lambda: M.process_bytes(child.pid) > 150e6, 10)
+        use = M.memory_use()
+        assert use.processes >= 2 and use.used > 150e6 and use.total > use.used
+        assert 0 < use.percent < 100
+        assert use.text() == f"{use.used / 1e9:.2f} GB · {use.percent:.1f} %"
+        assert "worker process" in use.tooltip() and " use " in use.tooltip()
+    finally:
+        child.kill()
+        child.wait()
+    assert M.process_bytes(child.pid) == 0                                  # gone: counts nothing
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("WINEPREFIX", str(tmp_path / "wine"))
+    monkeypatch.delenv("GOOSLICER_PROFILE_INI", raising=False)
+    from gooslicer_qt.main import MainWindow
+    w = MainWindow(settings=QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat))
+    w.resize(1200, 800)
+    w.show()
+    sb = w.statusBar()
+    assert isinstance(sb, M.StatusBar)
+    assert _wait(app, lambda: sb.memory.text().startswith("Memory ") and " GB · " in sb.memory.text(), 10)
+    # at the bottom left, and still shown with a message, which starts to its right
+    sb.showMessage("Slicing part.stl…")
+    app.processEvents()
+    assert sb.memory.isVisible() and sb.memory.x() < 20
+    r = sb.message_rect()
+    assert r.left() > sb.memory.geometry().right() and r.width() > 100
+    w._progress.show()                                                     # stops before the progress bar
+    app.processEvents()
+    assert sb.message_rect().right() < w._progress.x()
+    img = sb.grab().toImage()
+    assert img.width() == sb.width()
+    w.close()
+    assert not w.memory_monitor._thread.is_alive() or _wait(app, lambda: not w.memory_monitor._thread.is_alive(), 5)
+
+
+def test_vertex_data_float32_and_memory_trim(app):
+    import numpy as np
+    import trimesh
+
+    from gooslicer_qt import memory as M
+    from gooslicer_qt.viewport import mesh_vertex_data
+    m = trimesh.creation.icosphere(2)
+    vd = mesh_vertex_data(m)
+    ref = np.hstack([m.vertices[m.faces].reshape(-1, 3), np.repeat(m.face_normals, 3, axis=0)])
+    assert vd.dtype == np.float32 and vd.shape == ref.shape and np.allclose(vd, ref, atol=1e-6)
+    M.trim_memory()                                         # gc + malloc_trim: harmless any time
+    M.trim_memory_soon()
+    M.trim_memory_soon()                                    # merged into one, after TRIM_DELAY_MS
+    assert M._trim_timer.isActive()
+    assert _wait(app, lambda: not M._trim_timer.isActive(), 5)

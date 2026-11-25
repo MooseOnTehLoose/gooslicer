@@ -116,6 +116,12 @@ Each phase ends with passing tests and a short demo. Specs are written before th
     These run up to three passes, until every edge has two triangles running opposite ways and nothing is duplicated.
     `samples/Lisa_head_C.stl` starts with 87 shells, 171 hole edges, 60 back-to-back pairs, a fin and a twist. It ends as one closed shell with its volume unchanged (11,693 mm³), in about 4 s; trimesh's repair took 33 s and left it broken. A fan over a strongly curved or concave hole can cross itself; the slicer's non-zero fill copes with that.
   - undo/redo for every edit
+  - Memory per model (2026-11-24): six models with 2.24 M triangles went from +1,586 MB to +401 MB (Xvfb, software GL, where the 3D view's buffers count as RAM; without drawing, +190 MB, about 85 bytes a triangle). How:
+    - No rtree ray index for parts (it was about 280 bytes a triangle); picking uses `scene.ray_triangles`.
+    - `mesh.slim` drops trimesh's cached per-face arrays after a part is checked, keeping only face normals.
+    - The 3D view's vertex data is built directly in float32.
+    - A second after each background job, `memory.trim_memory` runs a full garbage collection (trimesh meshes sit in reference cycles) and glibc's `malloc_trim`, so freed memory goes back to the system.
+  - The status bar's left end shows GooSlicer's memory use in GB and as a percentage of the computer's RAM, updated every 2 s, with status messages to its right (`memory.py`). It counts GooSlicer and its worker processes by proportional set size (PSS), so shared memory is counted once.
   - Edit → Preferences… (`preferences.py`): a modal window, like Resin → Manage resins…, with a searchable category list. Pages: Appearance, Printer, Resin, Slicing, Hollowing, Drain holes, Supports, Network, Files and folders, Windows. Each option is the same setting its pane or dialog uses, so changes apply straight away both ways. Pages with defaults have Restore defaults.
   - out-of-volume parts shown in red and logged
 - **Deviation:** there are no 3D gizmo handles. Moving is done by dragging on the plate plus numeric fields; rotation uses buttons, angle input and lay-flat. Gizmo handles move to P7 if wanted.

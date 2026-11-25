@@ -284,3 +284,17 @@ def test_ray_triangles_matches_trimesh():
         if got is not None:
             assert np.allclose(got[1], loc[0], atol=1e-6)
     assert ray_triangles(m, [0, 0, 100], [0, 0, 1]) is None          # pointing away
+
+
+def test_slim_drops_caches_but_keeps_normals():
+    from gooslicer import mesh as M
+    m = trimesh.creation.icosphere(3)
+    m.triangles, m.triangles_cross, m.area_faces, m.edges_sorted  # noqa: B018 (fill caches)
+    n = m.face_normals.copy()
+    M.analyze(m)
+    M.slim(m)
+    assert set(m._cache.cache) <= set(M.KEEP_CACHED)
+    assert np.allclose(m.face_normals, n) and m.is_watertight             # recomputed on demand
+    fresh = trimesh.Trimesh(trimesh.creation.box().vertices, trimesh.creation.box().faces)
+    M.slim(fresh)
+    assert "face_normals" in fresh._cache.cache and "triangles" not in fresh._cache.cache

@@ -27,6 +27,7 @@ Per contact:
 - **Tip:** a frustum from `topConnect.topWidth` at the model (sunk `distanceInPart` along the normal) to `bottomWidth` at the tip end, `tipLength` long. Optional ball of `topBallDiameter` at the contact, and a joint sphere at the tip end.
 - **Tip direction:** outward normal blended with straight down, clamped to at most 45° from vertical **[GOOSLICER]**.
 - **Collision avoidance:** the tip ray must stay clear of the model for `tipLength`. Candidates are tried in order: blended direction, straight down, clamped normal. A tip end found inside the model (rays can slip through seams) is rejected.
+- **Ray queries** (`raycast.py`, 2026-11-24) [GOOSLICER]: trimesh's ray tester without Embree tests nearly every face for a long ray and held ~9 GB for hundreds of rays on a 300k-face model. A `Caster`, built once per mesh, bins faces on XY grids by size level for vertical rays and keeps k-d trees of face centres for short segments, querying in chunks so memory stays bounded.
 - **Pillar:** vertical from the tip end, `cluster.topWidth` → `bottomWidth`, `polyEdgeNum` sides.
   - Nothing below → lands on the raft (or the plate with no raft).
   - Upward-facing model surface below and `EnableInnerSupport` → lands on the model through a cone of `botConnect.topWidth`, sunk `botConnect.distanceInPart`.
@@ -39,7 +40,7 @@ Per contact:
 - **Raft outline:** the convex hull of pillar feet grown by `platOffset` + pillar radius **[SAMPLE]**: with arc.goo's own feet this is within 1% of its raft.
 - **Raft body:** `platHeight` thick, with the edge chamfered at `slotAngle`.
 - **Raft holes:** a hex grid at `holeInterval`, radius `holeRadius`, `holeEdgeNum` sides. Holes are kept inside the chamfered bottom and clear of pillar feet **[SAMPLE]**: in arc.goo no pillar covers more than 4% of a hole.
-- Everything is unioned with `manifold3d`, so the support body is watertight.
+- Each piece is a closed `manifold3d` solid. They are joined into one mesh as separate shells, not unioned (`join_solids`): slicing (manifold sections, non-zero fill), the island check and the 3D view all treat overlapping closed shells as their union. Unioning a typical support set took 1–2 s on every rebuild; joining takes a few ms (2026-11-24).
 
 ## 5. Unsupported-island check [GOOSLICER]
 - The model plus supports are sliced at the layer height and rasterised at 0.1 mm.
@@ -60,7 +61,7 @@ Per contact:
 - `SupportPlan` stores params and contacts in the **part's local frame**, so supports follow moves, rotations and scaling. Geometry is rebuilt from the plan in a background cache.
 - Supports → Edit (S): click on the model to add a manual contact (`contact_below` finds the underside); Ctrl+click on a support to remove it (`nearest_pillar`, 1.5 mm pick radius). Every change is one undo step.
 - Clear supports removes the plan and drops the part back to the plate.
-- Slicing and "Slice and send" union each part's support mesh with the model.
+- Slicing and "Slice and send" slice each part's support mesh together with the model; overlaps fill as one (non-zero rule).
 
 ## 7. Reference job (arc, EVO_30-60mm defaults)
 | | SatelLite `arc.goo` [SAMPLE] | GooSlicer |

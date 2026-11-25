@@ -641,9 +641,11 @@ def test_drain_hole_panel_and_preview(app, win, tmp_path):
     mouse(vp, QEvent.MouseButtonRelease, pos, Qt.LeftButton, Qt.NoButton)
     assert win.drilling() and p.mesh is old                              # drilled in the background
     loop = QEventLoop()
-    win.undo.indexChanged.connect(lambda *_: loop.quit())
+    quit_loop = lambda *_: loop.quit()
+    win.undo.indexChanged.connect(quit_loop)
     QTimer.singleShot(30000, loop.quit)
     loop.exec()
+    win.undo.indexChanged.disconnect(quit_loop)                         # later undo steps outlive the loop
     assert not win.drilling() and p.mesh is not old and len(p.mesh.faces) > len(old.faces)
     assert win.undo.undoText() == "Drain hole"
     assert panel.isVisible() and vp.hole_mode and vp.hole_preview is not None

@@ -150,10 +150,13 @@ class _Buffer:
 
 
 def mesh_vertex_data(mesh) -> np.ndarray:
-    """Flat-shaded triangle soup: per-corner position + face normal."""
-    pos = np.asarray(mesh.vertices)[np.asarray(mesh.faces)].reshape(-1, 3)
-    nrm = np.repeat(np.asarray(mesh.face_normals), 3, axis=0)
-    return np.hstack([pos, nrm])
+    """Flat-shaded triangle soup: per-corner position + face normal, float32 (what the GPU
+    gets), built in place: 72 bytes a face, with no float64 intermediates several times that."""
+    faces = np.asarray(mesh.faces)
+    out = np.empty((len(faces), 3, 6), np.float32)
+    out[:, :, :3] = np.asarray(mesh.vertices, np.float32)[faces]
+    out[:, :, 3:] = np.asarray(mesh.face_normals, np.float32)[:, None, :]
+    return out.reshape(-1, 6)
 
 
 def plate_lines(size, step: float = 10.0) -> tuple[np.ndarray, np.ndarray]:

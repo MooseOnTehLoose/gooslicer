@@ -41,6 +41,8 @@ def submit(fn, *args, on_done=None, on_failed=None, on_progress=None, **kw) -> J
 
     def finish(*_):
         _live.discard(sig)
+        from .memory import trim_memory_soon
+        trim_memory_soon()                   # jobs (loading, repair, hollowing…) leave freed memory
     if on_done:
         sig.done.connect(on_done)
     if on_failed:

@@ -241,3 +241,37 @@ def test_island_faces_each_keeps_islands_apart():
     combined = S.island_faces([a, b], isl)
     for k in range(2):
         assert (combined[k] == (each[0][k] | each[1][k])).all()
+
+
+def test_joined_support_mesh_slices_like_the_union():
+    import manifold3d as m3
+
+    from gooslicer.slicer import _Body
+    model = trimesh.creation.icosphere(3, radius=8)
+    model.apply_translation([0, 0, 15])
+    p = S.SupportParams()
+    res = S.build_supports(model, S.detect_contacts(model, p), p)
+    assert res.mesh is not None and len(res.pillars) > 5 and res.braces > 0
+    pieces = res.mesh.split(only_watertight=False)
+    assert len(pieces) > len(res.pillars)                  # one closed shell per solid, not merged
+    union = m3.Manifold.batch_boolean([m3.Manifold(m3.Mesh(vert_properties=np.asarray(x.vertices, np.float32),
+                                                           tri_verts=np.asarray(x.faces, np.uint32)))
+                                       for x in pieces], m3.OpType.Add)
+    body = _Body(np.asarray(res.mesh.vertices), np.asarray(res.mesh.faces))
+    assert body.mf is not None                             # the slicer takes it as a manifold
+    for z in (0.3, 2.0, 5.0, 7.5):
+        a = body.mf.slice(z).area()
+        assert a > 0 and abs(a - union.slice(z).area()) < 1e-6 * max(a, 1)
+
+
+def test_islands_see_a_model_that_is_not_closed():
+    # a floating plate above a grounded post: one island, found even with a face missing
+    post = trimesh.creation.box((2, 2, 4))
+    post.apply_translation([0, 0, 2])
+    plate = trimesh.creation.box((6, 6, 1))
+    plate.apply_translation([10, 0, 3])
+    open_plate = trimesh.Trimesh(plate.vertices, plate.faces[1:], process=False)
+    assert not open_plate.is_watertight
+    for top in (plate, open_plate):
+        isl = S.unsupported_islands([post, top], layer_height=0.1)
+        assert len(isl) == 1 and abs(isl[0].point[0] - 10) < 3.5
