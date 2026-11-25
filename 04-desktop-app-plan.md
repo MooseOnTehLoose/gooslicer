@@ -1,6 +1,6 @@
 # Stage 4: Native Linux desktop app — architecture and phased plan
 
-Status: **approved 2026-11-23**. P0 done, P1 done, P2 done (2026-11-23; see 05-slicing-spec.md), P3 done (2026-11-23; simulator plus hardware tests on the user's printer, see 02-lan-sdcp-spec.md §6–7), P4 done (2026-11-23; see 06-support-hollow-defaults-spec.md), P5 done (2026-11-23; see 07-hollow-drain-spec.md), P6 done (2026-11-23; EVO and tree supports, raft, editing, island check with pre-slice warning; see 08-supports-spec.md), P7 next.
+Status: **approved 2026-11-23**. P0 done, P1 done, P2 done (2026-11-23; see 05-slicing-spec.md), P3 done (2026-11-23; simulator plus hardware tests on the user's printer, see 02-lan-sdcp-spec.md §6–7), P4 done (2026-11-23; see 06-support-hollow-defaults-spec.md), P5 done (2026-11-23; see 07-hollow-drain-spec.md), P6 done (2026-11-23; EVO and tree supports, raft, editing, island check with pre-slice warning; see 08-supports-spec.md), P7 in progress (spec drafted 2026-11-24, see 09-projects-polish-spec.md).
 Decisions so far (2026-11-23):
 - Toolkit: Qt6 / PySide6.
 - Algorithms: hybrid. Open, clean-room algorithms, with SatelLite's *defaults and parameters* recovered by reverse engineering.
@@ -124,7 +124,7 @@ Each phase ends with passing tests and a short demo. Specs are written before th
   - The status bar's left end shows GooSlicer's memory use in GB and as a percentage of the computer's RAM, updated every 2 s, with status messages to its right (`memory.py`). It counts GooSlicer and its worker processes by proportional set size (PSS), so shared memory is counted once.
   - Edit → Preferences… (`preferences.py`): a modal window, like Resin → Manage resins…, with a searchable category list. Pages: Appearance, Printer, Resin, Slicing, Hollowing, Drain holes, Supports, Network, Files and folders, Windows. Each option is the same setting its pane or dialog uses, so changes apply straight away both ways. Pages with defaults have Restore defaults.
   - out-of-volume parts shown in red and logged
-- **Deviation:** there are no 3D gizmo handles. Moving is done by dragging on the plate plus numeric fields; rotation uses buttons, angle input and lay-flat. Gizmo handles move to P7 if wanted.
+- **Deviation:** there are no 3D gizmo handles. Moving is done by dragging on the plate plus numeric fields; rotation uses buttons, angle input and lay-flat. Move and scale handles are added in P7 (09 §8); rotation rings already exist.
 - Tests: core tests, plus GL viewport tests run under Xvfb with `scripts/test-gui.sh`.
 
 **P2: Slice → `.goo`**
@@ -176,7 +176,8 @@ GooSlicer's output for the same STL will be compared against it layer by layer: 
 
 **P7: Polish and packaging**
 - Project save/load (3MF with metadata), recent files, preferences, keyboard shortcuts.
-- Translations scaffold.
+- ~~Translations scaffold~~: dropped from P7 (2026-11-24).
+- 3D drag handles: move arrows and scale handles beside the rotation rings, with a handle-mode switch (09 §8).
 - **Flatpak build: done (2026-11-23).** `io.github.mooseontehloose.GooSlicer` on `io.qt.PySide.BaseApp` 6.11 / KDE 6.11 (Python 3.13), with the `.desktop` file, AppStream metainfo and an original icon. `scripts/build-flatpak.sh` builds, installs and writes `dist/GooSlicer.flatpak` (84 MB). Checked in the sandbox: the support → slice pipeline, the GL window, and discovery, status and upload against the printer simulator.
 
 Rough order of effort: P0 S · P1 L · P2 M · P3 S–M · P4 M · P5 M–L · P6 XL · P7 M.
