@@ -130,6 +130,7 @@ class SupportManager(QObject):
     """World-space support geometry per part, rebuilt in the background when the plan, mesh,
     rotation, scale or height changes. A pure XY move just offsets the cached geometry."""
     updated = Signal()
+    fixedReplaced = Signal(str, str)    # part name, source: imported supports gave way to GooSlicer's
 
     def __init__(self, scene):
         super().__init__()
@@ -137,6 +138,7 @@ class SupportManager(QObject):
         self.cache: dict[int, _Entry] = {}
         self._pending: dict[int, object] = {}      # pid -> key being built
         self._dirty: set[int] = set()
+        self._replaced: set[int] = set()        # ids of plans whose fixed geometry was reported replaced
 
     @staticmethod
     def key(part):
@@ -181,6 +183,15 @@ class SupportManager(QObject):
 
     def schedule(self, part) -> None:
         k = self.key(part)
+        fr = S.fixed_result(part)
+        if fr is not None:                       # exact geometry from SatelLite: nothing to build
+            self._pending.pop(part.id, None)
+            self.cache[part.id] = _Entry(k, fr[0], fr[1])
+            self.updated.emit()
+            return
+        if part.supports.fixed is not None and id(part.supports) not in self._replaced:
+            self._replaced.add(id(part.supports))
+            self.fixedReplaced.emit(part.name, part.supports.fixed.source)
         if part.id in self._pending:
             if self._pending[part.id] != k:
                 self._dirty.add(part.id)
@@ -217,6 +228,9 @@ class SupportManager(QObject):
         if part.supports is None:
             return None
         e = self.entry(part)
+        if e is None and (fr := S.fixed_result(part)) is not None:
+            e = _Entry(self.key(part), fr[0], fr[1])
+            self.cache[part.id] = e
         if e is None:
             res = S.build_supports(part.world_mesh(), part.supports.world_contacts(part), part.supports.params)
             e = _Entry(self.key(part), res, part.position.copy())

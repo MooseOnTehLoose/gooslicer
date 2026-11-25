@@ -314,3 +314,32 @@ def test_crash_recovery_discard_and_clean_quit(app, make_window, tmp_path, monke
     s2 = w2.project.autosave
     w2.close()
     assert not f2.exists() and not (s2.dir / f"{s2.session}.lock").exists()
+
+
+def test_satellite_project_opens_untitled(app, make_window, tmp_path, monkeypatch):
+    from test_satellite import make_project
+    f = tmp_path / "cube.goo.3mf"
+    make_project(f)
+    w = make_window()
+    opened = []
+    w.project.opened.connect(opened.append)
+    w.open_files([str(f)])                                  # a drop onto an empty plate opens it
+    assert _wait(app, lambda: opened)
+    (p,) = w.scene.parts
+    assert w.project.path is None and not w.project.is_modified()
+    assert w.project.recent()[:1] == [str(f)]
+    assert w.print_settings.settings().exposure == pytest.approx(1.8)
+    assert _wait(app, lambda: w.supports.entry(p) is not None)
+    assert w.supports.entry(p).result.pillars == []         # SatelLite's mesh, not a rebuild
+    logs = []
+    w.supports.fixedReplaced.connect(lambda *a: logs.append(a))
+    w.scene.parts[0].position[2] += 1
+    w.scene_changed()
+    assert logs == [("cube", "SatelLite")]
+    assert _wait(app, lambda: w.supports.entry(p) is not None and w.supports.entry(p).result.pillars)
+    # Save asks for a name: the SatelLite file is never written over
+    asked = []
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (asked.append(1), ("", ""))[1])
+    before = f.read_bytes()
+    w.project.save()
+    assert asked and f.read_bytes() == before

@@ -221,6 +221,9 @@ class MainWindow(QMainWindow):
         self.reports: dict[int, meshmod.MeshReport] = {}   # id(mesh) -> report
         self.undo = QUndoStack(self)
         self.supports = SupportManager(self.scene)
+        self.supports.fixedReplaced.connect(
+            lambda name, src: self.log_msg(f"{name} changed: GooSlicer now builds its supports from "
+                                           f"{src}'s support points."))
         self._pending = 0
 
         self.viewport = Viewport(self.scene)
@@ -1169,12 +1172,23 @@ class MainWindow(QMainWindow):
                 return
             _, p, local_hit = sup
             e = self.supports.cache.get(p.id)
-            i = supportmod.nearest_pillar(e.result.pillars, local_hit)
-            if i is None:
-                return
-            target = e.result.pillars[i].contact.point + self.supports.offset(p, e)
             cs = p.supports.world_contacts(p)
-            j = int(np.argmin([np.linalg.norm(c.point - target) for c in cs]))
+            if not cs:
+                return
+            if e.result.pillars:
+                i = supportmod.nearest_pillar(e.result.pillars, local_hit)
+                if i is None:
+                    return
+                target = e.result.pillars[i].contact.point + self.supports.offset(p, e)
+                j = int(np.argmin([np.linalg.norm(c.point - target) for c in cs]))
+            else:
+                # imported geometry (SatelLite) has no pillars: the contact above the click in plan view
+                w = local_hit + self.supports.offset(p, e)
+                xy = np.array([np.linalg.norm(c.point[:2] - w[:2]) if c.point[2] >= w[2] - 0.5 else np.inf
+                               for c in cs])
+                j = int(np.argmin(xy))
+                if xy[j] > 2.5:
+                    return
             before = SupportsCommand.snapshot(p)
             plan = p.supports.with_contacts(p, cs[:j] + cs[j + 1:])
             self.undo.push(SupportsCommand(self, p.id, before, (plan, p.elevation, p.state()), "Remove support"))

@@ -2,7 +2,7 @@
 
 Tags as in 06: **[OBSERVED]** is static RE of SatelLite; **[GOOSLICER]** marks a GooSlicer design choice where SatelLite's behaviour was not recovered or is not copied.
 
-Status: **approved 2026-11-24**. Done: the format (§2–3, `gooslicer/project.py`, `tests/test_project.py`); the File menu, title, prompts, Open recent and drops (§4–5, `gooslicer_qt/projectio.py`, `tests/test_gui_project.py`). Autosave and the Files and folders options (§6, `gooslicer_qt/autosave.py`) shortcuts (§7, `gooslicer_qt/shortcuts.py`, `tests/test_shortcuts.py`) and drag handles (§8, `gooslicer_qt/handles.py`, `tests/test_gui_handles.py`) are done too. Left: the Flatpak checks in §9.
+Status: **approved 2026-11-24**. Done: the format (§2–3, `gooslicer/project.py`, `tests/test_project.py`); the File menu, title, prompts, Open recent and drops (§4–5, `gooslicer_qt/projectio.py`, `tests/test_gui_project.py`). Autosave and the Files and folders options (§6, `gooslicer_qt/autosave.py`) shortcuts (§7, `gooslicer_qt/shortcuts.py`, `tests/test_shortcuts.py`) and drag handles (§8, `gooslicer_qt/handles.py`, `tests/test_gui_handles.py`) are done too, and checked in the Flatpak (§9). **P7 done.**
 
 Code: `gooslicer/project.py` (Qt-free read and write), `gooslicer_qt/projectio.py` (File menu actions, unsaved-changes prompts, recent files, autosave), `gooslicer_qt/shortcuts.py` (action registry, Keyboard preferences page, Help → Keyboard shortcuts), `gooslicer_qt/handles.py` (move and scale handles, handle mode; mixed into `Viewport`).
 Tests (planned): `tests/test_project.py`, `tests/test_gui_project.py`, `tests/test_shortcuts.py`, `tests/test_gui_handles.py`.
@@ -12,7 +12,7 @@ Tests (planned): `tests/test_project.py`, `tests/test_gui_project.py`, `tests/te
 - The package is written with lib3mf (`Lib3MF::CWriter`, `3D/3dmodel.model`). SatelLite's own state goes in `/Metadata/Document.xml` (a FreeCAD-style document: `PropertyMesh`, `readGoo3mfMesh`) and `/Metadata/info.json`. A `3mf-plus-meshkernel-meta` blob and a versioned "mesh map" (`getGoo3mfMeshMapVersion`) tie the 3MF meshes back to its document objects.
 - Autosave goes to `AUTOSAVE-%2.goo.3mf`, and a crash leaves `crash.goo.3mf`.
 - Recent projects are kept in SQLite (`projectrecent`: file path, path key, last used in ms, a PNG preview), trimmed to a limit. Recent sliced files are a separate list (`filerecent` in ElePrintHistory).
-- **Not recovered:** the contents of `Document.xml` and `info.json`. No SatelLite project file exists in `samples/`. GooSlicer does not read or write SatelLite's project state (§10).
+- The contents of `Document.xml`, `info.json` and the support file are decoded in 10, from a sample saved by SatelLite. GooSlicer opens SatelLite projects with their supports and settings (10 §6) but does not write them.
 
 ## 2. File format [GOOSLICER]
 A GooSlicer project is a standard 3MF package (3MF Core 1.3, unit millimetre) with GooSlicer's own state in one JSON file next to it.
@@ -86,11 +86,11 @@ New order of the File menu:
 - A project enters the list when it is opened or saved. Imported models do not.
 - Items show the file name; the tooltip shows the full path. A missing file is shown disabled with "(missing)" and stays until the list is cleared or the file is opened from elsewhere.
 - Preferences → Files and folders: list length (1–30, default 10).
-- **Flatpak:** paths from the file portal (`/run/user/<uid>/doc/…`) stay valid across sessions while the portal keeps the grant. To be checked in the sandbox (§9).
+- **Flatpak:** paths from the file portal (`/run/user/<uid>/doc/…`) stay valid across sessions while the portal keeps the grant (checked, §9).
 
 ## 6. Autosave and crash recovery [GOOSLICER, after SatelLite's `AUTOSAVE` / `crash` files]
 Code: `gooslicer_qt/autosave.py` (files and locks), `ProjectController.autosave_now` / `check_recovery`.
-- Every N minutes while there are unsaved changes, the project is written in the background to `<data dir>/autosave/autosave-<session>.3mf`, then `<session>.json` beside it records the project's own path (if any) and the time. The data dir is `$XDG_DATA_HOME/GooSlicer`, the Flatpak's own data folder in the sandbox. It never writes over the user's own file. N is in Preferences → Files and folders, "Autosave every" (default 5 min, Off = 0). The same page sets the length of Open recent (1–30, default 10) and the Projects folder.
+- Every N minutes while there are unsaved changes, the project is written in the background to `<data dir>/autosave/autosave-<session>.3mf`, then `<session>.json` beside it records the project's own path (if any) and the time. The data dir is `$XDG_DATA_HOME/GooSlicer/GooSlicer` (Qt's organisation/application folder); in the Flatpak, `~/.var/app/io.github.mooseontehloose.GooSlicer/data/GooSlicer/GooSlicer`. It never writes over the user's own file. N is in Preferences → Files and folders, "Autosave every" (default 5 min, Off = 0). The same page sets the length of Open recent (1–30, default 10) and the Projects folder.
 - **One autosave per running GooSlicer.** Each holds an exclusive `flock` on `<session>.lock` while it runs. Locks work across Flatpak instances, which each have their own pid namespace, where process ids could not be compared.
 - Becoming clean deletes the autosave: a successful Save, New, Open, and a clean quit (which also removes the lock). An autosave that finishes after the project was saved deletes itself.
 - Skipped (not queued) while a slice, a save or another autosave is running.
@@ -152,9 +152,13 @@ Moving was dragging on the plate plus number fields, and rotation already has ri
   - handles are not drawn or clickable in support, drain-hole or lay-flat mode;
   - a supported part keeps its plan through a handle move and gets its supports rebuilt.
 - **Speed:** saving and loading the six-model scene from 04 (2.24 M triangles) each take ≤ 5 s.
-- **Flatpak:** in the sandbox, Save as, reopen through Open recent after a restart, and autosave restore.
+- **Flatpak** (done 2026-11-24, `dist/GooSlicer.flatpak` built from f51542b, Xvfb with xcb): a script run by the sandbox's python3, in two processes:
+  - A file exported with `flatpak document-export` (as the file dialog's portal grants one) gives the app a `/run/user/<uid>/doc/<id>/` path. Saving there works, including the temporary file and rename, with no `.tmp` left; the host file is the project, preview included.
+  - After a restart, Open recent lists the portal path and opens it.
+  - An autosave followed by a crash (`os._exit`): the next start finds it, restores the unsaved state under the project's name, removes the leftover, and a clean quit leaves the autosave folder empty.
+  - Not checked: the desktop's own file dialog (interactive). Whether the portal keeps the grant across a logout is the portal's behaviour; `document-export` grants persist in its store.
 
 ## 10. Open items
-- **SatelLite projects:** reading `.goo.3mf` files' own state (supports, settings) needs a sample made in SatelLite (Wine) and a decode of `Document.xml`, `info.json` and the mesh map. Until then GooSlicer opens them as plain 3MF (models only), if lib3mf's output is standard, which is likely but unverified.
+- **SatelLite projects:** reading is done (10). Writing `.goo.3mf` for SatelLite to open is still open (10 §7).
 - **Translations:** dropped from P7 (decided 2026-11-24). Strings stay plain English; adding `tr()` later is a mechanical pass.
 - **Z placement:** a way to lift a bare part off the plate, if ever needed, would come with a Z arrow.

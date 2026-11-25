@@ -974,6 +974,27 @@ def contact_below(model: trimesh.Trimesh, point) -> Contact | None:
 
 
 # ------------------------------------------------------------------------- per-part plan
+@dataclass(eq=False)
+class FixedSupports:
+    """Support geometry made elsewhere (SatelLite, 10 §6), used as it is while the part keeps the
+    mesh, turn, scale and height it was made for; a move on the plate shifts it. Otherwise the
+    plan's contacts are built by GooSlicer instead."""
+    mesh: trimesh.Trimesh               # world frame, for a part placed at `position`
+    model: object                       # the part mesh it was made for (compared by identity)
+    position: np.ndarray
+    rotation: np.ndarray
+    scale: np.ndarray
+    source: str = "SatelLite"
+
+    def offset(self, part) -> np.ndarray | None:
+        """The XY shift that puts the geometry under `part`, or None when it no longer fits."""
+        if (part.mesh is not self.model or not np.allclose(part.rotation, self.rotation, atol=1e-9)
+                or not np.allclose(part.scale, self.scale, atol=1e-9)
+                or abs(float(part.position[2] - self.position[2])) > 1e-6):
+            return None
+        return np.array([part.position[0] - self.position[0], part.position[1] - self.position[1], 0.0])
+
+
 @dataclass
 class SupportPlan:
     """A part's supports: parameters plus contact points stored in the part's local mesh frame,
@@ -983,6 +1004,7 @@ class SupportPlan:
     normals: np.ndarray                 # (N, 3) local, outward
     kinds: list[str]
     template: str = ""                  # name of the template the params came from
+    fixed: FixedSupports | None = None  # exact geometry from another program; edits drop it
 
     @classmethod
     def from_world(cls, part, contacts: list[Contact], params: SupportParams, template: str = "") -> "SupportPlan":
@@ -1009,11 +1031,26 @@ class SupportPlan:
         return len(self.kinds)
 
 
+def fixed_result(part) -> tuple[SupportResult, np.ndarray] | None:
+    """(result, the part position it is placed for) when the part's plan carries fixed geometry
+    that still fits the part; None otherwise."""
+    plan = getattr(part, "supports", None)
+    fx = getattr(plan, "fixed", None)
+    if fx is None or fx.offset(part) is None:
+        return None
+    return SupportResult(fx.mesh, []), fx.position.copy()
+
+
 def build_for_part(part) -> SupportResult | None:
     """World-space support geometry for a part with a plan (None without one)."""
     plan = getattr(part, "supports", None)
     if plan is None:
         return None
+    fr = fixed_result(part)
+    if fr is not None:
+        m = fr[0].mesh.copy()
+        m.apply_translation(part.supports.fixed.offset(part))
+        return SupportResult(m, [])
     return build_supports(part.world_mesh(), plan.world_contacts(part), plan.params)
 
 

@@ -289,7 +289,16 @@ class ProjectController(QObject):
             self._apply_view(proj.view)
         w.scene_changed(select=[])
         n = len(proj.parts)
-        if restored is None:
+        if restored is None and proj.source:
+            # another program's project: opened as an untitled GooSlicer project, never written over
+            self.path = None
+            self.mark_saved()
+            self.add_recent(path)
+            sup = sum(p.supports is not None for p in proj.parts)
+            w.log_msg(f"Opened {proj.source} project {Path(path).name}: {n} part{'s' * (n != 1)}"
+                      + (f", {sup} with {proj.source}'s supports" if sup else "")
+                      + ". Save writes a GooSlicer project.")
+        elif restored is None:
             self.path = Path(path)
             self.mark_saved()
             self.add_recent(path)

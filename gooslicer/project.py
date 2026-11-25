@@ -67,6 +67,7 @@ class Project:
     app: str = ""
     saved: str = ""
     newer: bool = False          # written by a newer GooSlicer (loaded anyway, with a warning)
+    source: str = ""             # "SatelLite" for a project read from another program's format
 
 
 # --------------------------------------------------------------------------- writing
@@ -107,6 +108,7 @@ def save(path: str | os.PathLike, project: Project, *, support_meshes: dict | No
     objects: dict[int, int] = {}            # id(mesh) -> object id
     plans: dict[int, int] = {}              # id(plan) -> index in "plans"
     plan_list, parts_json = [], []
+    fixed_parts: dict[int, Part] = {}       # plan index -> the part whose support mesh is the plan's
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as z:
             z.writestr("[Content_Types].xml", _CONTENT_TYPES)
@@ -135,16 +137,21 @@ def save(path: str | os.PathLike, project: Project, *, support_meshes: dict | No
                         if id(part.supports) not in plans:
                             plans[id(part.supports)] = len(plan_list)
                             plan_list.append(_plan_dict(part.supports))
+                            fx = getattr(part.supports, "fixed", None)
+                            if fx is not None and fx.offset(part) is not None and part.id in support_meshes:
+                                fixed_parts[plans[id(part.supports)]] = part
                         entry["plan"] = plans[id(part.supports)]
                     parts_json.append(entry)
                     if progress:
                         progress((i + 1) / n)
                 oid = len(objects)
+                fixed_oid: dict[int, int] = {}      # part id -> its support object
                 for k, part in enumerate(project.parts):
                     m = support_meshes.get(part.id)
                     if m is None or not len(m.faces):
                         continue
                     oid += 1
+                    fixed_oid[part.id] = oid
                     _write_mesh(out, oid, m, f"{part.name} supports", "support")
                     items.append((oid, "1 0 0 0 1 0 0 0 1 0 0 0"))
                     if progress:
@@ -153,6 +160,11 @@ def save(path: str | os.PathLike, project: Project, *, support_meshes: dict | No
                 for oid, tr in items:
                     out.write(f' <item objectid="{oid}" transform="{tr}"/>\n'.encode())
                 out.write(b"</build>\n</model>\n")
+            for i, part in fixed_parts.items():
+                if part.id in fixed_oid:            # SatelLite's mesh, kept exact (10 §6)
+                    plan_list[i]["fixed"] = {"object": fixed_oid[part.id], "source": part.supports.fixed.source,
+                                             "position": part.position.tolist(),
+                                             "rotation": part.rotation.tolist(), "scale": part.scale.tolist()}
             doc = {"format": FORMAT, "version": VERSION, "app": project.app,
                    "saved": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                    "printer": project.printer, "print_settings": project.print_settings,
@@ -210,13 +222,19 @@ def _entry(z: zipfile.ZipFile, name: str) -> bytes:
     return z.read(info)
 
 
-def is_project(path: str | os.PathLike) -> bool:
+def is_gooslicer_project(path: str | os.PathLike) -> bool:
     """True for a 3MF that holds GooSlicer's project.json."""
     try:
         with zipfile.ZipFile(path) as z:
             return PROJECT_PATH in z.namelist()
     except (OSError, zipfile.BadZipFile):
         return False
+
+
+def is_project(path: str | os.PathLike) -> bool:
+    """A GooSlicer project, or a SatelLite one (.goo.3mf, 10), which opens as an untitled project."""
+    from . import satellite
+    return is_gooslicer_project(path) or satellite.is_satellite_project(path)
 
 
 def thumbnail(path: str | os.PathLike) -> bytes | None:
@@ -240,8 +258,13 @@ def _plan(d: dict):
 
 
 def load(path: str | os.PathLike, progress=None) -> Project:
-    """Read a GooSlicer project. Raises ProjectError for anything else or anything damaged."""
+    """Read a GooSlicer or SatelLite project. Raises ProjectError for anything else or anything
+    damaged."""
     path = Path(path)
+    if not is_gooslicer_project(path):
+        from . import satellite
+        if satellite.is_satellite_project(path):
+            return satellite.load(path, progress)
     try:
         with zipfile.ZipFile(path) as z:
             try:
@@ -265,6 +288,8 @@ def load(path: str | os.PathLike, progress=None) -> Project:
 
 def _build(doc: dict, model: bytes, progress) -> Project:
     wanted = {int(p["object"]) for p in doc.get("parts", [])}
+    fixed_ids = {int(d["fixed"]["object"]) for d in doc.get("plans", []) if isinstance(d.get("fixed"), dict)}
+    wanted |= fixed_ids
     meshes: dict[int, trimesh.Trimesh] = {}
     for a, start, end in _objects(model):
         oid = int(a.get("id", -1))
@@ -280,7 +305,8 @@ def _build(doc: dict, model: bytes, progress) -> Project:
     missing = wanted - meshes.keys()
     if missing:
         raise ProjectError(f"objects {sorted(missing)} are missing from {MODEL_PATH}")
-    plans = [_plan(d) for d in doc.get("plans", [])]
+    plan_docs = doc.get("plans", [])
+    plans = [_plan(d) for d in plan_docs]
     parts = []
     for d in doc.get("parts", []):
         part = Part(str(d.get("name", "part")), meshes[int(d["object"])],
@@ -291,7 +317,15 @@ def _build(doc: dict, model: bytes, progress) -> Project:
         if np.any(part.scale <= 0):
             raise ProjectError(f"part {part.name!r} has a scale that isn't positive")
         if "plan" in d:
-            part.supports = plans[int(d["plan"])]
+            i = int(d["plan"])
+            part.supports = plans[i]
+            fd = plan_docs[i].get("fixed")
+            if isinstance(fd, dict) and part.supports.fixed is None:
+                from .supports import FixedSupports
+                part.supports.fixed = FixedSupports(
+                    meshes[int(fd["object"])], part.mesh, np.asarray(fd["position"], float).reshape(3).copy(),
+                    np.asarray(fd["rotation"], float).reshape(3, 3).copy(),
+                    np.asarray(fd["scale"], float).reshape(3).copy(), str(fd.get("source", "SatelLite")))
         parts.append(part)
     dismissed = {str(k): [np.asarray(p, float).reshape(3) for p in v]
                  for k, v in (doc.get("dismissed_flaws") or {}).items()}
