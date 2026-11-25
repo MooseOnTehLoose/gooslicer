@@ -17,7 +17,26 @@ PLATE = (211.68, 118.37)
 SAMPLE = Path(__file__).resolve().parent.parent / "samples" / "arc-1a-attitude-4.goo.3mf"
 
 
-def _support_file(sup: trimesh.Trimesh, nodes: list[tuple], links: list[tuple] | None = None) -> bytes:
+# the sample's values by struct offset (10 §5); tests change a few
+SMART_VALUES = dict(zip(SAT._SMART, [
+    2.0, 2.0, 0.5, 2.0, 2, 0.1, 0.32, 0.6, 1, 1.0, 1.5, 5.0, 0, 0.1, 0.3, 1, 0, 2.0, 4.0, 90.0, 1, 0, 60.0, 7.0, 0.8,
+    2, 16, 0.0, 0.0, 1, 1, 4, 1, 0, 0, 1, 1, 1, 8.0, 1, 0.6, 0, 1, 2.0, 1.2, 1, 0.35, 0.35, 50.0, 1, 99999.0, 0.0,
+    0.0, 99999.0, 0, 10.0, 0.7, 0.7, 6.0, 0]))
+RAFT_VALUES = [1, 1.0, 0.5, 60.0, 1, 1, 1.0, 3.0, 12]
+
+
+def _pack(kinds, values) -> bytes:
+    return b"".join(struct.pack("<B" if k == "b" else "<i" if k == "i" else "<f", v) for k, v in zip(kinds, values))
+
+
+def _params(smart: dict, raft: list) -> bytes:
+    out = _pack([k[0] for k in SAT._SMART], [smart[k] for k in SAT._SMART]) + b"\n"
+    out += bytes(40) + b"Support::BasePlatBlock\n" + struct.pack("<5I", 1, 4, 1, 1, 1) + bytes(8)
+    return out + _pack([t for t, _ in SAT._RAFT], raft) + bytes(16)
+
+
+def _support_file(sup: trimesh.Trimesh, nodes: list[tuple], links: list[tuple] | None = None,
+                  params: bytes = b"") -> bytes:
     out = bytearray(struct.pack("<II", SAT.SUPPORT_MAGIC, 0x00010000))
     out += (b"MESH-" * 51)[:255] + b"\n"
     out += bytes(8) + b"\x01" + struct.pack("<I", len(sup.vertices))
@@ -33,11 +52,11 @@ def _support_file(sup: trimesh.Trimesh, nodes: list[tuple], links: list[tuple] |
         out += struct.pack("<I", 1) + b"Support::SupportSmartEntity\n" + struct.pack("<II", 4, len(links))
         out += struct.pack("<II", 0, 0) * len(links)
         out += np.asarray(links, "<i4").tobytes()
-        out += np.zeros(8, "<f4").tobytes()            # the parameter section follows
+        out += params or np.zeros(8, "<f4").tobytes()  # the parameter section
     return bytes(out)
 
 
-def make_project(path, *, supports=True, unsupported=False) -> trimesh.Trimesh:
+def make_project(path, *, supports=True, unsupported=False, params: bytes = b"") -> trimesh.Trimesh:
     """A 10 mm cube at plate-corner (100, 50), lifted 5 mm, with two contacts on its underside;
     `unsupported` adds a third that SatelLite left without a support (no link names it)."""
     cube = trimesh.creation.box((10, 10, 10))
@@ -66,7 +85,7 @@ def make_project(path, *, supports=True, unsupported=False) -> trimesh.Trimesh:
                 ((102, 52, 5), SAT.CONTACT, down[1], SAT.OVERHANG_T),
                 ((100, 50, 0), 3, -1, 2)]                     # on the plate: not a contact
                 + ([((101, 51, 5), SAT.CONTACT, down[0], SAT.OVERHANG_T)] if unsupported else []),
-                [(2, 0, 0, 0), (2, 1, 0, 1)] if unsupported else None))
+                [(2, 0, 0, 0), (2, 1, 0, 1)] if unsupported or params else None, params))
     return sup
 
 
@@ -167,3 +186,20 @@ def test_points_satellite_left_unsupported_are_dropped(tmp_path):
     make_project(f, unsupported=True)
     plan = P.load(f).parts[0].supports
     assert len(plan) == 2 and plan.kinds == [S.LOWEST, S.OVERHANG]
+
+
+def test_support_settings_come_with_the_project(tmp_path):
+    smart = {**SMART_VALUES, "f7c": 0.45, "f84": 2.0, "if0": 12, "f18": 37.0, "fd8": 1.1, "fdc": 1.3, "b8c": 0}
+    raft = list(RAFT_VALUES)
+    raft[2] = 0.3                                              # raft height
+    f = tmp_path / "cube.goo.3mf"
+    make_project(f, params=_params(smart, raft))
+    p = P.load(f).parts[0].supports.params
+    assert (p.tip_top_width, p.tip_length, p.poly_edges, p.critical_angle) == (0.45, 2.0, 12, 37.0)
+    assert (p.pillar_top_width, p.pillar_bottom_width, p.tip_ball) == (1.1, 1.3, False)
+    assert p.raft_height == 0.3 and p.raft_offset == 1.0 and p.hole_edges == 12
+    assert p.lift == 5.0                                       # the part's own lift, not a setting
+    # a section that doesn't check out leaves GooSlicer's defaults
+    bad = tmp_path / "bad.goo.3mf"
+    make_project(bad, params=_params({**smart, "if0": 999}, raft))
+    assert P.load(bad).parts[0].supports.params.tip_top_width == S.SupportParams().tip_top_width

@@ -135,7 +135,7 @@ The sample contains only type 0 and type 3 chunks (anti-aliasing off), always wi
 | Grey (anti-aliased) runs | Not needed. ELEGOO printers anti-alias at the LCD, not in the file [USER-REPORTED]. Layers are binary 0x00/0xFF (type 0/3 chunks), as in the sample. The type 1/2 codec stays for format completeness only. |
 | V5.x extensions (NFC, calibration, 0x66 trailer) | not written [UNKNOWN] |
 | Mapping from header motion fields to layer motion fields | unproven; the writer uses a template [UNKNOWN] |
-| Printer accepts a Linux-built file | not run (needs your go-ahead to upload and print) [UNKNOWN] |
+| Printer accepts a Linux-built file | Accepted, started, paused, resumed and stopped at layer 4 (a 10 mm cube, empty vat, 2026-11-23; 02 §6) [RUNTIME]. A complete print with resin: not run yet [UNKNOWN] |
 
 ## 7. Linux implementation
 - `elegoo_goo/rle.py`: encoder (regex run scan, about 20 ms per 16K layer) and decoder.

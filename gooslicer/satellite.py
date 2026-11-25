@@ -30,6 +30,24 @@ CONTACT, OVERHANG_T, LOWEST_T = 1, 2, 3
 _NODE = np.dtype([("p", "<f4", 3), ("d", "<f4", 3), ("id", "<i4"), ("r", "<f4"), ("role", "<u4"),
                   ("pad", "<u2"), ("face", "<i4"), ("type", "<u2")])
 
+# SmartSupportBlock parameters (10 §5): the order and types SatelLite writes them in
+# (EleTriAddExpand FUN_180045cb0, "SUPPORTVARIABLESMART"), named by the struct offset they come from.
+_SMART = ("f58 f5c f60 f64 i74 f78 f7c f80 b8c f84 f94 f98 b9c fa0 fa4 ba8 bb0 fb4 fb8 fbc bc0 ic4 fe0 fe4 fe8 iec if0 "
+          "ff4 ff8 ifc i100 i104 i108 b10c b10d b10e bd0 b110 f114 b118 f11c id4 i88 f68 f6c b70 fac f90 f18 b2c "
+          "f28 f24 f1c f20 b30 f34 fd8 fdc fc8 bcc").split()
+# struct offset -> SupportParams field [INFERRED from EVO_30-60mm's values and the struct layout, 10 §5]
+_SMART_FIELDS = {
+    "f18": "critical_angle", "f58": "anchor_dis", "f5c": "anchor_dis_border", "f60": "border_offset",
+    "f68": "lowest_interval", "b70": "reinforce_lowest", "f78": "tip_in_part", "f7c": "tip_top_width",
+    "f80": "tip_bottom_width", "f84": "tip_length", "b8c": "tip_ball", "f90": "tip_ball_diameter",
+    "fa0": "bot_in_part", "fa4": "bot_top_width", "bb0": "plat_connect", "fb4": "plat_connect_height",
+    "fb8": "plat_connect_radius", "fd8": "pillar_top_width", "fdc": "pillar_bottom_width",
+    "fe0": "diamond_angle", "fe4": "diamond_width", "fe8": "edge_width", "if0": "poly_edges",
+}
+# BasePlatBlock (raft) parameters at the end of the file [INFERRED from values]
+_RAFT = (("b", "raft"), ("f", "raft_offset"), ("f", "raft_height"), ("f", "raft_slot_angle"), ("i", None),
+         ("b", "raft_holes"), ("f", "hole_radius"), ("f", "hole_interval"), ("i", "hole_edges"))
+
 # ActiveScript key -> PrintSettings field (the .cfgx names, 10 §3)
 ACTIVE_SCRIPT = {
     "Scirptname": "resin_name", "layerthickness": "layer_height", "bottomLayerCount": "bottom_layers",
@@ -121,7 +139,7 @@ class _Reader:
         return self.take(end + 1 - self.o)[:-1]
 
 
-def _linked(r: _Reader, n_nodes: int) -> np.ndarray | None:
+def _linked(r: _Reader, n_nodes: int) -> np.ndarray | None:  # leaves r after the links
     """Which points of the first array have a support built from them: the point indices named by
     the link records after Support::SupportSmartEntity (10 §5). None if that part can't be read."""
     try:
@@ -145,9 +163,50 @@ def _linked(r: _Reader, n_nodes: int) -> np.ndarray | None:
     return used
 
 
-def read_supports(data: bytes) -> tuple[trimesh.Trimesh, np.ndarray]:
-    """SupportKernelEx.bms (10 §5): the support mesh (plate frame) and the first point array, with
-    a `linked` flag (False for points SatelLite left without a support)."""
+def _values(r: _Reader, spec) -> list:
+    out = []
+    for t in spec:
+        if t == "b":
+            out.append(bool(r.u8()))
+        elif t == "i":
+            out.append(struct.unpack("<i", r.take(4))[0])
+        else:
+            out.append(round(struct.unpack("<f", r.take(4))[0], 4))   # float32: 0.32 -> 0.31999…
+    return out
+
+
+def _params(r: _Reader) -> dict:
+    """SupportParams fields from the parameter section after the links; {} if it isn't the EVO
+    (smart) layout or anything doesn't check out."""
+    try:
+        vals = _values(r, [k[0] for k in _SMART])
+        if r.take(1) != b"\n":
+            return {}
+        out = {_SMART_FIELDS[k]: v for k, v in zip(_SMART, vals) if k in _SMART_FIELDS}
+        at = r.b.find(b"Support::BasePlatBlock\n", r.o)
+        if at >= 0:
+            r.o = at + len(b"Support::BasePlatBlock\n")
+            r.take(12)
+            a, b = r.u32(), r.u32()
+            r.take(4 * (a + b))
+            for (_, name), v in zip(_RAFT, _values(r, [t for t, _ in _RAFT])):
+                if name:
+                    out[name] = v
+    except SatelLiteError:
+        return {}
+    ok = (3 <= out.get("poly_edges", 0) <= 64 and 0 < out.get("critical_angle", 0) < 90
+          and all(0 < out[k] < 20 for k in ("tip_top_width", "tip_bottom_width", "tip_length",
+                                            "pillar_top_width", "pillar_bottom_width")))
+    if "raft" in out and not (0 < out["raft_height"] < 10 and 3 <= out["hole_edges"] <= 64):
+        for _, name in _RAFT:
+            out.pop(name, None)
+    return out if ok else {}
+
+
+def read_supports(data: bytes) -> tuple[trimesh.Trimesh, np.ndarray, dict]:
+    """SupportKernelEx.bms (10 §5): the support mesh (plate frame); the first point array, with a
+    `linked` flag (False for points SatelLite left without a support); and the support settings
+    as SupportParams fields ({} when they can't be read)."""
     r = _Reader(data)
     if r.u32() != SUPPORT_MAGIC:
         raise SatelLiteError("not a SatelLite support file")
@@ -173,10 +232,12 @@ def read_supports(data: bytes) -> tuple[trimesh.Trimesh, np.ndarray]:
     for k in _NODE.names:
         out[k] = nodes[k]
     out["linked"] = True if linked is None else linked
-    return trimesh.Trimesh(v, f, process=False), out
+    params = _params(r) if linked is not None else {}
+    return trimesh.Trimesh(v, f, process=False), out, params
 
 
-def _plan_for(part: Part, model_world: trimesh.Trimesh, nodes: np.ndarray, support_mesh: trimesh.Trimesh):
+def _plan_for(part: Part, model_world: trimesh.Trimesh, nodes: np.ndarray, support_mesh: trimesh.Trimesh,
+              settings: dict | None = None):
     from .supports import LOWEST, OVERHANG, FixedSupports, SupportParams, SupportPlan
     # contacts SatelLite built a support from; the rest it left unsupported (10 §5)
     c = nodes[(nodes["role"] == CONTACT) & nodes["linked"] & (nodes["face"] >= 0)
@@ -186,7 +247,7 @@ def _plan_for(part: Part, model_world: trimesh.Trimesh, nodes: np.ndarray, suppo
     pts = (c["p"].astype(np.float64) - part.position) @ part.rotation / part.scale
     nl = normals @ part.rotation * part.scale
     nl /= np.maximum(np.linalg.norm(nl, axis=1), 1e-12)[:, None]
-    params = SupportParams(lift=float(part.elevation))
+    params = SupportParams(**{**(settings or {}), "lift": float(part.elevation)})
     fixed = FixedSupports(support_mesh, part.mesh, part.position.copy(), part.rotation.copy(), part.scale.copy())
     return SupportPlan(params, pts, nl, kinds, "SatelLite project", fixed=fixed)
 
@@ -235,12 +296,12 @@ def _build(info: dict, model: bytes, support_data: dict, progress) -> projmod.Pr
         part = Part.from_mesh(str(meta.get("Name") or name), world)
         att = str(meta.get("SupportAttachment") or "").lstrip("/")
         if meta.get("HasSupport") and att in support_data:
-            sup, nodes = read_supports(support_data[att])
+            sup, nodes, settings = read_supports(support_data[att])
             sup.apply_translation(shift)
             nodes = nodes.copy()
             nodes["p"] += shift.astype(np.float32)
             part.elevation = float(world.bounds[0][2])
-            part.supports = _plan_for(part, world, nodes, sup)
+            part.supports = _plan_for(part, world, nodes, sup, settings)
         parts.append(part)
         if progress:
             progress((i + 1) / max(len(meshes), 1))
