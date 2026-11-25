@@ -20,6 +20,7 @@ from gooslicer import hollow as hollowmod
 from gooslicer import settings as settingsmod
 from gooslicer import slicer as slicermod
 from gooslicer import profile_store, support_defaults
+from gooslicer import project as projmod
 from gooslicer import supports as supportmod
 from gooslicer.raster import RasterSpec
 from gooslicer.scene import Part, Scene, ray_triangles, rotation_between
@@ -33,6 +34,7 @@ from .jobpanel import JobPanel
 from .memory import MemoryMonitor, StatusBar, trim_memory_soon
 from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, ToolWindow, show_popup
 from .printers import PrinterControlPanel
+from .projectio import ProjectController
 from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
 from .supporting import SupportDialog, SupportManager, SupportsCommand, support_params
 from .theme import THEMES, ThemeManager
@@ -159,6 +161,16 @@ def _cavities_and_faces(meshes):
 
 
 def _load_and_analyze(path: str):
+    if Path(path).suffix.lower() == ".3mf" and projmod.is_project(path):
+        # a GooSlicer project imported into this one: its parts with their supports, no settings
+        proj = projmod.load(path)
+        out, seen = [], {}
+        for part in proj.parts:
+            if id(part.mesh) not in seen:
+                seen[id(part.mesh)] = meshmod.analyze(part.mesh)
+                meshmod.slim(part.mesh)
+            out.append((part, seen[id(part.mesh)]))
+        return out
     out = []
     for name, m in meshmod.load_meshes(path):
         part = Part.from_mesh(name, m)
@@ -202,7 +214,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = settings or QSettings(APP, APP)
         self.theme = ThemeManager.for_app(QApplication.instance(), str(self.settings.value("theme", "system")))
-        self.setWindowTitle(f"{APP} {__version__}")
+        self.setWindowTitle(f"Untitled[*] — {APP}")
         self.resize(1400, 900)
         self.scene = Scene()
         self.reports: dict[int, meshmod.MeshReport] = {}   # id(mesh) -> report
@@ -316,6 +328,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self._progress)
         self.statusBar().addPermanentWidget(self._cancel_btn)
 
+        self.project = ProjectController(self)
         self._menus()
         self.viewport.selectionChanged.connect(self._on_viewport_selection)
         self.viewport.moveFinished.connect(lambda ch: self.undo.push(StateCommand(self, ch, "Move")))
@@ -340,6 +353,7 @@ class MainWindow(QMainWindow):
         self.load_profiles()
         if self.settings.value("geometry"):
             self.restoreGeometry(self.settings.value("geometry"))
+        self.project.mark_saved()              # the profiles' settings are the starting point
         self.statusBar().showMessage("Import a model (Ctrl+I) or drop STL/OBJ/3MF or .satres files here")
 
     def showEvent(self, e):
@@ -385,9 +399,18 @@ class MainWindow(QMainWindow):
     def _menus(self):
         mb = self.menuBar()
         m = mb.addMenu("&File")
+        self._act(m, "&New project", self.project.new_project, QKeySequence.New)
+        self._act(m, "&Open project…", self.project.open_dialog, QKeySequence.Open,
+                  "Open a GooSlicer project, or any 3MF file as a new project")
+        self.project.recent_menu = m.addMenu("Open &recent")
+        self.project.update_recent_menu()
+        self._act(m, "&Save project", self.project.save, QKeySequence.Save)
+        self._act(m, "Save project &as…", self.project.save_as, QKeySequence.SaveAs)
+        m.addSeparator()
         self._act(m, "&Import model…", self.import_dialog, "Ctrl+I")
         self._act(m, "Import &resin profile…", self.import_resin_dialog, None,
                   "Add resin profiles exported from SatelLite (.satres)")
+        m.addSeparator()
         self.slice_action = self._act(m, "&Slice and save .goo…", self.slice_dialog, "Ctrl+R")
         self.send_action = self._act(m, "Slice and sen&d to printer…", self.slice_and_send, "Ctrl+Shift+R")
         self._act(m, "&Open .goo for inspection…", self.open_goo_dialog, "Ctrl+Shift+O")
@@ -868,6 +891,23 @@ class MainWindow(QMainWindow):
         if hasattr(self, "job_panel"):
             self.job_panel.flaws_changed(kind, len(self.flaws[kind]))
 
+    def clear_flaws(self) -> None:
+        """Forget every check's result and dismissal (a new or opened project)."""
+        for kind in flawmod.KINDS:
+            self._set_flaws(kind, [])
+            if hasattr(self, "job_panel"):
+                self.job_panel.flaws_changed(kind, 0)
+        self._islands_fp = self._cavities_fp = None
+        self.set_dismissed({})
+
+    def dismissed_points(self) -> dict:
+        return {k: list(v) for k, v in self._dismissed.items()}
+
+    def set_dismissed(self, d: dict) -> None:
+        """Dismissals saved with a project: they belong to its parts as they are now."""
+        self._dismissed = {k: [np.asarray(x, float) for x in d.get(k, [])] for k in flawmod.KINDS}
+        self._dismissed_parts = self._plate_fingerprint()[2] if any(self._dismissed.values()) else None
+
     def _check_dismissed(self) -> None:
         if self._dismissed_parts is not None and not self._same_parts(self._dismissed_parts, self._plate_fingerprint()[2]):
             self._dismissed = {k: [] for k in flawmod.KINDS}
@@ -1343,9 +1383,16 @@ class MainWindow(QMainWindow):
             e.ignore()
 
     def open_files(self, files: list[str]):
-        """Dropped or command-line files: .satres are resin profiles, anything else a model."""
+        """Dropped or command-line files: .satres are resin profiles, anything else a model. A
+        single GooSlicer project onto an empty, unchanged plate opens as the project (09 §4)."""
         resins = [f for f in files if Path(f).suffix.lower() == settingsmod.SATRES_EXT]
         models = [f for f in files if f not in resins]
+        if (len(models) == 1 and not self.scene.parts and not self.project.is_modified()
+                and Path(models[0]).suffix.lower() == ".3mf" and projmod.is_project(models[0])):
+            if resins:
+                self.import_resin_profiles(resins)
+            self.project.open_project(models[0])
+            return
         if resins:
             self.import_resin_profiles(resins)
         if models:
@@ -1704,6 +1751,25 @@ class MainWindow(QMainWindow):
                      f"{h.resolution_x}×{h.resolution_y}, resin '{h.resin_profile}'")
 
     def closeEvent(self, e):
+        if not getattr(self, "_close_ok", False):
+            if self.project.busy():
+                e.ignore()
+                self.statusBar().showMessage("Wait for the project to finish saving.", 4000)
+                return
+            if self.project.is_modified():
+                # Qt ignores close() from inside closeEvent, so only a save closes later
+                answer = self.project.ask_unsaved()
+                if answer == "cancel":
+                    e.ignore()
+                    return
+                if answer == "save":
+                    e.ignore()
+
+                    def saved():
+                        self._close_ok = True
+                        self.close()
+                    self.project.save(then=saved)
+                    return
         for tw in (self.log_window, self.layers_window):
             if tw.isVisible():
                 tw.close()                   # saves where it was

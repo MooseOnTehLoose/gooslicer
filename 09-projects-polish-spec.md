@@ -2,9 +2,9 @@
 
 Tags as in 06: **[OBSERVED]** is static RE of SatelLite; **[GOOSLICER]** marks a GooSlicer design choice where SatelLite's behaviour was not recovered or is not copied.
 
-Status: **draft 2026-11-24**, not yet implemented.
+Status: **approved 2026-11-24**. Done: the format (§2–3, `gooslicer/project.py`, `tests/test_project.py`); the File menu, title, prompts, Open recent and drops (§4–5 except the Preferences option, `gooslicer_qt/projectio.py`, `tests/test_gui_project.py`). Next: autosave (§6), then shortcuts (§7), then handles (§8).
 
-Code (planned): `gooslicer/project.py` (Qt-free read and write), `gooslicer_qt/projectio.py` (File menu actions, unsaved-changes prompts, recent files, autosave), `gooslicer_qt/shortcuts.py` (action registry, Keyboard preferences page), `gooslicer_qt/viewport.py` (move and scale handles beside the existing rotation rings).
+Code: `gooslicer/project.py` (Qt-free read and write), `gooslicer_qt/projectio.py` (File menu actions, unsaved-changes prompts, recent files; autosave planned); planned: `gooslicer_qt/shortcuts.py` (action registry, Keyboard preferences page), `gooslicer_qt/viewport.py` (move and scale handles beside the existing rotation rings).
 Tests (planned): `tests/test_project.py`, `tests/test_gui_project.py`, `tests/test_shortcuts.py`, `tests/test_gui_handles.py`.
 
 ## 1. What SatelLite does [OBSERVED strings, no sample]
@@ -24,8 +24,8 @@ A GooSlicer project is a standard 3MF package (3MF Core 1.3, unit millimetre) wi
 - **Supports:** each part with a built support mesh also gets an `<object type="support">` (world frame, identity transform) so other programs show the supports. GooSlicer ignores these objects when it reads its own projects and rebuilds supports from the saved plan (§3), in the background as it does after any edit.
 - **`/Metadata/gooslicer/project.json`**, linked from the root `.rels` with a GooSlicer relationship type (`https://github.com/MooseOnTehLoose/gooslicer/project`). Contents in §3.
 - **Thumbnail:** `/Metadata/thumbnail.png` (256 × 256, the 3D view as shown, standard 3MF thumbnail relationship). File managers and the recent-files list use it.
-- **Writing:** to `<name>.3mf.tmp` beside the target, then renamed over it, so a failed or cancelled save never damages the old file. Done in a worker with progress. XML is built with vectorised formatting, aiming at ≤ 3 s for 2 M triangles.
-- **Reading:** with the same code path as model import where possible. The XML is parsed with `xml.etree.ElementTree.iterparse` and nothing else from the package is executed or followed (no external references, no entities).
+- **Writing:** to `<name>.3mf.tmp` beside the target, then renamed over it, so a failed or cancelled save never damages the old file. Done in a worker with progress. XML is built with batched `%` formatting.
+- **Reading** (`project.load`): a fast path that understands only what `save` writes: object and item tags found with plain searches, vertex and triangle values with one regex per block. No XML parser runs on the package, so entities and external references are never expanded or followed. Zip entries over 8 GB unpacked are refused. A 3MF without `project.json` goes through the model importer (`mesh.load_meshes`). Measured (2026-11-24): 1.31 M triangles save in 1.8 s and load in 1.6 s (20 MB file), about 3.1 s and 2.7 s at 2.24 M.
 
 ## 3. `project.json`
 ```json
@@ -37,15 +37,18 @@ A GooSlicer project is a standard 3MF package (3MF Core 1.3, unit millimetre) wi
   "support_type": "EVO_30-60mm",
   "parts": [
     { "object": 1, "item": 0, "name": "arc", "elevation": 5.0,
-      "supports": { "template": "EVO_30-60mm", "params": { "...": "SupportParams fields" },
-                    "points": [[x, y, z], ...], "normals": [[x, y, z], ...], "kinds": ["overhang", ...] } }
+      "position": [x, y, z], "rotation": [[...], [...], [...]], "scale": [sx, sy, sz], "plan": 0 }
+  ],
+  "plans": [
+    { "template": "EVO_30-60mm", "params": { "...": "SupportParams fields" },
+      "points": [[x, y, z], ...], "normals": [[x, y, z], ...], "kinds": ["overhang", ...] }
   ],
   "dismissed_flaws": { "island": [[x, y, z], ...], "cavity": [] },
   "view": { "...": "the 3D view's camera (yaw, pitch, distance, target)" }
 }
 ```
-- `parts[i]` matches build item `i` (and names its object id, as a check). Parts are restored in this order.
-- `supports` is `SupportPlan` as stored: points and normals in the part's local frame. Parts that share a plan (Duplicate) share it again on load.
+- `parts[i]` matches build item `i` and names its object. Parts are restored in this order. Position, rotation and scale are stored exactly here; the build item's transform is for other programs, so GooSlicer never has to split a matrix back into them.
+- `plans` holds each `SupportPlan` once, as stored: points and normals in the part's local frame. A part's `plan` is its index; parts that share a plan (Duplicate) share it again on load.
 - `print_settings` is the full set, including values the user changed from the resin profile. On load the printer and resin are selected by name and then these values are applied on top. A printer or resin that no longer exists is logged and the saved values are still applied to the closest match (the same printer family, the first resin).
 - `dismissed_flaws`: world points, kept because the parts come back exactly as they were (08 §5, Flaws tab: a change to a part's mesh or placement clears them).
 - Unknown keys are ignored. A `version` newer than GooSlicer knows opens with a warning ("saved by a newer GooSlicer; some settings may be lost").

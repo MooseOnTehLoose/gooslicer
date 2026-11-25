@@ -241,6 +241,21 @@ class PrintSettingsPanel(QWidget):
             w.setValue(getattr(s, attr))
             w.blockSignals(False)
 
+    def apply_saved(self, d: dict) -> bool:
+        """Settings saved in a project: select their resin by name (Printer default when it no
+        longer exists), then put every saved value on top. False when the resin was missing."""
+        name = str(d.get("resin_name", "") or "")
+        cur = next((i for i, r in enumerate(self.resins) if r.name == name), None)
+        self._rebuild(cur)
+        self._load(S.PrintSettings.from_dict({**self._loaded_for(cur).to_dict(), **d}))
+        frac = float(d.get("slice_z_fraction", self.settings().slice_z_fraction))
+        self.slice_pos.setCurrentIndex(min(range(len(SLICE_POS)), key=lambda i: abs(SLICE_POS[i][1] - frac)))
+        self.changed.emit()
+        return cur is not None or name in ("", self.base.resin_name)
+
+    def _loaded_for(self, i: int | None) -> S.PrintSettings:
+        return self.resins[i].settings() if i is not None else self.base
+
     def settings(self) -> S.PrintSettings:
         s = getattr(self, "_loaded", self.base)
         kw = {attr: (w.value() if isinstance(w, QSpinBox) else round(w.value(), 4)) for attr, w in self.widgets.items()}
