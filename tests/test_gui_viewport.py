@@ -11,7 +11,7 @@ if os.environ.get("GOOSLICER_GL_TESTS") != "1":
 
 import trimesh  # noqa: E402
 from PySide6.QtCore import QEvent, QEventLoop, QPointF, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QMouseEvent, QSurfaceFormat  # noqa: E402
+from PySide6.QtGui import QColor, QMouseEvent, QSurfaceFormat  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from gooslicer_qt.viewport import default_format  # noqa: E402
@@ -342,13 +342,12 @@ def test_plate_see_through_and_supports_half_transparent(app, win):
         return im.pixelColor(int(p.x() * dpr), int(p.y() * dpr))
     half = at(pt)
     assert half.alpha() == 255          # blending keeps the view opaque (the window must not show through)
-    import gooslicer_qt.viewport as V
-    old = V.SUPPORT_ALPHA
-    V.SUPPORT_ALPHA = 1.0
+    old = QColor(vp.colors["support"])
+    vp.colors["support"].setAlphaF(1.0)
     vp.update()
     pump(app)
     solid = at(pt)
-    V.SUPPORT_ALPHA = old
+    vp.colors["support"] = old
     # half of the support's colour plus half of the dark background behind it
     assert abs(half.blueF() - (solid.blueF() + 0.19) / 2) < 0.04 and half.blueF() < solid.blueF() - 0.15
     assert solid.blueF() > solid.redF() + 0.3 and solid.blueF() > solid.greenF() + 0.2      # blue supports
@@ -730,3 +729,38 @@ def test_arrange_all_button(app, win, tmp_path):
     assert win.undo.undoText() == "Arrange"
     win.undo.undo()
     assert all(np.allclose(p.position, before[p.id]) for p in parts)
+
+
+def test_view_colors_and_transparency(app, win, tmp_path):
+    """Models take their colour and transparency from Preferences → 3D view colors; a
+    see-through model blends with the background behind it; selected models use theirs."""
+    from gooslicer.scene import Part
+    vp = win.viewport
+    part = Part("box", trimesh.creation.box((40, 40, 10)))
+    win.scene.add(part)
+    win.scene.drop_to_plate(part)
+    win.scene_changed()
+    vp.camera.yaw, vp.camera.pitch = -90.0, 89.0                   # from above
+    vp.update()
+    pump(app)
+    dpr = vp.grabFramebuffer().devicePixelRatio()
+    pt = project(vp, [2.5, 2.5, 10])                               # on the top face, between grid lines
+
+    def at():
+        vp.update()
+        pump(app)
+        im = vp.grabFramebuffer()
+        return im.pixelColor(int(pt.x() * dpr), int(pt.y() * dpr))
+    win.set_view_color("model", QColor(0, 255, 0))
+    solid = at()
+    assert solid.greenF() > 0.5 and solid.redF() < 0.1 and solid.blueF() < 0.1
+    c = QColor(0, 255, 0)
+    c.setAlphaF(0.5)
+    win.set_view_color("model", c)
+    half = at()
+    assert half.alpha() == 255 and abs(half.greenF() - (solid.greenF() + 0.17) / 2) < 0.05
+    assert abs(half.redF() - 0.16 / 2) < 0.05                    # half of the background shows
+    win.set_view_color("selected", QColor(255, 0, 255))
+    vp.set_selection([part.id])
+    sel = at()
+    assert sel.redF() > 0.5 and sel.blueF() > 0.5 and sel.greenF() < 0.1

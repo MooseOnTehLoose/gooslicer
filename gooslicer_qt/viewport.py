@@ -18,21 +18,25 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from gooslicer.camera import OrbitCamera, axis_gizmo, ray_plane
 from gooslicer.scene import Part, PartState, Scene, rotation_matrix
 
+from . import colors as colormod
 from .handles import HandlesMixin
 
+# Meshes are drawn indexed (shared vertices, 12 bytes each, plus 12 bytes a face). Flat shading
+# needs a face normal: the fragment shader takes it from the screen-space derivatives of the
+# world position, which lie in the triangle's plane. It faces the viewer, which for a front face
+# is the outward normal; back faces are painted a fixed colour anyway.
 MESH_VS = """#version 330 core
 layout(location=0) in vec3 pos;
-layout(location=1) in vec3 nrm;
-uniform mat4 mvp; uniform mat3 nmat;
-out vec3 vN;
-void main(){ vN = normalize(nmat * nrm); gl_Position = mvp * vec4(pos, 1.0); }
+uniform mat4 mvp; uniform mat4 model;
+out vec3 vW;
+void main(){ vW = (model * vec4(pos, 1.0)).xyz; gl_Position = mvp * vec4(pos, 1.0); }
 """
 MESH_FS = """#version 330 core
-in vec3 vN; out vec4 frag;
+in vec3 vW; out vec4 frag;
 uniform vec3 color; uniform vec3 lightA; uniform vec3 lightB; uniform float alpha;
 void main(){
-  vec3 n = normalize(vN);
   if (!gl_FrontFacing) { frag = vec4(0.85, 0.15, 0.55, alpha); return; }  // inside/back faces
+  vec3 n = normalize(cross(dFdx(vW), dFdy(vW)));
   float d = 0.30 + 0.55 * max(dot(n, lightA), 0.0) + 0.25 * max(dot(n, lightB), 0.0);
   frag = vec4(color * d, alpha);
 }
@@ -46,12 +50,11 @@ out vec4 frag; uniform vec4 color;
 void main(){ frag = color; }
 """
 
-COL_PART = (0.55, 0.70, 0.78)
-COL_SELECTED = (0.98, 0.62, 0.20)
+# models, selected models, supports and flaw lines/labels take their colours from
+# Viewport.colors (colors.py: Edit → Preferences → 3D view colors)
 COL_OUTSIDE = (0.90, 0.25, 0.22)
-COL_SUPPORT = (0.22, 0.48, 0.96)       # blue, drawn half transparent
 COL_ISLAND = (0.92, 0.16, 0.14)       # unsupported islands, after the island check
-SUPPORT_ALPHA = 0.5                    # supports are see-through, so the model shows behind them
+OPAQUE = 0.999                         # an opacity at least this is drawn solid
 GUIDE_DIM = 0.35                       # island guide lines where something is in front of them
 COL_HOLE = (0.15, 0.45, 1.0)           # drain-hole preview (blue)
 HOLE_ALPHA = 0.75                      # its visible part (less and orange parts turn it grey)
@@ -61,7 +64,6 @@ LABEL_ISLAND = "Unsupported island"    # text at the outer end of each guide lin
 LABEL_CAVITY = "Sealed cavity"
 LABEL_CUP = "Suction cup"
 LABEL_GAP_PX = 6                       # between a guide line's end and its label
-COL_GUIDE_SELECTED = (0.95, 0.20, 0.18)  # a guide line whose label was clicked
 
 
 class GuideLabel(NamedTuple):
@@ -129,37 +131,50 @@ def _compile(vs: str, fs: str) -> int:
 
 
 class _Buffer:
-    """VAO + VBO with float32 attributes (3 or 3+3 floats per vertex)."""
+    """VAO + VBO of float32 xyz points, with an optional uint32 index buffer (then `count` is
+    the number of indices and draw() uses glDrawElements)."""
 
-    def __init__(self, data: np.ndarray, with_normals: bool):
+    def __init__(self, data: np.ndarray, with_normals: bool = False, indices: np.ndarray | None = None):
         data = np.ascontiguousarray(data, dtype=np.float32)
         self.count = len(data)
         self.vao = GL.glGenVertexArrays(1)
         self.vbo = GL.glGenBuffers(1)
+        self.ebo = None
         GL.glBindVertexArray(self.vao)
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vbo)
         GL.glBufferData(GL.GL_ARRAY_BUFFER, data.nbytes, data, GL.GL_STATIC_DRAW)
-        stride = data.shape[1] * 4
         GL.glEnableVertexAttribArray(0)
-        _raw_attrib_pointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(0))
-        if with_normals:
-            GL.glEnableVertexAttribArray(1)
-            _raw_attrib_pointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(12))
+        _raw_attrib_pointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, data.shape[1] * 4, ctypes.c_void_p(0))
+        if indices is not None:
+            indices = np.ascontiguousarray(indices, dtype=np.uint32)
+            self.ebo = GL.glGenBuffers(1)
+            GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, self.ebo)       # recorded in the VAO
+            GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL.GL_STATIC_DRAW)
+            self.count = indices.size
         GL.glBindVertexArray(0)
+
+    def draw(self, mode=GL.GL_TRIANGLES):
+        GL.glBindVertexArray(self.vao)
+        if self.ebo is not None:
+            GL.glDrawElements(mode, self.count, GL.GL_UNSIGNED_INT, ctypes.c_void_p(0))
+        else:
+            GL.glDrawArrays(mode, 0, self.count)
 
     def delete(self):
         GL.glDeleteBuffers(1, [self.vbo])
+        if self.ebo is not None:
+            GL.glDeleteBuffers(1, [self.ebo])
         GL.glDeleteVertexArrays(1, [self.vao])
 
 
-def mesh_vertex_data(mesh) -> np.ndarray:
-    """Flat-shaded triangle soup: per-corner position + face normal, float32 (what the GPU
-    gets), built in place: 72 bytes a face, with no float64 intermediates several times that."""
-    faces = np.asarray(mesh.faces)
-    out = np.empty((len(faces), 3, 6), np.float32)
-    out[:, :, :3] = np.asarray(mesh.vertices, np.float32)[faces]
-    out[:, :, 3:] = np.asarray(mesh.face_normals, np.float32)[:, None, :]
-    return out.reshape(-1, 6)
+def mesh_buffer(mesh) -> _Buffer:
+    """A mesh's indexed GPU buffer, from the float32/uint32 arrays gpu_arrays() keeps on it
+    (made on a worker thread where possible)."""
+    from gooslicer.scene import GPU_KEY, gpu_arrays
+    v, f = gpu_arrays(mesh)
+    buf = _Buffer(v, indices=f)
+    mesh._cache.cache.pop(GPU_KEY, None)          # on the GPU now: free the copy
+    return buf
 
 
 def plate_lines(size, step: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
@@ -252,6 +267,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self._hole_timer.setSingleShot(True)
         self._hole_timer.setInterval(0)
         self._hole_timer.timeout.connect(self._hover_pending)
+        self.colors = colormod.default_colors()     # key -> QColor with alpha (colors.VIEW_COLORS)
         self.show_compass = True
         self.show_front = True
         self.show_rings = True                     # rotation rings around the selection
@@ -348,7 +364,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             self._buffers.pop(k)[1].delete()
         for k, m in live.items():
             if k not in self._buffers:
-                self._buffers[k] = (m, _Buffer(mesh_vertex_data(m), True))
+                self._buffers[k] = (m, mesh_buffer(m))
         if self._plate_size is None or not np.allclose(self._plate_size, self.scene.size):
             if self._plate:
                 for b in self._plate:
@@ -388,37 +404,29 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "lightA"), *eye_dir)
         GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "lightB"), 0.0, 0.0, 1.0)
         u_mvp = GL.glGetUniformLocation(self._mesh_prog, "mvp")
-        u_n = GL.glGetUniformLocation(self._mesh_prog, "nmat")
+        u_n = GL.glGetUniformLocation(self._mesh_prog, "model")
         u_c = GL.glGetUniformLocation(self._mesh_prog, "color")
         u_alpha = GL.glGetUniformLocation(self._mesh_prog, "alpha")
         GL.glUniform1f(u_alpha, 1.0)
+        solid, clear = [], []                       # see-through parts are drawn after the rest
         for p in self.scene.parts:
-            M = p.matrix()
-            GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
-            GL.glUniformMatrix3fv(u_n, 1, GL.GL_TRUE, np.linalg.inv(M[:3, :3]).T.astype(np.float32))
-            col = COL_SELECTED if p.id in self.selected else COL_PART
+            *col, a = colormod.rgba(self.colors["selected" if p.id in self.selected else "model"])
             if not self.scene.in_volume(p):
                 col = COL_OUTSIDE
-            GL.glUniform3f(u_c, *col)
-            # mirrored transforms flip winding; keep front faces correct
-            GL.glFrontFace(GL.GL_CW if np.linalg.det(M[:3, :3]) < 0 else GL.GL_CCW)
-            b = self._buffers[id(p.mesh)][1]
-            GL.glBindVertexArray(b.vao)
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
-        GL.glFrontFace(GL.GL_CCW)
+            (solid if a >= OPAQUE else clear).append((self._buffers[id(p.mesh)][1], p.matrix(), col, a))
+        self._draw_meshes(solid, vp, u_mvp, u_n, u_c, u_alpha)
         if self.island_meshes or self.cavity_meshes:
             # the unsupported / cavity surface, drawn over the part's own faces (same depth):
             # pulled forward
             GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, vp.astype(np.float32))
-            GL.glUniformMatrix3fv(u_n, 1, GL.GL_TRUE, np.eye(3, dtype=np.float32))
+            GL.glUniformMatrix4fv(u_n, 1, GL.GL_TRUE, np.eye(4, dtype=np.float32))
             GL.glUniform3f(u_c, *COL_ISLAND)
             GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
             GL.glPolygonOffset(-1.0, -2.0)
             GL.glDepthFunc(GL.GL_LEQUAL)
             for m in self.island_meshes + self.cavity_meshes:
                 b = self._buffers[id(m)][1]
-                GL.glBindVertexArray(b.vao)
-                GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
+                b.draw()
             GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
             if self.cavity_meshes:
                 # a sealed cavity is hidden inside its part: show it through the walls. Its
@@ -433,37 +441,19 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 GL.glUniform1f(u_alpha, CAVITY_XRAY)
                 for m in self.cavity_meshes:
                     b = self._buffers[id(m)][1]
-                    GL.glBindVertexArray(b.vao)
-                    GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
+                    b.draw()
                 GL.glUniform1f(u_alpha, 1.0)
                 GL.glDisable(GL.GL_BLEND)
                 GL.glDisable(GL.GL_CULL_FACE)
                 GL.glDepthMask(GL.GL_TRUE)
             GL.glDepthFunc(GL.GL_LESS)
         self._draw_guides(vp)
-        if self._extras:
-            # supports: half transparent, front faces only (no inside faces showing through),
-            # without writing depth so the model and other supports stay visible behind them
-            GL.glUseProgram(self._mesh_prog)
-            GL.glUniform3f(u_c, *COL_SUPPORT)
-            GL.glUniform1f(u_alpha, SUPPORT_ALPHA)
-            GL.glEnable(GL.GL_BLEND)
-            GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)  # stays opaque
-            GL.glEnable(GL.GL_CULL_FACE)
-            GL.glCullFace(GL.GL_BACK)
-            GL.glDepthMask(GL.GL_FALSE)
-            for m, M in self._extras:
-                GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
-                GL.glUniformMatrix3fv(u_n, 1, GL.GL_TRUE, np.linalg.inv(M[:3, :3]).T.astype(np.float32))
-                GL.glFrontFace(GL.GL_CW if np.linalg.det(M[:3, :3]) < 0 else GL.GL_CCW)
-                b = self._buffers[id(m)][1]
-                GL.glBindVertexArray(b.vao)
-                GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
-            GL.glFrontFace(GL.GL_CCW)
-            GL.glDepthMask(GL.GL_TRUE)
-            GL.glDisable(GL.GL_CULL_FACE)
-            GL.glDisable(GL.GL_BLEND)
-            GL.glUniform1f(u_alpha, 1.0)
+        GL.glUseProgram(self._mesh_prog)
+        *scol, sa = colormod.rgba(self.colors["support"])
+        sup = [(self._buffers[id(m)][1], M, scol, sa) for m, M in self._extras]
+        # supports first when solid (they hide what's behind them), last when see-through
+        self._draw_meshes(sup if sa >= OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha, cull=True)
+        self._draw_meshes(clear + (sup if sa < OPAQUE else []), vp, u_mvp, u_n, u_c, u_alpha)
         self._draw_selected_guides(vp)
         if self.hole_preview is not None:
             self._draw_hole_preview(vp)
@@ -482,6 +472,34 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 self._draw_drag_marker(painter, vp)
         finally:
             painter.end()
+
+    def _draw_meshes(self, items, vp, u_mvp, u_n, u_c, u_alpha, cull: bool = False) -> None:
+        """Draw (buffer, 4x4 matrix, rgb, opacity) items with the mesh program. See-through ones
+        (opacity < 1) show front faces only (no inside faces showing through) and write no
+        depth, so what's behind them, including other see-through things, stays visible."""
+        if not items:
+            return
+        see_through = items[0][3] < OPAQUE
+        if see_through:
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)  # stays opaque
+            GL.glDepthMask(GL.GL_FALSE)
+        if see_through or cull:
+            GL.glEnable(GL.GL_CULL_FACE)
+            GL.glCullFace(GL.GL_BACK)
+        for buf, M, col, a in items:
+            GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
+            GL.glUniformMatrix4fv(u_n, 1, GL.GL_TRUE, M.astype(np.float32))
+            GL.glUniform3f(u_c, *col)
+            GL.glUniform1f(u_alpha, min(a, 1.0) if see_through else 1.0)
+            # mirrored transforms flip winding; keep front faces correct
+            GL.glFrontFace(GL.GL_CW if np.linalg.det(M[:3, :3]) < 0 else GL.GL_CCW)
+            buf.draw()
+        GL.glFrontFace(GL.GL_CCW)
+        GL.glUniform1f(u_alpha, 1.0)
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glDisable(GL.GL_BLEND)
 
     def _draw_drag_marker(self, p: QPainter, vp) -> None:
         """Where a dragged support contact will go."""
@@ -502,12 +520,11 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         fainter through the surface."""
         GL.glUseProgram(self._mesh_prog)
         GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._mesh_prog, "mvp"), 1, GL.GL_TRUE, vp.astype(np.float32))
-        GL.glUniformMatrix3fv(GL.glGetUniformLocation(self._mesh_prog, "nmat"), 1, GL.GL_TRUE,
-                              np.eye(3, dtype=np.float32))
+        GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._mesh_prog, "model"), 1, GL.GL_TRUE,
+                              np.eye(4, dtype=np.float32))
         GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "color"), *COL_HOLE)
         u_alpha = GL.glGetUniformLocation(self._mesh_prog, "alpha")
         b = self._buffers[id(self.hole_preview)][1]
-        GL.glBindVertexArray(b.vao)
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)
         GL.glEnable(GL.GL_CULL_FACE)
@@ -516,7 +533,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         for func, alpha in ((GL.GL_GREATER, HOLE_ALPHA_HIDDEN), (GL.GL_LEQUAL, HOLE_ALPHA)):
             GL.glDepthFunc(func)
             GL.glUniform1f(u_alpha, alpha)
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, b.count)
+            b.draw()
         GL.glDepthFunc(GL.GL_LESS)
         GL.glDepthMask(GL.GL_TRUE)
         GL.glDisable(GL.GL_CULL_FACE)
@@ -583,9 +600,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         shifts = [np.eye(4) for _ in range(5)]
         for T, (dx, dy) in zip(shifts, ((0, 0), (px, 0), (-px, 0), (0, py), (0, -py))):
             T[0, 3], T[1, 3] = dx, dy        # clip-space shift by w·d = a constant NDC shift
+        *rgb, a = colormod.rgba(self.colors["flaw"])
         for func, alpha in ((GL.GL_GREATER, GUIDE_DIM), (GL.GL_LEQUAL, 1.0)):   # hidden part dimmed
             GL.glDepthFunc(func)
-            GL.glUniform4f(loc, 1.0, 1.0, 1.0, alpha)
+            GL.glUniform4f(loc, *rgb, alpha * a)
             for T in (shifts if alpha == 1.0 else shifts[:1]):
                 GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (T @ vp).astype(np.float32))
                 GL.glDrawArrays(GL.GL_LINES, 0, self._guide_buf.count)
@@ -698,15 +716,18 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             return
         GL.glUseProgram(self._line_prog)
         u_mvp = GL.glGetUniformLocation(self._line_prog, "mvp")
-        GL.glUniform4f(GL.glGetUniformLocation(self._line_prog, "color"), *COL_GUIDE_SELECTED, 1.0)
+        GL.glUniform4f(GL.glGetUniformLocation(self._line_prog, "color"), *colormod.rgba(self.colors["flaw_selected"]))
         GL.glBindVertexArray(self._sel_buf.vao)
         GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)
         px, py = 2.0 / max(self.width(), 1), 2.0 / max(self.height(), 1)
         for dx, dy in ((0, 0), (px, 0), (-px, 0), (0, py), (0, -py)):
             T = np.eye(4)
             T[0, 3], T[1, 3] = dx, dy
             GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (T @ vp).astype(np.float32))
             GL.glDrawArrays(GL.GL_LINES, 0, self._sel_buf.count)
+        GL.glDisable(GL.GL_BLEND)
         GL.glEnable(GL.GL_DEPTH_TEST)
 
     def _draw_guide_labels(self, p: QPainter, vp, w, h) -> None:
@@ -719,12 +740,13 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         font = QFont(self.font())
         font.setBold(True)
         p.setFont(font)
-        red = QColor.fromRgbF(*COL_GUIDE_SELECTED)
+        text, sel = self.colors["flaw"], self.colors["flaw_selected"]
         for lab in labels:
-            p.setPen(QPen(red, 1.5) if lab.selected else Qt.NoPen)
+            p.setOpacity((sel if lab.selected else text).alphaF())     # the label fades with its line
+            p.setPen(QPen(QColor(sel.rgb()), 1.5) if lab.selected else Qt.NoPen)
             p.setBrush(QColor(20, 20, 24, 170))              # readable over the grid and models
             p.drawRoundedRect(lab.rect, 4, 4)
-            p.setPen(QColor(255, 255, 255))
+            p.setPen(QColor((sel if lab.selected else text).rgb()))
             p.drawText(lab.rect, Qt.AlignCenter, lab.text)
         p.restore()
 

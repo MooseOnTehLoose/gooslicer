@@ -17,6 +17,51 @@ import trimesh
 _ids = itertools.count(1)
 
 
+def hull_index(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Indices of the mesh's convex-hull vertices: bounds under any rotation and scale come from
+    these alone (a few thousand points instead of every vertex). They stay valid under any
+    affine change, so they're kept on the mesh and carried over to translated copies."""
+    n = len(mesh.vertices)
+    h = getattr(mesh, "_gs_hull", None)
+    if h is None or h[0] != n:
+        idx = np.arange(n)
+        if n > 64:
+            try:
+                from scipy.spatial import ConvexHull
+                idx = ConvexHull(np.asarray(mesh.vertices)).vertices
+            except Exception:  # flat or degenerate: qhull can't build a hull; use every vertex
+                pass
+        mesh._gs_hull = h = (n, idx)
+    return h[1]
+
+
+def _keep_hull(src: trimesh.Trimesh, dst: trimesh.Trimesh) -> trimesh.Trimesh:
+    if getattr(src, "_gs_hull", None) is not None:
+        dst._gs_hull = src._gs_hull
+    return dst
+
+
+GPU_KEY = "gs_gpu"
+
+
+def gpu_arrays(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """(float32 vertices, uint32 faces): what the 3D view uploads. Kept in trimesh's cache, which
+    drops it when the mesh changes; the view frees it after uploading."""
+    c = mesh._cache
+    if GPU_KEY not in c:
+        c[GPU_KEY] = (np.ascontiguousarray(mesh.vertices, np.float32),
+                      np.ascontiguousarray(mesh.faces, np.uint32))
+    return c[GPU_KEY]
+
+
+def prepare(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Do the 3D view's per-mesh work now (on a worker thread), not when it is first drawn."""
+    if mesh is not None and len(mesh.faces):
+        hull_index(mesh)
+        gpu_arrays(mesh)
+    return mesh
+
+
 @dataclass
 class PartState:
     position: np.ndarray
@@ -42,10 +87,11 @@ class Part:
     elevation: float = 0.0                   # height of the part's bottom above the plate (supports lift)
     supports: object = None                  # gooslicer.supports.SupportPlan | None
     _cache: tuple | None = field(default=None, repr=False)
+    _bcache: tuple | None = field(default=None, repr=False)
 
     @classmethod
     def from_mesh(cls, name: str, mesh: trimesh.Trimesh) -> "Part":
-        m = mesh.copy()
+        m = _keep_hull(mesh, mesh.copy())
         centre = m.bounds.mean(axis=0)
         m.apply_translation(-centre)
         return cls(name, m, position=centre.astype(float))
@@ -65,7 +111,7 @@ class Part:
 
     def set_mesh(self, mesh: trimesh.Trimesh) -> None:
         """Replace geometry keeping the world placement of the bounding-box centre."""
-        m = mesh.copy()
+        m = _keep_hull(mesh, mesh.copy())
         c = m.bounds.mean(axis=0)
         m.apply_translation(-c)
         self.position = self.position + self.rotation @ (self.scale * c)
@@ -85,8 +131,15 @@ class Part:
         return m
 
     def bounds(self) -> np.ndarray:
-        v = self.world_vertices()
-        return np.array([v.min(axis=0), v.max(axis=0)])
+        """World bounding box [[min xyz], [max xyz]], from the hull vertices (the 3D view asks
+        for every part's bounds every frame)."""
+        key = (self.position.tobytes(), self.rotation.tobytes(), self.scale.tobytes(), id(self.mesh),
+               len(self.mesh.vertices))
+        if self._bcache is None or self._bcache[0] != key:
+            v = np.asarray(self.mesh.vertices)[hull_index(self.mesh)]
+            w = (v * self.scale) @ self.rotation.T + self.position
+            self._bcache = (key, np.array([w.min(axis=0), w.max(axis=0)]))
+        return self._bcache[1].copy()
 
     def size(self) -> np.ndarray:
         b = self.bounds()

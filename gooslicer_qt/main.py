@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QEvent, QObject, QSettings, QStandardPaths, Qt, Signal
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QSurfaceFormat, QUndoStack
+from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QSurfaceFormat, QUndoStack
 from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QMenu,
                                QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
                                QGroupBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
@@ -17,19 +17,21 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog
 from elegoo_goo import goo
 from gooslicer import __version__, mesh as meshmod, preview, profiles
 from gooslicer import hollow as hollowmod
+from gooslicer import jobs
 from gooslicer import settings as settingsmod
 from gooslicer import slicer as slicermod
 from gooslicer import profile_store, support_defaults
 from gooslicer import project as projmod
 from gooslicer import supports as supportmod
 from gooslicer.raster import RasterSpec
-from gooslicer.scene import Part, Scene, ray_triangles, rotation_between
+from gooslicer.scene import Part, Scene, prepare, ray_triangles, rotation_between
 
+from . import colors as colormod
 from . import workers
 from .commands import AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, StateCommand
 from .camera import CameraPanel
 from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowDialog, drill_part_at, hole_axis_world,
-                        hole_preview_mesh, hollow_part)
+                        hole_preview_mesh)
 from .jobpanel import JobPanel
 from .memory import MemoryMonitor, StatusBar, trim_memory_soon
 from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, ToolWindow, show_popup
@@ -142,23 +144,26 @@ class _DropForwarder(QObject):
         return False
 
 
-def _red(meshes, masks) -> list:
-    return [m.submesh([np.flatnonzero(sel)], append=True) for m, sel in zip(meshes, masks) if sel.any()]
+def _reds_ready(res):
+    """(flaws, [[red meshes] per flaw]) with the red meshes ready for the 3D view."""
+    for group in res[1]:
+        for m in group:
+            prepare(m)
+    return res
 
 
 def _islands_and_faces(meshes, layer_height):
-    """The island check, plus each island's unsupported surface as red meshes for the 3D view:
-    (islands, [[meshes] per island])."""
-    isl = supportmod.unsupported_islands(meshes, layer_height=layer_height)
-    reds = [_red(meshes, masks) for masks in supportmod.island_faces_each(meshes, isl, layer_height)] if isl else []
-    return isl, reds
+    return _reds_ready(jobs.islands_and_faces(meshes, layer_height))
 
 
 def _cavities_and_faces(meshes):
-    """The trapped-resin check, plus the surface lining each sealed cavity or suction cup as
-    red meshes: (cavities, [[meshes] per cavity])."""
-    cav, each = hollowmod.cavity_faces_each(meshes, cups=True)
-    return cav, [_red(meshes, masks) for masks in each]
+    return _reds_ready(jobs.cavities_and_faces(meshes))
+
+
+def _auto_supported(res):
+    contacts, result, islands = res
+    prepare(result.mesh)                         # ready for the 3D view, off the GUI thread
+    return res
 
 
 def _load_and_analyze(path: str):
@@ -170,6 +175,7 @@ def _load_and_analyze(path: str):
             if id(part.mesh) not in seen:
                 seen[id(part.mesh)] = meshmod.analyze(part.mesh)
                 meshmod.slim(part.mesh)
+                prepare(part.mesh)
             out.append((part, seen[id(part.mesh)]))
         return out
     out = []
@@ -177,6 +183,7 @@ def _load_and_analyze(path: str):
         part = Part.from_mesh(name, m)
         rep = meshmod.analyze(part.mesh)
         meshmod.slim(part.mesh)                 # picking needs no index (scene.ray_triangles)
+        prepare(part.mesh)                      # hull and GPU arrays, off the GUI thread
         out.append((part, rep))
     return out
 
@@ -335,6 +342,7 @@ class MainWindow(QMainWindow):
         self.project = ProjectController(self)
         self.shortcuts = ShortcutRegistry(self.settings, self)
         self.viewport.set_handle_mode(str(self.settings.value("view/handleMode", "rotate")))
+        self.viewport.colors = colormod.load_colors(self.settings)
         self._menus()
         self.viewport.selectionChanged.connect(self._on_viewport_selection)
         self.viewport.moveFinished.connect(lambda ch: self.undo.push(StateCommand(self, ch, "Move")))
@@ -516,6 +524,12 @@ class MainWindow(QMainWindow):
         dlg.open()
         self._shortcuts_dialog = dlg
         return dlg
+
+    def set_view_color(self, key: str, color) -> None:
+        """A 3D view colour with its opacity (Edit → Preferences → 3D view colors); remembered."""
+        self.viewport.colors[key] = QColor(color)
+        colormod.save_color(self.settings, key, QColor(color))
+        self.viewport.update()
 
     def set_theme(self, mode: str) -> None:
         """System (follow the desktop), light or dark; remembered across sessions."""
@@ -779,7 +793,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP, "Hollow failed: " + msg.splitlines()[0])
             self.statusBar().clearMessage()
             self.hollowFinished.emit(False)
-        workers.submit(hollow_part, p, hs, on_done=done, on_failed=failed)
+        workers.submit_process(jobs.hollow_mesh, p.mesh, p.scale.copy(), hs, on_done=done, on_failed=failed)
 
     def drain_hole_mode(self):
         """Show the drain-hole settings over the top-left of the 3D view and drill where the
@@ -1011,7 +1025,7 @@ class MainWindow(QMainWindow):
         def failed(msg):
             self.log_msg("Trapped-resin check failed: " + msg.splitlines()[0])
             on_done(None)
-        workers.submit(_cavities_and_faces, meshes, on_done=done, on_failed=failed)
+        workers.submit_process(jobs.cavities_and_faces, meshes, then=_reds_ready, on_done=done, on_failed=failed)
 
     def seal_cavities(self, on_done) -> None:
         """Make every sealed cavity solid: check in the background, delete the shells that only
@@ -1065,7 +1079,7 @@ class MainWindow(QMainWindow):
         def failed(msg):
             self.log_msg("Seal cavities failed: " + msg.splitlines()[0])
             on_done("Sealing failed; see the Log.")
-        workers.submit(hollowmod.cavity_shells, meshes, on_done=done, on_failed=failed)
+        workers.submit_process(jobs.cavity_shells, meshes, on_done=done, on_failed=failed)
 
     def _report_cavities(self, cav):
         lines = [f"• {f.title}: {f.detail}" for f in flawmod.cavity_flaws(cav[:8], [[]] * len(cav[:8]))]
@@ -1141,7 +1155,8 @@ class MainWindow(QMainWindow):
             self.log_msg("Auto-support failed: " + msg.splitlines()[0])
             self.statusBar().clearMessage()
             self.supportsFinished.emit(-1)
-        workers.submit(supportmod.auto_support, model, params, on_done=done, on_failed=failed)
+        workers.submit_process(supportmod.auto_support, model, params, then=_auto_supported,
+                               on_done=done, on_failed=failed)
 
     def clear_supports(self):
         for pid in self.selected_ids() or [p.id for p in self.scene.parts]:
@@ -1321,7 +1336,8 @@ class MainWindow(QMainWindow):
         def failed(msg):
             self.log_msg("Island check failed: " + msg.splitlines()[0])
             on_done(None)
-        workers.submit(_islands_and_faces, meshes, max(h, 0.05), on_done=done, on_failed=failed)
+        workers.submit_process(jobs.islands_and_faces, meshes, max(h, 0.05), then=_reds_ready,
+                               on_done=done, on_failed=failed)
 
     def fix_islands(self, params, template: str, on_done) -> None:
         """Check for islands, then support each one: a contact under it for a part that already
@@ -1721,7 +1737,8 @@ class MainWindow(QMainWindow):
             self._set_slicing_enabled(True)
             self.log_msg("Island check failed (slicing anyway): " + msg.splitlines()[0])
             proceed()
-        workers.submit(_islands_and_faces, job.meshes, h, on_done=done, on_failed=failed)
+        workers.submit_process(jobs.islands_and_faces, job.meshes, h, then=_reds_ready,
+                               on_done=done, on_failed=failed)
 
     def _set_slicing_enabled(self, on: bool) -> None:
         self.slice_action.setEnabled(on)
@@ -1866,6 +1883,7 @@ class MainWindow(QMainWindow):
         if self._slice_thread:
             self._slice_thread.cancel()
             self._slice_thread.wait(10000)
+        workers.shutdown_processes()
         self.camera.shutdown()
         self.memory_monitor.stop()
         self.project.shutdown()

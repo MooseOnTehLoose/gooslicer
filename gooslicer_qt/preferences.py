@@ -6,13 +6,15 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
                                QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
-                               QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
+                               QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
                                QVBoxLayout, QWidget)
 
 from gooslicer.support_defaults import DrainHoleSettings, HollowSettings
 
+from . import colors as colormod
 from .hollowing import DrainHoleFields, HollowFields
 from .supporting import support_choices
 from .theme import THEMES
@@ -75,7 +77,7 @@ class PreferencesDialog(QDialog):
         self.categories.setSpacing(2)
         self.stack = QStackedWidget()
         self.pages: list[_Page] = []
-        for build in (self._appearance, self._printer, self._resin, self._slicing, self._hollowing,
+        for build in (self._appearance, self._colors, self._printer, self._resin, self._slicing, self._hollowing,
                       self._drain, self._supports, self._network, self._folders, self._windows, self._keyboard):
             page = build()
             self.pages.append(page)
@@ -187,6 +189,76 @@ class PreferencesDialog(QDialog):
             self.theme.blockSignals(False)
         refresh()
         return _Page("Appearance", w, reset=lambda: self.win.set_theme("system"), refresh=refresh)
+
+    def _colors(self) -> _Page:
+        """Colour (a wheel, R/G/B or hex) and transparency of each kind of object in the 3D view."""
+        w = QWidget()
+        g = QGridLayout(w)
+        g.setColumnStretch(3, 1)
+        g.addWidget(_note("Color"), 0, 1)
+        g.addWidget(_note("Transparency"), 0, 2, 1, 2)
+        self.color_buttons, self.color_sliders, self.color_values = {}, {}, {}
+        for row, (key, label, _rgb, _a, tip) in enumerate(colormod.VIEW_COLORS, start=1):
+            name = QLabel(label)
+            name.setToolTip(tip)
+            btn = QPushButton()
+            btn.setToolTip(f"Pick the color of: {label.lower()}")
+            btn.setFixedWidth(110)
+            btn.clicked.connect(lambda _=False, k=key, t=label: self._pick_color(k, t))
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(0, 100)
+            sl.setToolTip(f"Transparency of: {label.lower()} (0% is solid)")
+            sl.valueChanged.connect(lambda v, k=key: self._set_transparency(k, v))
+            val = QLabel()
+            val.setMinimumWidth(40)
+            self.color_buttons[key], self.color_sliders[key], self.color_values[key] = btn, sl, val
+            g.addWidget(name, row, 0)
+            g.addWidget(btn, row, 1)
+            g.addWidget(sl, row, 2)
+            g.addWidget(val, row, 3)
+        g.addWidget(_note("Parts outside the build volume stay red, and flaw surfaces stay red, "
+                          "whatever the model colors."), len(colormod.VIEW_COLORS) + 1, 0, 1, 4)
+
+        def refresh():
+            for key in colormod.KEYS:
+                self._show_color(key)
+
+        def reset():
+            for key in colormod.KEYS:
+                self.win.set_view_color(key, colormod.default_color(key))
+        refresh()
+        return _Page("3D view colors", w, reset=reset, refresh=refresh)
+
+    def _show_color(self, key: str) -> None:
+        c = self.win.viewport.colors[key]
+        pm = QPixmap(18, 18)
+        pm.fill(QColor(c.rgb()))
+        btn = self.color_buttons[key]
+        btn.setIcon(QIcon(pm))
+        btn.setText(c.name(QColor.HexRgb))
+        sl = self.color_sliders[key]
+        sl.blockSignals(True)
+        sl.setValue(round((1 - c.alphaF()) * 100))
+        sl.blockSignals(False)
+        self.color_values[key].setText(f"{sl.value()}%")
+
+    def _set_transparency(self, key: str, value: int) -> None:
+        c = QColor(self.win.viewport.colors[key])
+        c.setAlphaF(1 - value / 100)
+        self.win.set_view_color(key, c)
+        self.color_values[key].setText(f"{value}%")
+
+    def _pick_color(self, key: str, title: str) -> None:
+        """The colour wheel dialog; the 3D view follows it live and goes back on Cancel."""
+        before = QColor(self.win.viewport.colors[key])
+        dlg = colormod.ColorDialog(before, title, self)
+        dlg.colorChanged.connect(lambda c: (self.win.set_view_color(key, c), self._show_color(key)))
+        self._color_dialog = dlg                       # tests reach it while it's open
+        ok = dlg.exec()
+        self._color_dialog = None
+        if not ok:
+            self.win.set_view_color(key, before)
+        self._show_color(key)
 
     def _printer(self) -> _Page:
         win = self.win

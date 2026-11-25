@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDialog, Q
                                QVBoxLayout, QWidget)
 
 from gooslicer import hollow as H
+from gooslicer import jobs
 from gooslicer.support_defaults import HOLLOW_TYPES, INFILL_TYPES, DrainHoleSettings, HollowSettings
 
 TYPE_LABELS = ("Inside", "Outside", "Center", "Open bottom")
@@ -377,27 +378,6 @@ class DrainHoleDialog(_FieldsDialog):
 # ------------------------------------------------------------------ part-frame helpers
 # Work in the part's *scaled* local frame: world = R·(S·v) + t, so distances there are true
 # millimetres (rotation is rigid). Results are unscaled back into the part's local mesh.
-def _scaled(part) -> tuple[trimesh.Trimesh, bool]:
-    m = trimesh.Trimesh(np.asarray(part.mesh.vertices) * part.scale, part.mesh.faces, process=False)
-    flipped = bool(np.prod(np.sign(part.scale)) < 0)
-    if flipped:
-        m.invert()
-    return m, flipped
-
-
-def _unscaled(mesh: trimesh.Trimesh, part, flipped: bool) -> trimesh.Trimesh:
-    out = trimesh.Trimesh(np.asarray(mesh.vertices) / part.scale, mesh.faces, process=False)
-    if flipped:
-        out.invert()
-    return out
-
-
-def hollow_part(part, s: HollowSettings) -> tuple[trimesh.Trimesh, H.HollowResult]:
-    m, flipped = _scaled(part)
-    res = H.hollow(m, s)
-    return _unscaled(res.mesh, part, flipped), res
-
-
 def hole_axis_world(part, face: int, direction: str = "normal") -> np.ndarray:
     """The drill direction in world space (into the part), as drill_part uses it."""
     if direction == "vertical":
@@ -442,8 +422,8 @@ def drill_part_at(part, hit_world, axis_world, s: DrainHoleSettings):
     """The part's mesh with a hole drilled at a world point along a world direction (into the
     part). Works on any object with the part's mesh, position, rotation and scale, so a snapshot
     can be drilled off the GUI thread."""
-    m, flipped = _scaled(part)
+    m, flipped = jobs.scaled(part)
     p_local = part.rotation.T @ (np.asarray(hit_world, float) - part.position)
     axis = part.rotation.T @ np.asarray(axis_world, float)      # the scaled frame is rigid
     hole = H.DrainHole(tuple(p_local), tuple(axis / np.linalg.norm(axis)), s)
-    return _unscaled(H.drill(m, [hole]), part, flipped)
+    return jobs.unscaled(H.drill(m, [hole]), part.scale, flipped)

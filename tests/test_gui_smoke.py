@@ -1579,7 +1579,7 @@ def test_preferences_window(app, tmp_path, monkeypatch):
     d = w._preferences
     assert isinstance(d, PreferencesDialog) and d.isVisible() and d.isModal()
     names = [d.categories.item(i).text() for i in range(d.categories.count())]
-    assert names == ["Appearance", "Printer", "Resin", "Slicing", "Hollowing", "Drain holes", "Supports",
+    assert names == ["Appearance", "3D view colors", "Printer", "Resin", "Slicing", "Hollowing", "Drain holes", "Supports",
                      "Network", "Files and folders", "Windows", "Keyboard"]
 
     # changes apply at once, both ways
@@ -1942,11 +1942,24 @@ def test_vertex_data_float32_and_memory_trim(app):
     import trimesh
 
     from gooslicer_qt import memory as M
-    from gooslicer_qt.viewport import mesh_vertex_data
+    from gooslicer.scene import GPU_KEY, Part, gpu_arrays, hull_index, prepare
     m = trimesh.creation.icosphere(2)
-    vd = mesh_vertex_data(m)
-    ref = np.hstack([m.vertices[m.faces].reshape(-1, 3), np.repeat(m.face_normals, 3, axis=0)])
-    assert vd.dtype == np.float32 and vd.shape == ref.shape and np.allclose(vd, ref, atol=1e-6)
+    v, f = gpu_arrays(prepare(m))
+    assert v.dtype == np.float32 and f.dtype == np.uint32 and np.allclose(v, m.vertices, atol=1e-6)
+    assert (f == m.faces).all() and GPU_KEY in m._cache
+    m.apply_translation([1, 0, 0])                          # a changed mesh drops the stale copy
+    assert GPU_KEY not in m._cache
+    # bounds from the hull vertices match bounds from every vertex, under any transform
+    big = trimesh.creation.icosphere(4)
+    part = Part.from_mesh("s", big)
+    assert len(hull_index(part.mesh)) <= len(big.vertices)
+    part.rotation = trimesh.transformations.rotation_matrix(0.7, [1, 2, 3])[:3, :3]
+    part.scale = np.array([1.0, -2.0, 0.5])
+    part.position = np.array([3.0, 4.0, 5.0])
+    w = part.world_vertices()
+    assert np.allclose(part.bounds(), [w.min(axis=0), w.max(axis=0)])
+    flat = trimesh.Trimesh(np.c_[np.random.rand(100, 2), np.zeros(100)], np.zeros((0, 3), int))
+    assert len(hull_index(flat)) == 100                     # qhull fails on a flat set: all of them
     M.trim_memory()                                         # gc + malloc_trim: harmless any time
     M.trim_memory_soon()
     M.trim_memory_soon()                                    # merged into one, after TRIM_DELAY_MS
@@ -1975,3 +1988,66 @@ def test_hollow_dialog_infill_fields(app, tmp_path):
     f.save()
     g = HollowFields(s)
     assert g.value() == v
+
+
+def test_view_color_preferences(app, tmp_path):
+    """Edit → Preferences → 3D view colors: a colour (wheel, R/G/B or hex) and a transparency
+    for models, selected models, supports, and flaw lines/labels; applied at once, remembered,
+    Cancel in the picker puts the colour back, Restore defaults resets them all."""
+    from PySide6.QtCore import QPoint, QTimer
+    from PySide6.QtGui import QColor
+    from gooslicer_qt import colors as C
+    from gooslicer_qt.main import MainWindow
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    w.prefs_action.trigger()
+    d = w._preferences
+    d.show_page("3D view colors")
+    assert set(d.color_buttons) == {"model", "selected", "support", "flaw", "flaw_selected"}
+    assert d.color_sliders["support"].value() == 50 and d.color_sliders["model"].value() == 0
+    assert d.color_buttons["model"].text() == C.default_color("model").name()
+
+    d.color_sliders["model"].setValue(30)                        # transparency, applied at once
+    assert abs(w.viewport.colors["model"].alphaF() - 0.7) < 0.01 and d.color_values["model"].text() == "30%"
+
+    def pick(color, ok):
+        dlg = d._color_dialog
+        assert isinstance(dlg, C.ColorDialog)
+        for sp, x in zip(dlg.rgb, color):
+            sp.setValue(x)
+        assert w.viewport.colors["selected"].getRgb()[:3] == color     # the view follows live
+        dlg.accept() if ok else dlg.reject()
+    QTimer.singleShot(0, lambda: pick((10, 200, 30), True))
+    d.color_buttons["selected"].click()
+    assert w.viewport.colors["selected"].getRgb()[:3] == (10, 200, 30)
+    assert d.color_buttons["selected"].text() == "#0ac81e"
+    QTimer.singleShot(0, lambda: pick((1, 2, 3), False))           # Cancel: back as it was
+    d.color_buttons["selected"].click()
+    assert w.viewport.colors["selected"].getRgb()[:3] == (10, 200, 30)
+
+    # remembered by a new window
+    w2 = MainWindow(settings=s)
+    assert w2.viewport.colors["selected"].getRgb()[:3] == (10, 200, 30)
+    assert abs(w2.viewport.colors["model"].alphaF() - 0.7) < 0.01
+    w2.close()
+
+    d.reset_page()
+    assert all(w.viewport.colors[k] == C.default_color(k) for k in C.KEYS)
+    assert d.color_sliders["model"].value() == 0 and not any(k.startswith("colors/") for k in s.allKeys())
+
+    # the wheel, brightness, R/G/B and hex stay in step
+    dlg = C.ColorDialog(QColor("#336699"), "t")
+    assert dlg.hex.text() == "#336699" and abs(dlg.wheel.v - 0x99 / 255) < 0.01
+    dlg.hex.setText("#ff0000")
+    dlg.hex.editingFinished.emit()
+    assert [sp.value() for sp in dlg.rgb] == [255, 0, 0] and dlg.wheel.s == 1.0
+    r = dlg.wheel._radius()
+    c = dlg.wheel.SIZE / 2
+    from PySide6.QtTest import QTest
+    QTest.mouseClick(dlg.wheel, QtCore.Qt.LeftButton, pos=QPoint(int(c), int(c - r * 0.99)))  # top: hue 90°
+    col = dlg.color()
+    assert abs(col.hsvHueF() - 0.25) < 0.02 and col.saturationF() > 0.95
+    dlg.value.setValue(0)                                          # brightness 0: black
+    assert dlg.color().getRgb()[:3] == (0, 0, 0) and dlg.hex.text() == "#000000"
+    d.close()
+    w.close()

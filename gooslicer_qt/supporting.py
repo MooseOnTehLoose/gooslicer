@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout
                                QRadioButton, QVBoxLayout)
 
 from gooslicer import supports as S
+from gooslicer.scene import prepare
 from gooslicer.support_defaults import recommended_template
 
 from . import workers
@@ -121,6 +122,12 @@ class SupportsCommand(QUndoCommand):
         self._apply(self.before)
 
 
+def _ready(res: S.SupportResult) -> S.SupportResult:
+    """Get the support mesh ready for the 3D view (on the worker thread)."""
+    prepare(res.mesh)
+    return res
+
+
 class _Entry:
     def __init__(self, key, result: S.SupportResult, pos: np.ndarray):
         self.key, self.result, self.pos = key, result, pos
@@ -217,7 +224,8 @@ class SupportManager(QObject):
             self._pending.pop(pid, None)
             self._dirty.discard(pid)
             self.updated.emit()
-        workers.submit(S.build_supports, model, contacts, params, on_done=done, on_failed=failed)
+        workers.submit_process(S.build_supports, model, contacts, params, then=_ready,
+                               on_done=done, on_failed=failed)
 
     def prime(self, pid: int, frame, result: S.SupportResult) -> None:
         """Store geometry built for `frame` (a Part-like snapshot with the final placement/plan)."""
