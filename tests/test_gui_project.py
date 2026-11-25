@@ -221,3 +221,96 @@ def test_open_damaged_project_leaves_scene(app, make_window, tmp_path, monkeypat
     w.project.open_project(str(bad))
     assert _wait(app, lambda: warned)
     assert "bad.3mf" in warned[0] and len(w.scene.parts) == 1 and w.project.path == tmp_path / "ok.3mf"
+
+
+# --------------------------------------------------------------------- autosave (09 §6)
+def _autosave(app, w):
+    done = []
+    w.project.autosaved.connect(done.append)
+    w.project.set_autosave_interval_ms(50)
+    assert _wait(app, lambda: done)
+    w.project.set_autosave_interval_ms(0)
+    return Path(done[0])
+
+
+def test_autosave_writes_and_clears(app, make_window, tmp_path, monkeypatch):
+    import json
+    w = make_window()
+    assert not w.project.autosave_now()                        # nothing unsaved
+    _import(app, w, _stl(tmp_path))
+    f = _autosave(app, w)
+    assert f.exists() and f.parent.name == "autosave" and str(tmp_path / "data") in str(f)
+    info = json.loads(w.project.autosave.info.read_text())
+    assert info["original"] is None
+    from gooslicer import project as projmod
+    assert len(projmod.load(f).parts) == 1
+    _save_as(app, w, monkeypatch, tmp_path / "mine.3mf")       # saving makes it unneeded
+    assert not f.exists() and not w.project.autosave.info.exists()
+    assert (tmp_path / "mine.3mf").exists()
+
+
+def test_autosave_skipped_while_slicing(app, make_window, tmp_path, monkeypatch):
+    w = make_window()
+    _import(app, w, _stl(tmp_path))
+    monkeypatch.setattr(w, "slicing", lambda: True)
+    assert not w.project.autosave_now()
+
+
+def test_autosave_interval_preference(app, make_window):
+    w = make_window()
+    assert w.project.autosave_minutes() == 5 and w.project.autosave_timer.isActive()
+    assert w.project.autosave_timer.interval() == 5 * 60_000
+    d = w.open_preferences("Files and folders")
+    d.autosave_spin.setValue(0)
+    assert not w.project.autosave_timer.isActive() and w.settings.value("autosave/minutes") in (0, "0")
+    d.recent_spin.setValue(3)
+    assert w.project.recent_max() == 3
+    d.reset_page()
+    assert w.project.autosave_minutes() == 5 and w.project.autosave_timer.isActive()
+    assert w.project.recent_max() == 10
+    d.close()
+
+
+def test_crash_recovery(app, make_window, tmp_path, monkeypatch):
+    from gooslicer_qt import projectio
+    w1 = make_window()
+    _import(app, w1, _stl(tmp_path))
+    _save_as(app, w1, monkeypatch, tmp_path / "work.3mf")
+    w1.print_settings.widgets["exposure"].setValue(4.4)       # unsaved change
+    f = _autosave(app, w1)
+    # while w1 runs, another GooSlicer doesn't offer its autosave
+    w2 = make_window("s2.ini")
+    assert w2.project.autosave.leftovers() == []
+    # w1 "crashes": its lock goes, its files stay
+    w1.project.autosave._lock.close()
+    left = w2.project.autosave.leftovers()
+    assert [x.model for x in left] == [f] and left[0].original == str(tmp_path / "work.3mf")
+    monkeypatch.setattr(projectio.ProjectController, "ask_restore", lambda self, x: True)
+    assert w2.project.check_recovery()
+    assert _wait(app, lambda: len(w2.scene.parts) == 1)
+    assert w2.print_settings.settings().exposure == pytest.approx(4.4)
+    assert w2.project.path == tmp_path / "work.3mf" and w2.isWindowModified()
+    assert w2.windowTitle() == "work.3mf[*] — GooSlicer"
+    assert not f.exists() and w2.project.autosave.leftovers() == []
+
+
+def test_crash_recovery_discard_and_clean_quit(app, make_window, tmp_path, monkeypatch):
+    from gooslicer_qt import projectio
+    w1 = make_window()
+    _import(app, w1, _stl(tmp_path))
+    f = _autosave(app, w1)
+    store = w1.project.autosave
+    store._lock.close()
+    w2 = make_window("s2.ini")
+    asked = []
+    monkeypatch.setattr(projectio.ProjectController, "ask_restore", lambda self, x: asked.append(x) or False)
+    assert not w2.project.check_recovery()
+    assert len(asked) == 1 and not f.exists() and not store.info.exists()
+    assert not (store.dir / f"{store.session}.lock").exists()
+    assert not w2.project.check_recovery() and len(asked) == 1     # nothing left to ask about
+    # a clean quit leaves neither an autosave nor a lock
+    _import(app, w2, _stl(tmp_path))
+    f2 = _autosave(app, w2)
+    s2 = w2.project.autosave
+    w2.close()
+    assert not f2.exists() and not (s2.dir / f"{s2.session}.lock").exists()

@@ -1778,6 +1778,7 @@ class MainWindow(QMainWindow):
             self._slice_thread.wait(10000)
         self.camera.shutdown()
         self.memory_monitor.stop()
+        self.project.shutdown()
         self.lan.shutdown()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState(LAYOUT_VERSION))
@@ -2054,6 +2055,7 @@ def main(argv=None) -> int:
     app.setDesktopFileName(os.environ.get("FLATPAK_ID", "gooslicer"))   # must match the .desktop file
     w = MainWindow()
     w.show()
+    w.project.check_recovery()           # before any files from the command line
     files = [a for a in app.arguments()[1:]
              if Path(a).suffix.lower() in (*meshmod.SUPPORTED, settingsmod.SATRES_EXT)]
     if files:

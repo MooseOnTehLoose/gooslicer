@@ -2,9 +2,9 @@
 
 Tags as in 06: **[OBSERVED]** is static RE of SatelLite; **[GOOSLICER]** marks a GooSlicer design choice where SatelLite's behaviour was not recovered or is not copied.
 
-Status: **approved 2026-11-24**. Done: the format (§2–3, `gooslicer/project.py`, `tests/test_project.py`); the File menu, title, prompts, Open recent and drops (§4–5 except the Preferences option, `gooslicer_qt/projectio.py`, `tests/test_gui_project.py`). Next: autosave (§6), then shortcuts (§7), then handles (§8).
+Status: **approved 2026-11-24**. Done: the format (§2–3, `gooslicer/project.py`, `tests/test_project.py`); the File menu, title, prompts, Open recent and drops (§4–5, `gooslicer_qt/projectio.py`, `tests/test_gui_project.py`). Autosave and the Files and folders options (§6, `gooslicer_qt/autosave.py`) are done too. Next: shortcuts (§7), then handles (§8).
 
-Code: `gooslicer/project.py` (Qt-free read and write), `gooslicer_qt/projectio.py` (File menu actions, unsaved-changes prompts, recent files; autosave planned); planned: `gooslicer_qt/shortcuts.py` (action registry, Keyboard preferences page), `gooslicer_qt/viewport.py` (move and scale handles beside the existing rotation rings).
+Code: `gooslicer/project.py` (Qt-free read and write), `gooslicer_qt/projectio.py` (File menu actions, unsaved-changes prompts, recent files, autosave); planned: `gooslicer_qt/shortcuts.py` (action registry, Keyboard preferences page), `gooslicer_qt/viewport.py` (move and scale handles beside the existing rotation rings).
 Tests (planned): `tests/test_project.py`, `tests/test_gui_project.py`, `tests/test_shortcuts.py`, `tests/test_gui_handles.py`.
 
 ## 1. What SatelLite does [OBSERVED strings, no sample]
@@ -89,10 +89,12 @@ New order of the File menu:
 - **Flatpak:** paths from the file portal (`/run/user/<uid>/doc/…`) stay valid across sessions while the portal keeps the grant. To be checked in the sandbox (§9).
 
 ## 6. Autosave and crash recovery [GOOSLICER, after SatelLite's `AUTOSAVE` / `crash` files]
-- Every N minutes while there are unsaved changes, the project is written in the background to `$XDG_DATA_HOME/GooSlicer/autosave/autosave.3mf` (the Flatpak's own data folder in the sandbox). N is in Preferences → Files and folders (default 5, 0 = off). It never writes over the user's own file.
-- A clean quit, New, or a successful Save deletes the autosave.
-- **At start**, an autosave left over means GooSlicer did not quit cleanly. A dialog offers Restore / Discard, with the time it was written. Restore opens it as an unsaved, untitled project (or titled with the original path, if the autosave recorded one, and still marked unsaved).
-- An autosave never starts while a slice or another save is writing, and is skipped (not queued) when one is due during a job.
+Code: `gooslicer_qt/autosave.py` (files and locks), `ProjectController.autosave_now` / `check_recovery`.
+- Every N minutes while there are unsaved changes, the project is written in the background to `<data dir>/autosave/autosave-<session>.3mf`, then `<session>.json` beside it records the project's own path (if any) and the time. The data dir is `$XDG_DATA_HOME/GooSlicer`, the Flatpak's own data folder in the sandbox. It never writes over the user's own file. N is in Preferences → Files and folders, "Autosave every" (default 5 min, Off = 0). The same page sets the length of Open recent (1–30, default 10) and the Projects folder.
+- **One autosave per running GooSlicer.** Each holds an exclusive `flock` on `<session>.lock` while it runs. Locks work across Flatpak instances, which each have their own pid namespace, where process ids could not be compared.
+- Becoming clean deletes the autosave: a successful Save, New, Open, and a clean quit (which also removes the lock). An autosave that finishes after the project was saved deletes itself.
+- Skipped (not queued) while a slice, a save or another autosave is running.
+- **At start** (`main`, before files from the command line), autosaves whose lock can be taken belong to a GooSlicer that didn't quit cleanly. The newest is offered (Restore / Discard, with its project's name and time); older ones are discarded. Restore opens it unsaved, under the project's own path if it had one, and deletes the leftover files. Discard deletes them.
 
 ## 7. Keyboard shortcuts
 - **Registry:** every main-window action gets a stable id (`file.save`, `edit.hollow`, `view.top`…) and a default shortcut, in one table in `shortcuts.py`. Menus are built from it, so shortcuts and ids can't drift apart.

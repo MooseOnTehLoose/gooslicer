@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, Signal
+from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMenu, QMessageBox
 
 from gooslicer import __version__
@@ -14,12 +14,15 @@ from gooslicer import project as projmod
 from gooslicer.scene import Part
 
 from . import workers
+from .autosave import AutosaveStore, Leftover
 
 APP = "GooSlicer"
 PROJECT_FILTER = "GooSlicer projects and 3MF files (*.3mf *.3MF);;All files (*)"
 RECENT_KEY = "recent/projects"
 RECENT_MAX_KEY = "recent/max"
 RECENT_DEFAULT = 10
+AUTOSAVE_KEY = "autosave/minutes"
+AUTOSAVE_DEFAULT = 5
 THUMB_PX = 256
 SAVE, DISCARD, CANCEL = "save", "discard", "cancel"
 
@@ -56,6 +59,7 @@ def _save_job(path, project, supports, thumb, progress=None):
 class ProjectController(QObject):
     opened = Signal(str)          # path (tests, status)
     saved = Signal(str)
+    autosaved = Signal(str)       # path of the autosave written
 
     def __init__(self, win):
         super().__init__(win)
@@ -64,6 +68,12 @@ class ProjectController(QObject):
         self._saved_state = None
         self._saving = False
         self.recent_menu: QMenu | None = None
+        from .main import data_dir
+        self.autosave = AutosaveStore(data_dir() / "autosave")
+        self._autosaving = False
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.timeout.connect(self.autosave_now)
+        self.set_autosave_minutes(self.autosave_minutes())
         win.undo.cleanChanged.connect(self.update_title)
         win.undo.indexChanged.connect(self.update_title)
         win.print_settings.changed.connect(self.update_title)
@@ -83,6 +93,7 @@ class ProjectController(QObject):
         self.win.undo.setClean()
         self._saved_state = self.settings_state()
         self.update_title()
+        self.autosave.remove()               # nothing unsaved is left to recover
 
     def update_title(self, *_):
         name = self.path.name if self.path else "Untitled"
@@ -94,6 +105,86 @@ class ProjectController(QObject):
 
     def busy(self) -> bool:
         return self._saving
+
+    # ------------------------------------------------------------ autosave (09 §6)
+    def autosave_minutes(self) -> int:
+        try:
+            return max(0, min(120, int(self.win.settings.value(AUTOSAVE_KEY, AUTOSAVE_DEFAULT))))
+        except (TypeError, ValueError):
+            return AUTOSAVE_DEFAULT
+
+    def set_autosave_minutes(self, n: int) -> None:
+        """0 turns autosave off."""
+        n = max(0, min(120, int(n)))
+        self.win.settings.setValue(AUTOSAVE_KEY, n)
+        self.set_autosave_interval_ms(n * 60_000)
+
+    def set_autosave_interval_ms(self, ms: int) -> None:
+        if ms > 0:
+            self.autosave_timer.start(ms)
+        else:
+            self.autosave_timer.stop()
+
+    def autosave_now(self) -> bool:
+        """Write the autosave if there is something unsaved; skipped (not queued) while a slice
+        or a save is running. True when a write started."""
+        w = self.win
+        if not self.is_modified() or self._autosaving or self._saving or w.slicing():
+            return False
+        proj = self.current_project()
+        supports = self._support_meshes(proj.parts)
+        target, original = self.autosave.model, str(self.path) if self.path else None
+        self._autosaving = True
+
+        def done(_):
+            self._autosaving = False
+            if self.is_modified():
+                self.autosave.record(original)
+                self.autosaved.emit(str(target))
+            else:                                # saved meanwhile: nothing to recover
+                self.autosave.remove()
+
+        def failed(msg):
+            self._autosaving = False
+            w.log_msg(f"Autosave failed: {msg.splitlines()[0]}")
+        workers.submit(_save_job, target, proj, supports, None, on_done=done, on_failed=failed)
+        return True
+
+    def shutdown(self) -> None:
+        """A clean quit."""
+        self.autosave_timer.stop()
+        self.autosave.close()
+
+    def ask_restore(self, left: Leftover) -> bool:
+        """Restore / Discard. Tests replace this."""
+        what = Path(left.original).name if left.original else "an unsaved project"
+        box = QMessageBox(QMessageBox.Question, APP, "GooSlicer didn't quit properly last time.",
+                          QMessageBox.NoButton, self.win)
+        box.setInformativeText(f"An autosave of {what} from {left.written:%d %b %Y, %H:%M} was left. "
+                               "Restore it?")
+        restore = box.addButton("Restore", QMessageBox.AcceptRole)
+        box.addButton("Discard", QMessageBox.DestructiveRole)
+        box.setDefaultButton(restore)
+        box.exec()
+        return box.clickedButton() is restore
+
+    def check_recovery(self) -> bool:
+        """At start: offer the newest autosave left by a GooSlicer that didn't quit cleanly.
+        Older ones are discarded either way. True when a restore started."""
+        left = self.autosave.leftovers()
+        if not left:
+            return False
+        newest, older = left[0], left[1:]
+        for x in older:
+            self.autosave.discard(x.session)
+        if not self.ask_restore(newest):
+            self.autosave.discard(newest.session)
+            return False
+        self.win.log_msg(f"Restoring the autosave from {newest.written:%H:%M}…")
+        workers.submit(load_project, str(newest.model),
+                       on_done=lambda res: self._opened(str(newest.model), res, restored=newest),
+                       on_failed=lambda msg: self._open_failed(str(newest.model), msg))
+        return True
 
     # ------------------------------------------------------------ prompt
     def ask_unsaved(self) -> str:
@@ -171,7 +262,7 @@ class ProjectController(QObject):
         self.win.log_msg(f"Could not open {Path(path).name}: {first}")
         QMessageBox.warning(self.win, APP, f"Could not open {Path(path).name}:\n{first}")
 
-    def _opened(self, path: str, res) -> None:
+    def _opened(self, path: str, res, restored: Leftover | None = None) -> None:
         proj, reports = res
         w = self.win
         self._clear()
@@ -197,11 +288,20 @@ class ProjectController(QObject):
         if proj.view:
             self._apply_view(proj.view)
         w.scene_changed(select=[])
-        self.path = Path(path)
-        self.mark_saved()
-        self.add_recent(path)
         n = len(proj.parts)
-        w.log_msg(f"Opened {Path(path).name}: {n} part{'s' * (n != 1)}")
+        if restored is None:
+            self.path = Path(path)
+            self.mark_saved()
+            self.add_recent(path)
+            w.log_msg(f"Opened {Path(path).name}: {n} part{'s' * (n != 1)}")
+        else:
+            # unsaved, under the project's own name if it had one
+            self.path = Path(restored.original) if restored.original else None
+            w.undo.setClean()
+            self._saved_state = None
+            self.update_title()
+            self.autosave.discard(restored.session)
+            w.log_msg(f"Restored {n} part{'s' * (n != 1)} from the autosave.")
         for p in proj.parts:
             if not w.scene.in_volume(p):
                 w.log_msg(f"⚠ {p.name} does not fit in the build volume of the selected printer.")
@@ -284,6 +384,8 @@ class ProjectController(QObject):
                 self.win.undo.setClean()
             self._saved_state = state
             self.update_title()
+            if not self.is_modified():
+                self.autosave.remove()
             self.add_recent(str(path))
             self.win.statusBar().showMessage(f"Saved {path.name}", 5000)
             self.win.log_msg(f"Saved {path}")

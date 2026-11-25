@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
                                QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
-                               QPushButton, QScrollArea, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
+                               QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
 
 from gooslicer.support_defaults import DrainHoleSettings, HollowSettings
 
@@ -17,7 +17,8 @@ from .supporting import support_choices
 from .theme import THEMES
 
 AUTO_SUPPORT = "Automatic (SatelLite's rule: by part height)"
-FOLDERS = (("lastDir", "Models", "Where Import model… starts"),
+FOLDERS = (("projectDir", "Projects", "Where Open project… and Save project as… start"),
+           ("lastDir", "Models", "Where Import model… starts"),
            ("lastGooDir", ".goo files", "Where Slice and save, Export and Open .goo start"),
            ("lastResinDir", "Resin profile imports", "Where Import resin profile… and resin exports start"))
 
@@ -395,14 +396,41 @@ class PreferencesDialog(QDialog):
                                              lambda path, k=key: s.setValue(k, path) if path else s.remove(k)))
         f.addRow(_note("Where file dialogs open. They follow the last folder used; Automatic means "
                        "your home folder."))
+        proj = self.win.project
+        self.autosave_spin = QSpinBox()
+        self.autosave_spin.setRange(0, 120)
+        self.autosave_spin.setSuffix(" min")
+        self.autosave_spin.setSpecialValueText("Off")
+        self.autosave_spin.setValue(proj.autosave_minutes())
+        self.autosave_spin.valueChanged.connect(proj.set_autosave_minutes)
+        f.addRow("Autosave every", self.autosave_spin)
+        f.addRow(_note("While there are unsaved changes, a copy is kept in GooSlicer's own folder, "
+                       "never over your file. If GooSlicer doesn't quit properly, it offers the copy "
+                       "the next time it starts."))
+        self.recent_spin = QSpinBox()
+        self.recent_spin.setRange(1, 30)
+        self.recent_spin.setValue(proj.recent_max())
+
+        def set_recent(n):
+            self.win.settings.setValue("recent/max", n)
+            proj.update_recent_menu()
+        self.recent_spin.valueChanged.connect(set_recent)
+        f.addRow("Recent projects", self.recent_spin)
 
         def refresh():
             for key, lab in self.folder_labels.items():
                 lab.setText(str(s.value(key, "") or Path.home()))
+            for spin, value in ((self.autosave_spin, proj.autosave_minutes()), (self.recent_spin, proj.recent_max())):
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
 
         def reset():
             for key, *_ in FOLDERS:
                 s.remove(key)
+            proj.set_autosave_minutes(5)
+            s.remove("recent/max")
+            proj.update_recent_menu()
         refresh()
         return _Page("Files and folders", w, reset=reset, refresh=refresh)
 
