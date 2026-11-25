@@ -140,4 +140,4 @@ The Auto Position button (Models → Properties, below Lay flat) turns the selec
 - Border pass (`anchorDisBorder`, `borderOffset`).
 - Drag to move an existing contact (add and remove work).
 - 106 rejected contacts on arc (EVO, 30° cap; 96 with the old 45° blend; 84 with tree values; no islands left in either case): mostly points with no clear tip path or a downward surface below. Worth checking that none leave an area unsupported (the island check passes today).
-- The model check is stricter than SatelLite's: run on the sample's own tips, GooSlicer's tip ray (from 0.02 mm off the surface) would block 50 of SatelLite's 500 (10 §5). That's one cause of rejections worth looking at.
+- On SatelLite's own supported points (10 §5), GooSlicer's checks reject 1 of 370. So the arc rejections above are mostly points SatelLite wouldn't support either; SatelLite left 130 of its 500 detected points unsupported.

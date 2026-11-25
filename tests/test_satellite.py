@@ -17,7 +17,7 @@ PLATE = (211.68, 118.37)
 SAMPLE = Path(__file__).resolve().parent.parent / "samples" / "arc-1a-attitude-4.goo.3mf"
 
 
-def _support_file(sup: trimesh.Trimesh, nodes: list[tuple]) -> bytes:
+def _support_file(sup: trimesh.Trimesh, nodes: list[tuple], links: list[tuple] | None = None) -> bytes:
     out = bytearray(struct.pack("<II", SAT.SUPPORT_MAGIC, 0x00010000))
     out += (b"MESH-" * 51)[:255] + b"\n"
     out += bytes(8) + b"\x01" + struct.pack("<I", len(sup.vertices))
@@ -29,11 +29,17 @@ def _support_file(sup: trimesh.Trimesh, nodes: list[tuple]) -> bytes:
     for i, (p, role, face, typ) in enumerate(nodes):
         arr[i] = (p, (0, 0, -1), i, 0.1, role, 0, face, typ)
     out += struct.pack("<I", len(arr)) + arr.tobytes() + struct.pack("<I", 0)
+    if links is not None:                 # one empty piece per link, then the links (10 §5)
+        out += struct.pack("<I", 1) + b"Support::SupportSmartEntity\n" + struct.pack("<II", 4, len(links))
+        out += struct.pack("<II", 0, 0) * len(links)
+        out += np.asarray(links, "<i4").tobytes()
+        out += np.zeros(8, "<f4").tobytes()            # the parameter section follows
     return bytes(out)
 
 
-def make_project(path, *, supports=True) -> trimesh.Trimesh:
-    """A 10 mm cube at plate-corner (100, 50), lifted 5 mm, with two contacts on its underside."""
+def make_project(path, *, supports=True, unsupported=False) -> trimesh.Trimesh:
+    """A 10 mm cube at plate-corner (100, 50), lifted 5 mm, with two contacts on its underside;
+    `unsupported` adds a third that SatelLite left without a support (no link names it)."""
     cube = trimesh.creation.box((10, 10, 10))
     cube.apply_translation([100, 50, 10])                     # z 5..15
     down = [i for i, n in enumerate(cube.face_normals) if n[2] < -0.9]
@@ -58,7 +64,9 @@ def make_project(path, *, supports=True) -> trimesh.Trimesh:
             z.writestr("Metadata/SupportKernelEx.bms", _support_file(sup, [
                 ((98, 48, 5), SAT.CONTACT, down[0], SAT.LOWEST_T),
                 ((102, 52, 5), SAT.CONTACT, down[1], SAT.OVERHANG_T),
-                ((100, 50, 0), 3, -1, 2)]))                   # on the plate: not a contact
+                ((100, 50, 0), 3, -1, 2)]                     # on the plate: not a contact
+                + ([((101, 51, 5), SAT.CONTACT, down[0], SAT.OVERHANG_T)] if unsupported else []),
+                [(2, 0, 0, 0), (2, 1, 0, 1)] if unsupported else None))
     return sup
 
 
@@ -150,5 +158,12 @@ def test_real_sample():
     assert proj.printer == "ELEGOO Saturn 4 Ultra 16K"
     assert proj.print_settings["resin_name"] == "Space Grey 8K ABS-Like 3.0"
     assert len(part.mesh.faces) == 40074 and part.bounds()[0][2] == pytest.approx(5.0, abs=1e-4)
-    assert len(part.supports) == 500 and part.supports.kinds.count(S.LOWEST) == 70
+    assert len(part.supports) == 370 and part.supports.kinds.count(S.LOWEST) == 70   # 130 left unsupported
     assert len(S.build_for_part(part).mesh.faces) == 1205902
+
+
+def test_points_satellite_left_unsupported_are_dropped(tmp_path):
+    f = tmp_path / "cube.goo.3mf"
+    make_project(f, unsupported=True)
+    plan = P.load(f).parts[0].supports
+    assert len(plan) == 2 and plan.kinds == [S.LOWEST, S.OVERHANG]

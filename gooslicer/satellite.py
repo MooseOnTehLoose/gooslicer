@@ -121,8 +121,33 @@ class _Reader:
         return self.take(end + 1 - self.o)[:-1]
 
 
+def _linked(r: _Reader, n_nodes: int) -> np.ndarray | None:
+    """Which points of the first array have a support built from them: the point indices named by
+    the link records after Support::SupportSmartEntity (10 §5). None if that part can't be read."""
+    try:
+        r.array(_NODE, r.u32())                         # the second point array (on the plate)
+        r.u32()
+        if r.line() != b"Support::SupportSmartEntity":
+            return None
+        r.u32()
+        pieces = r.u32()
+        for _ in range(pieces):
+            a, b = r.u32(), r.u32()
+            r.take(4 * (a + b))
+        links = r.array("<i4", 4 * pieces).reshape(-1, 4)
+    except SatelLiteError:
+        return None
+    ends = links[:, :2]
+    if len(ends) and (ends.min() < 0 or ends.max() >= n_nodes):
+        return None
+    used = np.zeros(n_nodes, bool)
+    used[ends.ravel()] = True
+    return used
+
+
 def read_supports(data: bytes) -> tuple[trimesh.Trimesh, np.ndarray]:
-    """SupportKernelEx.bms (10 §5): the support mesh (plate frame) and the first point array."""
+    """SupportKernelEx.bms (10 §5): the support mesh (plate frame) and the first point array, with
+    a `linked` flag (False for points SatelLite left without a support)."""
     r = _Reader(data)
     if r.u32() != SUPPORT_MAGIC:
         raise SatelLiteError("not a SatelLite support file")
@@ -143,12 +168,19 @@ def read_supports(data: bytes) -> tuple[trimesh.Trimesh, np.ndarray]:
     if r.line() != b"Support::SmartSupportBlock" or blocks < 1:
         raise SatelLiteError("the support points are missing")
     nodes = r.array(_NODE, r.u32())
-    return trimesh.Trimesh(v, f, process=False), nodes
+    linked = _linked(r, len(nodes)) if blocks >= 2 else None
+    out = np.zeros(len(nodes), _NODE.descr + [("linked", "?")])
+    for k in _NODE.names:
+        out[k] = nodes[k]
+    out["linked"] = True if linked is None else linked
+    return trimesh.Trimesh(v, f, process=False), out
 
 
 def _plan_for(part: Part, model_world: trimesh.Trimesh, nodes: np.ndarray, support_mesh: trimesh.Trimesh):
     from .supports import LOWEST, OVERHANG, FixedSupports, SupportParams, SupportPlan
-    c = nodes[(nodes["role"] == CONTACT) & (nodes["face"] >= 0) & (nodes["face"] < len(model_world.faces))]
+    # contacts SatelLite built a support from; the rest it left unsupported (10 §5)
+    c = nodes[(nodes["role"] == CONTACT) & nodes["linked"] & (nodes["face"] >= 0)
+              & (nodes["face"] < len(model_world.faces))]
     normals = model_world.face_normals[c["face"]]           # outward normals, as GooSlicer's plans hold
     kinds = [LOWEST if t == LOWEST_T else OVERHANG for t in c["type"]]
     pts = (c["p"].astype(np.float64) - part.position) @ part.rotation / part.scale
