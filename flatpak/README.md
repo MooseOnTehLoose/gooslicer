@@ -11,7 +11,7 @@ flatpak run io.github.mooseontehloose.GooSlicer
 ```
 - The script installs the KDE runtime, SDK and PySide BaseApp for the current user (about 1.7 GB, once). Build state goes to `build/flatpak/`.
 - `python3-deps.json` pins every dependency wheel (URL + sha256) at the versions in `.venv`, which are the tested set. `gen-python-deps.py` regenerates it from `pyproject.toml`. The build replaces the BaseApp's own numpy with the pinned one.
-- QtWebEngine/QtPdf (`BASEAPP_REMOVE_WEBENGINE`) and the shiboken generator's libclang/LLVM are removed, which takes the bundle from 215 MB to 84 MB.
+- QtWebEngine/QtPdf (`BASEAPP_REMOVE_WEBENGINE`) and the shiboken generator's libclang/LLVM are removed, which takes the bundle from 215 MB to 84 MB. PyAV (printer camera, H.264 over RTSP) brought it to 106 MB (2026-11-24).
 - Two workarounds in the script, both caused by running `flatpak-builder` as the sandboxed `org.flatpak.Builder` app:
   - `FLATPAK_USER_DIR` is set so it finds `--user` runtimes.
   - `--disable-rofiles-fuse` is passed because FUSE can't mount in its sandbox.
