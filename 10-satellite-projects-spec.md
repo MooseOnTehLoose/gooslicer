@@ -71,7 +71,11 @@ Little-endian throughout. Sections in order:
 | 42 | u16 | contact type: 2 = overhang (430; median spacing 1.98 mm = `anchorDis` 2.0), 3 = lowest point (70; on faces pointing nearly straight down, tips near vertical) **[INFERRED]**; 2 for every non-contact |
 
 - Array 1: 1,662 points, of which 500 contacts. Array 2: 165 points on the plate, on a grid with 3.5 mm steps.
-- **Tip directions:** 19 % of contacts have direction z exactly −0.866025 = −cos 30°. So SatelLite clamps tips to **30° from vertical**. GooSlicer clamps to 45° (08 §3, [GOOSLICER]).
+- **Tip directions** (measured with the part's mesh, 2026-11-24):
+  - No tip leans more than 30.00° from vertical, and 312 of 500 lean exactly 30°. So SatelLite caps tips at **30°**.
+  - 286 of 500 (57 %) are exactly the outward normal capped at 30° (within 1°; median gap 0.01°). For normals under 28° from straight down, the tip angle equals the normal's. GooSlicer uses this rule since 2026-11-24 (08 §3). The old blend with straight down matched 4 %.
+  - The other 214 keep the angle but turn the heading (median 37°). **[UNKNOWN]** why. Not to avoid the model: the capped normal would be blocked for 27 of the 286 and 27 of the 214, about as often in both groups. Not to share a pillar either: each tip runs 1 mm to its own joint (links of kind 0).
+  - GooSlicer's model check would block 50 of SatelLite's own tips (a ray from 0.02 mm off the surface, 1 mm long), so it's stricter than SatelLite's.
 
 **`Support::SupportSmartEntity`:** u32 1, the name ending in `\n`, u32 4 **[UNKNOWN]**, u32 1,935 pieces. Each piece: u32 triangle count, u32 vertex count, that many int32 triangle indices, then vertex indices into the support mesh. The ranges are consecutive and cover all but 10,116 triangles (**[INFERRED]** the raft). Piece sizes: 66/36 × 1,186, 2,050/1,030 × 379, 1,024/516 × 290, 545/276 × 80.
 
@@ -87,10 +91,10 @@ Decided 2026-11-24: **both**. SatelLite's support mesh is sliced exactly until a
 - **Fixed geometry.** The plan also carries `FixedSupports`: SatelLite's mesh plus the part's mesh, turn, scale and height at import. A move on the plate shifts the mesh with the part. Any other change makes GooSlicer build supports from the plan's contacts, and the log says so once per plan: a new mesh (repair, hollow, mirror), turn, scale, height or lift, or added or removed points. Undo brings the exact mesh back.
 - **Removing a point.** SatelLite's mesh has no pillars to pick. Ctrl+click picks the contact within 2.5 mm in plan view, at or above the click.
 - **Saving.** A GooSlicer save writes the support mesh as a `type="support"` object, as always. A plan whose fixed mesh still fits also records `"fixed": {object, source, position, rotation, scale}` in project.json. Reopening keeps the exact supports. Without that key the plan is rebuilt as usual.
-- **Sample results.** Opens in 0.2 s. With the fixed mesh, a save takes 1.3 s and a reopen 1.4 s (14 MB). GooSlicer's rebuild from the 500 points takes 0.8 s and gives 487 pillars. It turns down 13 points its 45° tip rule can't reach (§5: SatelLite uses 30°).
+- **Sample results.** Opens in 0.2 s. With the fixed mesh, a save takes 1.3 s and a reopen 1.4 s (14 MB). GooSlicer's rebuild from the 500 points takes 0.7 s and gives 481 pillars. It turns down 19, mostly where its model check is stricter than SatelLite's (§5). With the old 45° blend it was 487 and 13.
 
 ## 7. Open
 - The Y direction of SatelLite's frame (§2). Checkable with one test print, or with a project and its sliced `.goo` saved together.
-- The 0.1 field, the role values 0 and 5, and the parameter section (§5). Decoding the parameters would let GooSlicer rebuild with SatelLite's tip and pillar sizes instead of its defaults.
+- The 0.1 field, the role values 0 and 5, the turned tip headings, and the parameter section (§5). Decoding the parameters would let GooSlicer rebuild with SatelLite's tip and pillar sizes instead of its defaults.
 - Several parts in one project: the sample has one. Parts are matched to `Objects` by order.
 - Writing `.goo.3mf` files for SatelLite to open.

@@ -58,6 +58,7 @@ class SupportParams:
     # filters
     inner_support: bool = True          # EnableInnerSupport (supports landing on the model)
     min_on_model_length: float = 1.0    # GooSlicer: shortest support allowed to land on the model
+    max_tip_angle: float = 30.0         # steepest tip, ° from vertical (SatelLite's, 10 §5; name GooSlicer's)
     # raft (script 9)
     raft: bool = True                   # hasBasePlat
     raft_height: float = 0.5            # platHeight
@@ -368,30 +369,28 @@ def _sphere(c, r: float, n: int = 12) -> m3.Manifold:
 
 
 def plan_pillars(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams) -> tuple[list[Pillar], list[Contact]]:
-    """Tip direction = outward normal blended with straight down, at most 45° from vertical.
-    The pillar drops vertically from the tip end to the raft, or onto the model below."""
+    """Tip direction = the outward normal, tilted no further than max_tip_angle from vertical
+    (SatelLite's rule, 10 §5). The pillar drops vertically from the tip end to the raft, or onto
+    the model below."""
     pillars, rejected = [], []
     if not contacts:
         return pillars, rejected
     down = np.array([0.0, 0.0, -1.0])
     P = np.array([c.point for c in contacts])
     N = np.array([c.normal / max(np.linalg.norm(c.normal), 1e-12) for c in contacts])
-    D = N + down
-    D[np.linalg.norm(D, axis=1) < 1e-6] = down
-    D /= np.linalg.norm(D, axis=1)[:, None]
-    lim = math.cos(math.radians(45))
-    flat = -D[:, 2] < lim
-    if flat.any():          # tilt toward vertical, keeping the horizontal direction
-        h = D[flat, :2]
-        hn = np.linalg.norm(h, axis=1)[:, None]
-        h = np.where(hn > 1e-9, h / np.maximum(hn, 1e-9), 0)
-        D[flat] = np.column_stack([h * math.sin(math.radians(45)), np.full(flat.sum(), -lim)])
+    lim = math.cos(math.radians(min(max(p.max_tip_angle, 0.0), 89.0)))
+    D = _clamp_dir(N, lim)
+    D /= np.maximum(np.linalg.norm(D, axis=1), 1e-12)[:, None]
+    half = N + down                     # halfway to vertical
+    half[np.linalg.norm(half, axis=1) < 1e-6] = down
+    half /= np.linalg.norm(half, axis=1)[:, None]
+    half = _clamp_dir(half, lim)
     rc = caster(model)
     o = P + N * 0.02
-    # 1) the tip must not pass through the model: try the blended direction, then straight
-    #    down, then the normal (clamped as above) [GOOSLICER]
+    # 1) the tip must not pass through the model: try the capped normal, then halfway to
+    #    vertical, then straight down [GOOSLICER fallbacks]
     ok = np.zeros(len(P), bool)
-    for cand in (D, np.tile(down, (len(P), 1)), _clamp_dir(N, lim)):
+    for cand in (D, half, np.tile(down, (len(P), 1))):
         todo = np.nonzero(~ok)[0]
         if not len(todo):
             break

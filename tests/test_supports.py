@@ -275,3 +275,25 @@ def test_islands_see_a_model_that_is_not_closed():
     for top in (plate, open_plate):
         isl = S.unsupported_islands([post, top], layer_height=0.1)
         assert len(isl) == 1 and abs(isl[0].point[0] - 10) < 3.5
+
+
+@pytest.mark.parametrize("tilt, cap, expect", [(0, 30, 0), (20, 30, 20), (60, 30, 30), (60, 45, 45), (85, 30, 30)])
+def test_tip_follows_the_normal_up_to_the_cap(tilt, cap, expect):
+    """SatelLite's rule (10 §5): the tip leaves along the outward normal, tilted no further than
+    max_tip_angle from vertical, keeping the normal's heading."""
+    model = _lifted(trimesh.creation.box((40, 40, 10)), 20)
+    a = math.radians(tilt)
+    n = np.array([math.sin(a), 0.0, -math.cos(a)])            # heading +X
+    c = S.Contact(np.array([0.0, 0.0, 20.0]), n, S.OVERHANG)
+    p = S.SupportParams(max_tip_angle=cap, raft=False)
+    pillars, rejected = S.plan_pillars(model, [c], p)
+    assert not rejected
+    d = pillars[0].tip_end - c.point
+    d /= np.linalg.norm(d)
+    assert math.degrees(math.acos(-d[2])) == pytest.approx(expect, abs=1e-6)
+    if expect:
+        assert d[0] > 0 and abs(d[1]) < 1e-9
+
+
+def test_default_cap_is_satellites():
+    assert S.SupportParams().max_tip_angle == 30.0

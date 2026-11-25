@@ -25,8 +25,8 @@ Not used yet: `anchorDisBorder`, `borderOffset` (no separate border pass).
 ## 3. Structure (EVO)
 Per contact:
 - **Tip:** a frustum from `topConnect.topWidth` at the model (sunk `distanceInPart` along the normal) to `bottomWidth` at the tip end, `tipLength` long. Optional ball of `topBallDiameter` at the contact, and a joint sphere at the tip end.
-- **Tip direction:** outward normal blended with straight down, clamped to at most 45° from vertical **[GOOSLICER]**.
-- **Collision avoidance:** the tip ray must stay clear of the model for `tipLength`. Candidates are tried in order: blended direction, straight down, clamped normal. A tip end found inside the model (rays can slip through seams) is rejected.
+- **Tip direction:** the outward normal, tilted no further than `max_tip_angle` from vertical (default 30°), keeping the normal's heading. This is SatelLite's rule, measured on a SatelLite project **[SAMPLE, 10 §5]**; the parameter's name is GooSlicer's. Until 2026-11-24 GooSlicer blended the normal with straight down and capped at 45° **[GOOSLICER]**, which halved most tips' angle.
+- **Collision avoidance:** the tip ray must stay clear of the model for `tipLength`. Candidates are tried in order: the capped normal, halfway to vertical (also capped), straight down **[GOOSLICER]**. A tip end found inside the model (rays can slip through seams) is rejected.
 - **Ray queries** (`raycast.py`, 2026-11-24) [GOOSLICER]: trimesh's ray tester without Embree tests nearly every face for a long ray and held ~9 GB for hundreds of rays on a 300k-face model. A `Caster`, built once per mesh, bins faces on XY grids by size level for vertical rays and keeps k-d trees of face centres for short segments, querying in chunks so memory stays bounded.
 - **Pillar:** vertical from the tip end, `cluster.topWidth` → `bottomWidth`, `polyEdgeNum` sides.
   - Nothing below → lands on the raft (or the plate with no raft).
@@ -139,4 +139,5 @@ The Auto Position button (Models → Properties, below Lay flat) turns the selec
 - Tree: check the `maxHeight` interpretation against SatelLite, by a runtime capture or by decompiling `EleTriBuilder`. The other reading is "trunks at most 5 mm tall, everything above is branches", which would give far fewer, larger trees.
 - Border pass (`anchorDisBorder`, `borderOffset`).
 - Drag to move an existing contact (add and remove work).
-- 96 rejected contacts on arc (EVO; 84 with tree values): mostly points with no clear tip path or a downward surface below. Worth checking that none leave an area unsupported (the island check passes today).
+- 106 rejected contacts on arc (EVO, 30° cap; 96 with the old 45° blend; 84 with tree values; no islands left in either case): mostly points with no clear tip path or a downward surface below. Worth checking that none leave an area unsupported (the island check passes today).
+- The model check is stricter than SatelLite's: run on the sample's own tips, GooSlicer's tip ray (from 0.02 mm off the surface) would block 50 of SatelLite's 500 (10 §5). That's one cause of rejections worth looking at.
