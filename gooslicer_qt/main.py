@@ -35,6 +35,7 @@ from .memory import MemoryMonitor, StatusBar, trim_memory_soon
 from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, ToolWindow, show_popup
 from .printers import PrinterControlPanel
 from .projectio import ProjectController
+from .shortcuts import MOUSE_HELP, ShortcutRegistry, ShortcutsDialog
 from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
 from .supporting import SupportDialog, SupportManager, SupportsCommand, support_params
 from .theme import THEMES, ThemeManager
@@ -329,10 +330,16 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self._cancel_btn)
 
         self.project = ProjectController(self)
+        self.shortcuts = ShortcutRegistry(self.settings, self)
+        self.viewport.set_handle_mode(str(self.settings.value("view/handleMode", "rotate")))
         self._menus()
         self.viewport.selectionChanged.connect(self._on_viewport_selection)
         self.viewport.moveFinished.connect(lambda ch: self.undo.push(StateCommand(self, ch, "Move")))
         self.viewport.rotateFinished.connect(lambda ch, text: self.undo.push(StateCommand(self, ch, text)))
+        self.viewport.transformFinished.connect(lambda ch, text: self.undo.push(StateCommand(self, ch, text)))
+        self.viewport.transformLive.connect(self._handle_live)
+        self.viewport.uniform_scale = lambda: self.props.uniform.isChecked()
+        self.viewport.handleModeChanged.connect(self._handle_mode_changed)
         self.viewport.partContextMenu.connect(self._part_context)
         self.viewport.layFlatPicked.connect(self._lay_flat)
         self.viewport.holePicked.connect(self._hole_picked)
@@ -386,108 +393,125 @@ class MainWindow(QMainWindow):
         self.settings.setValue("windowState", self.saveState(LAYOUT_VERSION))
 
     # ----------------------------------------------------------------- setup
-    def _act(self, menu, text, slot, shortcut=None, tip=None):
+    def _act(self, menu, aid, text, slot, tip=None):
+        """A menu action with a stable id; its shortcut comes from shortcuts.DEFAULTS or the
+        user's change (Preferences → Keyboard)."""
         a = QAction(text, self)
-        if shortcut:
-            a.setShortcut(QKeySequence(shortcut))
         if tip:
             a.setStatusTip(tip)
         a.triggered.connect(slot)
         menu.addAction(a)
-        return a
+        return self.shortcuts.register(aid, a, f"{menu.title()} → {text}")
 
     def _menus(self):
         mb = self.menuBar()
         m = mb.addMenu("&File")
-        self._act(m, "&New project", self.project.new_project, QKeySequence.New)
-        self._act(m, "&Open project…", self.project.open_dialog, QKeySequence.Open,
+        self._act(m, "file.new", "&New project", self.project.new_project)
+        self._act(m, "file.open", "&Open project…", self.project.open_dialog,
                   "Open a GooSlicer project, or any 3MF file as a new project")
         self.project.recent_menu = m.addMenu("Open &recent")
         self.project.update_recent_menu()
-        self._act(m, "&Save project", self.project.save, QKeySequence.Save)
-        self._act(m, "Save project &as…", self.project.save_as, QKeySequence.SaveAs)
+        self._act(m, "file.save", "&Save project", self.project.save)
+        self._act(m, "file.save_as", "Save project &as…", self.project.save_as)
         m.addSeparator()
-        self._act(m, "&Import model…", self.import_dialog, "Ctrl+I")
-        self._act(m, "Import &resin profile…", self.import_resin_dialog, None,
+        self._act(m, "file.import", "&Import model…", self.import_dialog)
+        self._act(m, "file.import_resin", "Import &resin profile…", self.import_resin_dialog,
                   "Add resin profiles exported from SatelLite (.satres)")
         m.addSeparator()
-        self.slice_action = self._act(m, "&Slice and save .goo…", self.slice_dialog, "Ctrl+R")
-        self.send_action = self._act(m, "Slice and sen&d to printer…", self.slice_and_send, "Ctrl+Shift+R")
-        self._act(m, "&Open .goo for inspection…", self.open_goo_dialog, "Ctrl+Shift+O")
-        self._act(m, "Locate SatelLite &profiles…", self.locate_profiles)
+        self.slice_action = self._act(m, "file.slice_save", "&Slice and save .goo…", self.slice_dialog)
+        self.send_action = self._act(m, "file.slice_send", "Slice and sen&d to printer…", self.slice_and_send)
+        self._act(m, "file.open_goo", "&Open .goo for inspection…", self.open_goo_dialog)
+        self._act(m, "file.locate_profiles", "Locate SatelLite &profiles…", self.locate_profiles)
         m.addSeparator()
-        self._act(m, "&Quit", self.close, QKeySequence.Quit)
+        self._act(m, "file.quit", "&Quit", self.close)
 
         e = mb.addMenu("&Edit")
         u = self.undo.createUndoAction(self, "&Undo")
-        u.setShortcut(QKeySequence.Undo)
         r = self.undo.createRedoAction(self, "&Redo")
-        r.setShortcut(QKeySequence.Redo)
         e.addActions([u, r])
+        self.shortcuts.register("edit.undo", u, "Edit → Undo")
+        self.shortcuts.register("edit.redo", r, "Edit → Redo")
         e.addSeparator()
-        self._act(e, "Select &all", lambda: self.select([p.id for p in self.scene.parts]), QKeySequence.SelectAll)
-        self._act(e, "&Duplicate", self.duplicate_selected, "Ctrl+D")
-        self._act(e, "De&lete", self.delete_selected, QKeySequence.Delete)
+        self._act(e, "edit.select_all", "Select &all", lambda: self.select([p.id for p in self.scene.parts]))
+        self._act(e, "edit.duplicate", "&Duplicate", self.duplicate_selected)
+        self._act(e, "edit.delete", "De&lete", self.delete_selected)
         e.addSeparator()
-        self._act(e, "&Arrange all", self.arrange_all, "A")
-        self._act(e, "Lay &flat (pick face)", self.start_lay_flat, "L")
-        self._act(e, "&Repair mesh", self.repair_selected)
+        self._act(e, "edit.arrange", "&Arrange all", self.arrange_all)
+        self._act(e, "edit.lay_flat", "Lay &flat (pick face)", self.start_lay_flat)
+        self._act(e, "edit.repair", "&Repair mesh", self.repair_selected)
+        hm = e.addMenu("Ha&ndles")
+        hgroup = QActionGroup(self)
+        self.handle_actions = {}
+        for mode, label in (("move", "&Move"), ("rotate", "&Rotate"), ("scale", "&Scale")):
+            a = self._act(hm, f"edit.handles.{mode}", label, lambda _=False, m=mode: self.viewport.set_handle_mode(m),
+                          f"Show the {mode} handles in the 3D view")
+            a.setCheckable(True)
+            a.setChecked(mode == self.viewport.handle_mode)
+            hgroup.addAction(a)
+            self.handle_actions[mode] = a
         e.addSeparator()
-        self._act(e, "&Hollow…", self.hollow_dialog, "Ctrl+Shift+H")
-        self._act(e, "Add drain &holes…", self.drain_hole_mode, "Ctrl+Shift+D")
-        self._act(e, "Check for &voids", self.check_trapped_resin, None,
+        self._act(e, "edit.hollow", "&Hollow…", self.hollow_dialog)
+        self._act(e, "edit.drain_holes", "Add drain &holes…", self.drain_hole_mode)
+        self._act(e, "edit.check_voids", "Check for &voids", self.check_trapped_resin,
                   "Look for sealed cavities that would trap uncured resin")
         e.addSeparator()
-        self.prefs_action = self._act(e, "&Preferences…", self.open_preferences, QKeySequence.Preferences,
+        self.prefs_action = self._act(e, "edit.preferences", "&Preferences…", self.open_preferences,
                                       "Every GooSlicer option, by category")
 
         sm = mb.addMenu("&Supports")
-        self._act(sm, "&Auto-support…", self.auto_support_dialog, "Ctrl+Shift+A")
-        self._act(sm, "&Edit supports (click to add, Ctrl+click to remove)", self.support_edit_mode, "S")
-        self._act(sm, "&Clear supports of selected", self.clear_supports)
+        self._act(sm, "supports.auto", "&Auto-support…", self.auto_support_dialog)
+        self._act(sm, "supports.edit", "&Edit supports (click to add, Ctrl+click to remove)", self.support_edit_mode)
+        self._act(sm, "supports.clear", "&Clear supports of selected", self.clear_supports)
         sm.addSeparator()
-        self._act(sm, "&Detect islands", self.check_islands, None,
+        self._act(sm, "supports.islands", "&Detect islands", self.check_islands,
                   "Look for unsupported islands: regions with nothing under them in the layer below")
 
         pm = mb.addMenu("&Printer")
-        self._act(pm, "&Find printers on network", self._show_lan(self.lan.find_printers))
-        self._act(pm, "&Add printer by IP…", self._show_lan(self.lan.add_by_ip_dialog))
-        self._act(pm, "&Connect / disconnect", self._show_lan(self.lan.toggle_connection))
-        self._act(pm, "&Send .goo file…", self._show_lan(self.lan.send_dialog))
+        self._act(pm, "printer.find", "&Find printers on network", self._show_lan(self.lan.find_printers))
+        self._act(pm, "printer.add_ip", "&Add printer by IP…", self._show_lan(self.lan.add_by_ip_dialog))
+        self._act(pm, "printer.connect", "&Connect / disconnect", self._show_lan(self.lan.toggle_connection))
+        self._act(pm, "printer.send", "&Send .goo file…", self._show_lan(self.lan.send_dialog))
 
         rm = mb.addMenu("&Resin")
-        self._act(rm, "&Manage resins…", self.manage_resins, None,
+        self._act(rm, "resin.manage", "&Manage resins…", self.manage_resins,
                   "Browse, copy, hide, delete and export resin profiles")
 
         v = mb.addMenu("&View")
-        self._act(v, "&Reset view", self.viewport.reset_view, "Home")
-        self._act(v, "&Frame selection", self.viewport.frame_selection, "F")
-        self._act(v, "&Top", lambda: self.viewport.set_view(-90, 89), "7")
-        self._act(v, "F&ront", lambda: self.viewport.set_view(-90, 0), "1")
-        self._act(v, "&Side", lambda: self.viewport.set_view(0, 0), "3")
+        self._act(v, "view.reset", "&Reset view", self.viewport.reset_view)
+        self._act(v, "view.frame", "&Frame selection", self.viewport.frame_selection)
+        self._act(v, "view.top", "&Top", lambda: self.viewport.set_view(-90, 89))
+        self._act(v, "view.front", "F&ront", lambda: self.viewport.set_view(-90, 0))
+        self._act(v, "view.side", "&Side", lambda: self.viewport.set_view(0, 0))
         v.addSeparator()
-        self._act(v, "&Logs", self.log_window.popup, None, "Open the log in its own window")
-        self._act(v, "&Layers", self.layers_window.popup, None,
+        self._act(v, "view.logs", "&Logs", self.log_window.popup, "Open the log in its own window")
+        self._act(v, "view.layers", "&Layers", self.layers_window.popup,
                   "Open the layer preview of the sliced or opened .goo in its own window")
         v.addSeparator()
-        self._act(v, "Restore all &windows to default", self.restore_default_windows, None,
+        self._act(v, "view.restore_windows", "Restore all &windows to default", self.restore_default_windows,
                   "Reopen closed panels and put every panel back in its default place")
         tm = v.addMenu("T&heme")
         group = QActionGroup(self)
         self.theme_actions = {}
         for key, label in THEMES:
-            a = self._act(tm, label, lambda _=False, k=key: self.set_theme(k))
+            a = self._act(tm, f"view.theme.{key}", label, lambda _=False, k=key: self.set_theme(k))
             a.setCheckable(True)
             a.setChecked(key == self.theme.mode)
             group.addAction(a)
             self.theme_actions[key] = a
 
         h = mb.addMenu("&Help")
-        self._act(h, "&About GooSlicer", lambda: QMessageBox.about(
+        self._act(h, "help.shortcuts", "&Keyboard shortcuts", self.show_shortcuts,
+                  "Every keyboard shortcut and the mouse controls")
+        self._act(h, "help.about", "&About GooSlicer", lambda: QMessageBox.about(
             self, APP, f"<b>{APP} {__version__}</b><p>Native Linux slicer for ELEGOO Saturn 4 "
                        "printers (.goo, SDCP v3 LAN).</p><p>Not affiliated with ELEGOO.</p>"
-                       "<p>Mouse: left = select/drag on plate, right = orbit, middle or "
-                       "Shift+drag = pan, wheel = zoom.</p>"))
+                       f"<p>{MOUSE_HELP}</p>"))
+
+    def show_shortcuts(self):
+        dlg = ShortcutsDialog(self.shortcuts, self)
+        dlg.open()
+        self._shortcuts_dialog = dlg
+        return dlg
 
     def set_theme(self, mode: str) -> None:
         """System (follow the desktop), light or dark; remembered across sessions."""
@@ -528,6 +552,17 @@ class MainWindow(QMainWindow):
         if hasattr(self, "job_panel"):
             self.job_panel.refresh()
             self._check_held()
+
+    def _handle_live(self) -> None:
+        """A handle drag moved or scaled parts: the Mesh panel follows (the rest updates when the
+        drag ends and becomes an undo step)."""
+        p = self.primary()
+        self.props.set_part(p, self.reports.get(id(p.mesh)) if p else None)
+
+    def _handle_mode_changed(self, mode: str) -> None:
+        self.settings.setValue("view/handleMode", mode)
+        if mode in getattr(self, "handle_actions", {}):
+            self.handle_actions[mode].setChecked(True)
 
     def scene_changed(self, select=None, mesh_changed=None):
         self.supports.sync()

@@ -18,6 +18,8 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from gooslicer.camera import OrbitCamera, axis_gizmo, ray_plane
 from gooslicer.scene import Part, PartState, Scene, rotation_matrix
 
+from .handles import HandlesMixin
+
 MESH_VS = """#version 330 core
 layout(location=0) in vec3 pos;
 layout(location=1) in vec3 nrm;
@@ -207,7 +209,7 @@ def snap_angle(deg: float, step: float = ROTATE_STEP) -> float:
     return float(np.round(deg / step) * step) + 0.0
 
 
-class Viewport(QOpenGLWidget):
+class Viewport(HandlesMixin, QOpenGLWidget):
     selectionChanged = Signal(list)                # [part ids]
     moveFinished = Signal(object)                  # {id: (before PartState, after PartState)}
     layFlatPicked = Signal(int, int)               # part id, local face index
@@ -219,6 +221,9 @@ class Viewport(QOpenGLWidget):
     rotateFinished = Signal(object, str)           # {id: (before, after)}, undo text
     partContextMenu = Signal(int, object)          # part id, global QPoint (right click on a part)
     guideSelectionChanged = Signal(object)         # set of flaw keys, after a label click
+    handleModeChanged = Signal(str)                # "move", "rotate" or "scale" (handles.py)
+    transformFinished = Signal(object, str)        # a handle drag: {id: (before, after)}, undo text
+    transformLive = Signal()                       # parts changed during a handle drag
 
     def __init__(self, scene: Scene, parent=None):
         super().__init__(parent)
@@ -269,6 +274,7 @@ class Viewport(QOpenGLWidget):
         self._gl_ready = False
         self._drag = None
         self._last = QPointF()
+        self._init_handles()
         self.reset_view()
 
     # ------------------------------------------------------------- public
@@ -466,6 +472,7 @@ class Viewport(QOpenGLWidget):
                 self._draw_compass(painter)
             self._draw_guide_labels(painter, vp, w, h)
             self._draw_rings(painter, vp, w, h)
+            self._draw_handles(painter, vp)
         finally:
             painter.end()
 
@@ -750,7 +757,8 @@ class Viewport(QOpenGLWidget):
     # ------------------------------------------------------------ rotation rings
     def rings(self):
         """(centre, radius) of the rotation rings around the selection, or None."""
-        if not self.show_rings or self.support_mode or self.hole_mode or self.lay_flat_mode:
+        if (not self.show_rings or self.handle_mode != "rotate" or self.support_mode or self.hole_mode
+                or self.lay_flat_mode):
             return None
         parts = [p for p in (self.scene.get(i) for i in self.selected) if p]
         if not parts:
@@ -969,6 +977,10 @@ class Viewport(QOpenGLWidget):
             if axis is not None:
                 self._start_rotate(axis, e.position())
                 return
+            hd = self.handle_at(e.position())
+            if hd is not None:
+                self._start_handle(hd, e.position())
+                return
         if e.button() == Qt.LeftButton and not (e.modifiers() & Qt.ShiftModifier):
             o, d = self._ray(e.position())
             part, face, hit = self.scene.pick(o, d)
@@ -1003,7 +1015,7 @@ class Viewport(QOpenGLWidget):
     def _restore_cursor(self) -> None:
         if self.support_mode or self.hole_mode or self.lay_flat_mode:
             self.setCursor(Qt.CrossCursor)
-        elif self._ring_hover is not None:
+        elif self._ring_hover is not None or self._handle_hover is not None:
             self.setCursor(Qt.OpenHandCursor)
         else:
             self.unsetCursor()
@@ -1014,6 +1026,9 @@ class Viewport(QOpenGLWidget):
         self._last = pos
         if self._rot is not None and e.buttons() & Qt.LeftButton:
             self._drag_rotate(pos)
+            return
+        if self._hdrag is not None and e.buttons() & Qt.LeftButton:
+            self._drag_handle(pos, bool(e.modifiers() & Qt.ControlModifier))
             return
         if self.hole_mode and not e.buttons():
             # a fast mouse sends many moves: pick only where the cursor ends up once they're in
@@ -1032,9 +1047,10 @@ class Viewport(QOpenGLWidget):
             if on_label:
                 return
             hover = self.ring_at(pos)
-            if hover != self._ring_hover:
-                self._ring_hover = hover
-                if hover is None:
+            handle = None if hover is not None else self.handle_at(pos)
+            if hover != self._ring_hover or handle != self._handle_hover:
+                self._ring_hover, self._handle_hover = hover, handle
+                if hover is None and handle is None:
                     self.unsetCursor()
                 else:
                     self.setCursor(Qt.OpenHandCursor)
@@ -1063,6 +1079,9 @@ class Viewport(QOpenGLWidget):
         if self._rot is not None and e.button() == Qt.LeftButton:
             self._end_rotate()
             return
+        if self._hdrag is not None and e.button() == Qt.LeftButton:
+            self._end_handle()
+            return
         if e.button() == Qt.RightButton and self._rpress is not None:
             pos, self._rpress = self._rpress, None
             part, _, _ = self.scene.pick(*self._ray(pos))
@@ -1083,6 +1102,8 @@ class Viewport(QOpenGLWidget):
         self.update()
 
     def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape and self.cancel_handle_drag():
+            return
         if e.key() == Qt.Key_Escape and (self.lay_flat_mode or self.hole_mode or self.support_mode):
             if self.hole_mode:
                 self.stop_hole_mode()

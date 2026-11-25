@@ -2,9 +2,9 @@
 
 Tags as in 06: **[OBSERVED]** is static RE of SatelLite; **[GOOSLICER]** marks a GooSlicer design choice where SatelLite's behaviour was not recovered or is not copied.
 
-Status: **approved 2026-11-24**. Done: the format (§2–3, `gooslicer/project.py`, `tests/test_project.py`); the File menu, title, prompts, Open recent and drops (§4–5, `gooslicer_qt/projectio.py`, `tests/test_gui_project.py`). Autosave and the Files and folders options (§6, `gooslicer_qt/autosave.py`) are done too. Next: shortcuts (§7), then handles (§8).
+Status: **approved 2026-11-24**. Done: the format (§2–3, `gooslicer/project.py`, `tests/test_project.py`); the File menu, title, prompts, Open recent and drops (§4–5, `gooslicer_qt/projectio.py`, `tests/test_gui_project.py`). Autosave and the Files and folders options (§6, `gooslicer_qt/autosave.py`) shortcuts (§7, `gooslicer_qt/shortcuts.py`, `tests/test_shortcuts.py`) and drag handles (§8, `gooslicer_qt/handles.py`, `tests/test_gui_handles.py`) are done too. Left: the Flatpak checks in §9.
 
-Code: `gooslicer/project.py` (Qt-free read and write), `gooslicer_qt/projectio.py` (File menu actions, unsaved-changes prompts, recent files, autosave); planned: `gooslicer_qt/shortcuts.py` (action registry, Keyboard preferences page), `gooslicer_qt/viewport.py` (move and scale handles beside the existing rotation rings).
+Code: `gooslicer/project.py` (Qt-free read and write), `gooslicer_qt/projectio.py` (File menu actions, unsaved-changes prompts, recent files, autosave), `gooslicer_qt/shortcuts.py` (action registry, Keyboard preferences page, Help → Keyboard shortcuts), `gooslicer_qt/handles.py` (move and scale handles, handle mode; mixed into `Viewport`).
 Tests (planned): `tests/test_project.py`, `tests/test_gui_project.py`, `tests/test_shortcuts.py`, `tests/test_gui_handles.py`.
 
 ## 1. What SatelLite does [OBSERVED strings, no sample]
@@ -97,18 +97,18 @@ Code: `gooslicer_qt/autosave.py` (files and locks), `ProjectController.autosave_
 - **At start** (`main`, before files from the command line), autosaves whose lock can be taken belong to a GooSlicer that didn't quit cleanly. The newest is offered (Restore / Discard, with its project's name and time); older ones are discarded. Restore opens it unsaved, under the project's own path if it had one, and deletes the leftover files. Discard deletes them.
 
 ## 7. Keyboard shortcuts
-- **Registry:** every main-window action gets a stable id (`file.save`, `edit.hollow`, `view.top`…) and a default shortcut, in one table in `shortcuts.py`. Menus are built from it, so shortcuts and ids can't drift apart.
-- **Preferences → Keyboard** (new page): every action with its menu path, its shortcut and a `QKeySequenceEdit`. Typing a shortcut that another action uses shows which one and offers to move it. Restore defaults resets all. Stored as `shortcuts/<id>`; only changes from the default are stored.
+- **Registry:** every main-window action gets a stable id (`file.save`, `edit.hollow`, `view.top`…) and a default shortcut, in one table (`shortcuts.DEFAULTS`). `MainWindow._act` takes the id and the registry sets the shortcut; a test checks that the table and the menus hold the same ids. Defaults are written out (Ctrl+Z / Ctrl+Shift+Z, Ctrl+Q, Del, Ctrl+, for Preferences…) rather than taken from Qt's standard keys, which differ by desktop.
+- **Preferences → Keyboard** (new page, last): every action with its menu path, its shortcut (a one-chord `QKeySequenceEdit`) and Clear, with a filter field. The Preferences search also matches action names. Typing a shortcut that another action uses shows which one and offers to move it. Restore defaults resets all. Stored as `shortcuts/<id>`; only changes from the default are stored.
 - **Help → Keyboard shortcuts** (F1): a read-only list of the current shortcuts plus the mouse controls now in About.
 - New defaults: the File items in §4; F1; W, E, R for the handle modes (§8). Existing shortcuts stay as they are.
-- Single-key shortcuts (A, L, S, F, W, E, R, 1, 3, 7, Home) are window shortcuts and must not fire while a text field or spin box has focus. Checked by a test.
+- Single-key shortcuts (A, L, S, F, W, E, R, 1, 3, 7, Home) are window shortcuts and must not fire while a text field or spin box has focus. Qt's line edits already claim plain keys (ShortcutOverride); `test_single_keys_stay_out_of_fields` checks it.
 
 ## 8. Drag handles in the 3D view [GOOSLICER]
 Moving was dragging on the plate plus number fields, and rotation already has rings (04, P4 deviation). P7 adds handles for moving along one axis and for scaling, and a way to choose which handles are shown.
 
 **Handle mode**
 - Three modes: **Move** (W), **Rotate** (E), **Scale** (R). Only the current mode's handles are drawn. Rotate is the default, so the view looks as it does now until another mode is picked.
-- Picked from Edit → Handles (radio items) and from three small buttons at the top left of the 3D view. The mode is remembered between sessions (`view/handleMode`).
+- Picked from Edit → Handles (radio items, ids `edit.handles.*`) and from three small buttons at the top left of the 3D view. The mode is remembered between sessions (`view/handleMode`).
 - Dragging a part's body still moves it on the plate in every mode.
 - Handles are hidden while support editing, drain-hole placing or lay-flat picking is on, as the rings are now.
 
@@ -131,6 +131,7 @@ Moving was dragging on the plate plus number fields, and rotation already has ri
 - **One part selected:** three cube handles on lines from the part's bounding-box centre, along the part's **own** X, Y and Z axes (turned with it), just past its surface. `Part.scale` is per local axis, so scaling along world axes would shear a rotated part.
 - **Uniform:** a white cube handle at the end of a short diagonal line from the top of the bounding box. It scales all three axes by the same factor.
 - When the Mesh panel's **Uniform scale** box is ticked (the default), the axis cubes also scale uniformly, so the handles and the number fields agree.
+- Axis cubes sit 0.3 × the handle length (at least 4 mm) past the part's surface; the uniform cube as far beyond the box's top corner.
 - **Several parts selected:** only the uniform handle. Each part scales by the factor about the selection's bottom centre, so the spacing between parts grows with them.
 - Factor = the mouse's distance from the centre along the handle's on-screen direction, divided by the distance where the drag started. Steps of 1 %; with Ctrl held, 10 %. Never below 1 % of the original size.
 - The Mesh panel's size and scale fields follow the drag live.

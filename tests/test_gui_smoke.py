@@ -1565,7 +1565,7 @@ def test_preferences_window(app, tmp_path, monkeypatch):
     assert isinstance(d, PreferencesDialog) and d.isVisible() and d.isModal()
     names = [d.categories.item(i).text() for i in range(d.categories.count())]
     assert names == ["Appearance", "Printer", "Resin", "Slicing", "Hollowing", "Drain holes", "Supports",
-                     "Network", "Files and folders", "Windows"]
+                     "Network", "Files and folders", "Windows", "Keyboard"]
 
     # changes apply at once, both ways
     d.show_page("Appearance")

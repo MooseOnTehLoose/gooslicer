@@ -8,7 +8,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
                                QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
-                               QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
+                               QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
+                               QVBoxLayout, QWidget)
 
 from gooslicer.support_defaults import DrainHoleSettings, HollowSettings
 
@@ -51,6 +52,8 @@ class _Page:
                 out.append(w.text())
             elif isinstance(w, QComboBox):
                 out += [w.itemText(i) for i in range(w.count())]
+            elif isinstance(w, QTableWidget):
+                out += [w.item(r, 0).text() for r in range(w.rowCount()) if w.item(r, 0)]
             out.append(w.toolTip())
         return " ".join(out).lower()
 
@@ -73,7 +76,7 @@ class PreferencesDialog(QDialog):
         self.stack = QStackedWidget()
         self.pages: list[_Page] = []
         for build in (self._appearance, self._printer, self._resin, self._slicing, self._hollowing,
-                      self._drain, self._supports, self._network, self._folders, self._windows):
+                      self._drain, self._supports, self._network, self._folders, self._windows, self._keyboard):
             page = build()
             self.pages.append(page)
             scroll = QScrollArea()
@@ -433,6 +436,12 @@ class PreferencesDialog(QDialog):
             proj.update_recent_menu()
         refresh()
         return _Page("Files and folders", w, reset=reset, refresh=refresh)
+
+    def _keyboard(self) -> _Page:
+        from .shortcuts import KeyboardPage
+        self.keyboard = KeyboardPage(self.win.shortcuts)
+        self.keyboard.setMinimumHeight(420)
+        return _Page("Keyboard", self.keyboard, reset=self.keyboard.reset, refresh=self.keyboard.refresh)
 
     def _windows(self) -> _Page:
         w = QWidget()

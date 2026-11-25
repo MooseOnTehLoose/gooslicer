@@ -1,6 +1,6 @@
 # Stage 4: Native Linux desktop app — architecture and phased plan
 
-Status: **approved 2026-11-23**. P0 done, P1 done, P2 done (2026-11-23; see 05-slicing-spec.md), P3 done (2026-11-23; simulator plus hardware tests on the user's printer, see 02-lan-sdcp-spec.md §6–7), P4 done (2026-11-23; see 06-support-hollow-defaults-spec.md), P5 done (2026-11-23; see 07-hollow-drain-spec.md), P6 done (2026-11-23; EVO and tree supports, raft, editing, island check with pre-slice warning; see 08-supports-spec.md), P7 in progress (spec drafted 2026-11-24, see 09-projects-polish-spec.md).
+Status: **approved 2026-11-23**. P0 done, P1 done, P2 done (2026-11-23; see 05-slicing-spec.md), P3 done (2026-11-23; simulator plus hardware tests on the user's printer, see 02-lan-sdcp-spec.md §6–7), P4 done (2026-11-23; see 06-support-hollow-defaults-spec.md), P5 done (2026-11-23; see 07-hollow-drain-spec.md), P6 done (2026-11-23; EVO and tree supports, raft, editing, island check with pre-slice warning; see 08-supports-spec.md), P7 in progress (2026-11-24: projects, recent files, autosave, shortcuts and drag handles done; Flatpak checks left; see 09-projects-polish-spec.md).
 Decisions so far (2026-11-23):
 - Toolkit: Qt6 / PySide6.
 - Algorithms: hybrid. Open, clean-room algorithms, with SatelLite's *defaults and parameters* recovered by reverse engineering.
