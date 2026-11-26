@@ -366,6 +366,7 @@ class MainWindow(ModifyingMixin, QMainWindow):
         self.viewport.partContextMenu.connect(self._part_context)
         self.viewport.layFlatPicked.connect(self._lay_flat)
         self.viewport.regionPicked.connect(self.region_pick)
+        self.viewport.regionExcluded.connect(self.region_exclude)
         self.viewport.regionModeEnded.connect(self._region_mode_ended)
         self.load_modify_settings()
         self.viewport.holePicked.connect(self._hole_picked)

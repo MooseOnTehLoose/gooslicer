@@ -2,10 +2,10 @@
 """Write python3-deps.json: a flatpak-builder module that installs GooSlicer's Python
 dependencies offline from pinned PyPI wheels (url + sha256).
 
-Versions are those installed in the project venv (the tested set). PySide6/shiboken6 come
-from the io.qt.PySide.BaseApp base and are left out.
+Versions are those installed in the project venv (the tested set), PySide6-Essentials (Qt
+itself) included: the runtime is plain freedesktop.
 
-Usage: gen-python-deps.py --python 3.13 [--arch x86_64] [--venv .venv] [-o python3-deps.json]
+Usage: gen-python-deps.py --python 3.14 [--arch x86_64] [--venv .venv] [-o python3-deps.json]
 """
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SKIP = {"pyside6", "pyside6-essentials", "pyside6-addons", "shiboken6", "gooslicer", "pytest",
-        "pluggy", "iniconfig", "packaging", "pygments", "pip", "setuptools", "wheel"}
+SKIP = {"pyside6", "pyside6-addons", "gooslicer", "pytest", "pluggy", "iniconfig", "pygments", "pip",
+        "setuptools", "wheel"}
 
 
 def norm(name: str) -> str:
@@ -36,7 +36,8 @@ def runtime_requirements(venv: Path) -> list[str]:
     code = r"""
 import importlib.metadata as md, re, json, sys
 from packaging.requirements import Requirement
-seen, todo = {}, [Requirement(r).name for r in json.loads(sys.argv[1])]
+top = [Requirement(r) for r in json.loads(sys.argv[1])]
+seen, todo = {}, [r.name for r in top if not r.marker or r.marker.evaluate({"extra": ""})]
 while todo:
     n = todo.pop()
     k = re.sub(r"[-_.]+", "-", n).lower()
@@ -77,7 +78,7 @@ def main() -> int:
     a = ap.parse_args()
 
     reqs = runtime_requirements(Path(a.venv))
-    plats = [f"manylinux_2_{v}_{a.arch}" for v in (39, 34, 31, 28, 27, 24, 17)] + \
+    plats = [f"manylinux_2_{v}_{a.arch}" for v in (44, 43, 42, 41, 40, 39, 34, 31, 28, 27, 24, 17)] + \
             [f"manylinux2014_{a.arch}", f"manylinux1_{a.arch}"]
     with tempfile.TemporaryDirectory() as tmp:
         cmd = [sys.executable, "-m", "pip", "download", "--no-deps", "--only-binary=:all:",
@@ -93,13 +94,13 @@ def main() -> int:
             if sha != info["digests"]["sha256"]:
                 raise SystemExit(f"checksum mismatch for {whl.name}")
             sources.append({"type": "file", "url": info["url"], "sha256": sha})
-    names = " ".join(reqs)          # pinned, so the base's own numpy/PyOpenGL are replaced
+    names = " ".join(reqs)          # pinned: the tested set
     module = {
         "name": "python3-deps",
         "buildsystem": "simple",
         "build-commands": [
             "pip3 install --verbose --no-index --find-links=\"file://${PWD}\" "
-            f"--prefix=${{FLATPAK_DEST}} --no-build-isolation {names}"
+            f"--prefix=${{FLATPAK_DEST}} --no-build-isolation --ignore-installed {names}"
         ],
         "sources": sources,
     }

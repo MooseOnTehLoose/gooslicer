@@ -44,6 +44,25 @@ void main(){
   frag = vec4(color * d, alpha);
 }
 """
+# Select by Picture (11): the picture the image model sees is shaded smoothly (per-vertex
+# normals): flat shading of a finely sculpted mesh sparkles, and the model reads that as texture
+SMOOTH_VS = """#version 330 core
+layout(location=0) in vec3 pos; layout(location=1) in vec3 nrm;
+uniform mat4 mvp; uniform mat4 model; uniform mat3 nmat; uniform float clipZ;
+out vec3 vN;
+void main(){ vec3 w = (model * vec4(pos, 1.0)).xyz; vN = nmat * nrm; gl_Position = mvp * vec4(pos, 1.0);
+             gl_ClipDistance[0] = clipZ - w.z; }
+"""
+SMOOTH_FS = """#version 330 core
+in vec3 vN; out vec4 frag;
+uniform vec3 color; uniform vec3 lightA; uniform vec3 lightB; uniform vec3 backColor;
+void main(){
+  if (!gl_FrontFacing) { frag = vec4(backColor, 1.0); return; }
+  vec3 n = normalize(vN);
+  float d = 0.30 + 0.55 * max(dot(n, lightA), 0.0) + 0.25 * max(dot(n, lightB), 0.0);
+  frag = vec4(color * d, 1.0);
+}
+"""
 # Select by Picture (11): each face's index written into the colour (24 bits), back faces none
 ID_FS = """#version 330 core
 out vec4 frag;
@@ -244,6 +263,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     moveFinished = Signal(object)                  # {id: (before PartState, after PartState)}
     layFlatPicked = Signal(int, int)               # part id, local face index
     regionPicked = Signal(int, int, bool)          # part id, local face index, add (Ctrl)
+    regionExcluded = Signal(int, int)              # right-click in Select by Picture: part id, face
     regionModeEnded = Signal()
     holePicked = Signal(int, int, object)          # part id, local face index, world hit point
     holeModeEnded = Signal()
@@ -270,6 +290,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self.selected: list[int] = []
         self.lay_flat_mode = False
         self.region_mode = False                   # Select surface (11): clicks pick regions
+        self.region_exclude = False                # …and a right-click marks what to leave out
         self.region_mesh = None                    # world trimesh of the selected surface
         self.cut_preview = None                    # world trimesh: the cut's faces inside the part
         self.contour_lines = None                  # (k, 2, 3) world segments: Select surface contours
@@ -384,6 +405,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self._mesh_prog = _compile(MESH_VS, MESH_FS)
         self._line_prog = _compile(LINE_VS, LINE_FS)
         self._id_prog = _compile(MESH_VS, ID_FS)
+        self._smooth_prog = _compile(SMOOTH_VS, SMOOTH_FS)
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glEnable(GL.GL_MULTISAMPLE)
         self._gl_ready = True
@@ -1002,11 +1024,11 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         u, w = RING_BASIS[axis]
         return centre + radius * (np.cos(t)[:, None] * u + np.sin(t)[:, None] * w)
 
-    def capture(self, part: Part, id_scale: int = 2) -> dict:
+    def capture(self, part: Part, scale: int = 2) -> dict:
         """The part alone as it's seen now (opaque, model colour, the view's background, no
-        overlays) and a face-index render of it at `id_scale`× the size (11, Select by
-        Picture): {"rgb": (H, W, 3) uint8, "ids": (sH, sW) int64 (-1: none), "vp", "w", "h"
-        (widget pixels), "dpr"}."""
+        overlays) and a face-index render of it, both at `scale`× the widget's device pixels
+        (11, Select by Picture): {"rgb": (H, W, 3) uint8, "ids": (H, W) int64 (-1: none),
+        "vp", "w", "h" (widget pixels), "dpr", "scale"}."""
         from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat
         w, h = max(self.width(), 1), max(self.height(), 1)
         dpr = self.devicePixelRatioF()
@@ -1019,9 +1041,21 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             self._sync_buffers()
             buf = self._buffers[id(part.mesh)][1]
             M = part.matrix()
+            # the mesh with per-vertex normals, for the smooth picture (deleted after)
+            from gooslicer.scene import gpu_arrays
+            v, f = gpu_arrays(part.mesh)
+            vn = np.asarray(part.mesh.vertex_normals, np.float32)
+            sbuf = _Buffer(np.c_[v, vn], indices=f)
+            GL.glBindVertexArray(sbuf.vao)
+            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, sbuf.vbo)
+            GL.glEnableVertexAttribArray(1)
+            _raw_attrib_pointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 24, ctypes.c_void_p(12))
+            GL.glBindVertexArray(0)
+            nmat = np.linalg.inv(M[:3, :3]).T * np.sign(np.linalg.det(M[:3, :3]))
             clip = 1e9 if self.clip_z is None else float(self.clip_z) + 1e-4
-            out = {"vp": vp, "w": w, "h": h, "dpr": dpr}
-            for prog, size in ((self._mesh_prog, (W, H)), (self._id_prog, (W * id_scale, H * id_scale))):
+            out = {"vp": vp, "w": w, "h": h, "dpr": dpr, "scale": scale}
+            for prog in (self._smooth_prog, self._id_prog):
+                size = (W * scale, H * scale)
                 fbo = QOpenGLFramebufferObject(size[0], size[1], fmt)
                 fbo.bind()
                 try:
@@ -1033,7 +1067,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                     GL.glEnable(GL.GL_DEPTH_TEST)
                     GL.glDepthMask(GL.GL_TRUE)
                     GL.glDepthFunc(GL.GL_LESS)
-                    if prog == self._mesh_prog:
+                    if prog == self._smooth_prog:
                         GL.glClearColor(0.16, 0.17, 0.19, 1.0)
                     else:
                         GL.glClearColor(0.0, 0.0, 0.0, 0.0)
@@ -1044,16 +1078,16 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                     GL.glUniformMatrix4fv(loc("model"), 1, GL.GL_TRUE, M.astype(np.float32))
                     GL.glUniform1f(loc("clipZ"), clip)
                     GL.glEnable(GL.GL_CLIP_DISTANCE0)
-                    if prog == self._mesh_prog:
+                    if prog == self._smooth_prog:
+                        GL.glUniformMatrix3fv(loc("nmat"), 1, GL.GL_TRUE, nmat.astype(np.float32))
                         eye = self.camera.eye() - self.camera.target
                         eye /= np.linalg.norm(eye)
                         GL.glUniform3f(loc("lightA"), *eye)
                         GL.glUniform3f(loc("lightB"), 0.0, 0.0, 1.0)
                         GL.glUniform3f(loc("color"), *colormod.rgba(self.colors["model"])[:3])
-                        GL.glUniform1f(loc("alpha"), 1.0)
                         back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
                         GL.glUniform3f(loc("backColor"), *back)
-                    buf.draw()
+                    (sbuf if prog == self._smooth_prog else buf).draw()
                     GL.glDisable(GL.GL_CLIP_DISTANCE0)
                     px = GL.glReadPixels(0, 0, size[0], size[1], GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
                     a = np.frombuffer(px, np.uint8).reshape(size[1], size[0], 4)[::-1]
@@ -1061,12 +1095,13 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                     fbo.release()
                     GL.glBindVertexArray(0)
                     GL.glUseProgram(0)
-                if prog == self._mesh_prog:
+                if prog == self._smooth_prog:
                     out["rgb"] = np.ascontiguousarray(a[:, :, :3])
                 else:
                     ids = a[:, :, 0].astype(np.int64) | (a[:, :, 1].astype(np.int64) << 8) \
                         | (a[:, :, 2].astype(np.int64) << 16)
                     out["ids"] = np.where(a[:, :, 3] > 0, ids, -1)
+            sbuf.delete()
         finally:
             self.doneCurrent()
         return out
@@ -1398,7 +1433,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             return
         if e.button() == Qt.RightButton and self._rpress is not None:
             pos, self._rpress = self._rpress, None
-            part, _, _ = self.scene.pick(*self._ray(pos))
+            part, face, _ = self.scene.pick(*self._ray(pos))
+            if part is not None and self.region_mode and self.region_exclude:
+                self.regionExcluded.emit(part.id, face)
+                return
             if part is not None:
                 self.set_selection([part.id])
                 self.partContextMenu.emit(part.id, self.mapToGlobal(pos.toPoint()))

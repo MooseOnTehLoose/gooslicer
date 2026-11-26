@@ -3,6 +3,8 @@ along the selection's outline. A mixin of MainWindow: it uses the window's scene
 undo stack, settings and panels (and its `cutFinished` signal)."""
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 import trimesh
 from PySide6.QtCore import Qt, QTimer
@@ -96,8 +98,10 @@ class ModifyingMixin:
             vp.lay_flat_mode = False
             vp.start_region_mode()
             self._show_contours()
-            self.statusBar().showMessage("Select surface: click a part's surface; Ctrl+click adds an area "
-                                         "(Esc to finish)")
+            self.statusBar().showMessage(
+                "Select by Picture: click a thing on a part; Ctrl+click adds to its outline, right-click "
+                "leaves something out (Esc to finish)" if self.select_by() == "picture" else
+                "Select surface: click a part's surface; Ctrl+click adds an area (Esc to finish)")
         else:
             vp.stop_region_mode()
 
@@ -118,6 +122,7 @@ class ModifyingMixin:
 
     def select_by_changed(self) -> None:
         self.settings.setValue("modify/selectBy", self.select_by())
+        self.viewport.region_exclude = self.select_by() == "picture"
         self._show_contours()
 
     def region_pick(self, pid: int, face: int, add: bool) -> None:
@@ -127,12 +132,10 @@ class ModifyingMixin:
         if pid not in self.selected_ids():
             self.select([pid])
         kind = {"surface": "surface", "parts": "part", "picture": "picture"}[self.select_by()]
-        seed = {"kind": kind, "face": int(face)}
         if kind == "picture":
-            cands = self._picture_candidates(p, int(face))
-            if cands is None:
-                return
-            seed["cands"] = cands
+            self._picture_click(p, int(face), "add" if add else "new")
+            return
+        seed = {"kind": kind, "face": int(face)}
         r = self._region
         if add and r is not None and r["pid"] == pid and r["mesh"] == id(p.mesh):
             if not any(q["kind"] == kind and q["face"] == seed["face"] for q in r["seeds"]):
@@ -155,41 +158,130 @@ class ModifyingMixin:
             c[2][deg] = c[1].labels(deg)
         return c[2][deg]
 
-    def _picture_candidates(self, p: Part, face: int):
-        """Select by Picture: the image model's outlines round `face` in the current view, as
-        face masks, smallest first (None if it can't run)."""
-        ok, why = picture.available()
+    def region_exclude(self, pid: int, face: int) -> None:
+        """Right-click in Select by Picture: leave that out of the last outline."""
+        p = self.scene.get(pid)
+        if p is not None and self.select_by() == "picture":
+            self._picture_click(p, int(face), "exclude")
+
+    def _picture_view_key(self, p: Part):
+        vp = self.viewport
+        return (p.id, id(p.mesh), p.matrix().tobytes(), vp.camera.view().tobytes(), vp.width(), vp.height(),
+                vp.clip_z)
+
+    def picture_model_settings(self) -> tuple[str, str]:
+        """(model key, "cpu" | "gpu") from Preferences."""
+        key = str(self.settings.value("picture/model", picture.DEFAULT_MODEL))
+        if key not in picture.MODELS or picture.model_dir(key) is None:
+            key = picture.DEFAULT_MODEL
+        dev = str(self.settings.value("picture/device", "cpu"))
+        return key, ("gpu" if dev == "gpu" else "cpu")
+
+    def _picture_click(self, p: Part, face: int, how: str) -> None:
+        """Select by Picture (11). how: "new" (a plain click: a new outline), "add" (Ctrl+click:
+        another point on the last outline when the view hasn't changed, else another outline)
+        or "exclude" (right-click: leave that out of the last outline). The picture is looked
+        at once per view, in the background (the first time on a GPU compiles the model)."""
+        model = self.picture_model_settings()
+        ok, why = picture.available(model[0])
         if not ok:
             QMessageBox.warning(self, APP, "Select by Picture isn't available: " + why + ".")
-            return None
-        vp = self.viewport
-        key = (p.id, id(p.mesh), p.matrix().tobytes(), vp.camera.view().tobytes(), vp.width(), vp.height(),
-               vp.clip_z)
-        try:
-            with _Busy(self, "Looking at the picture…"):
-                if getattr(self, "_segmenter", None) is None:
-                    self._segmenter = picture.Segmenter()
-                if getattr(self, "_picture_key", None) != key:
-                    self._picture = vp.capture(p)
-                    self._segmenter.embed(self._picture["rgb"])
-                    self._picture_key = key
-                cap = self._picture
-                c = p.world_mesh().triangles_center[face]
-                xy, _ = vp._screen(np.asarray([c]))
-                x, y = xy[0] * cap["dpr"]
-                outs = self._segmenter.outlines(float(x), float(y))
-        except Exception as e:                 # a broken model file, an odd GPU: say so, carry on
+            return
+        if getattr(self, "_picture_busy", False):
+            self.statusBar().showMessage("Still looking at the picture…", 3000)
+            return
+        key = self._picture_view_key(p)
+        if getattr(self, "_picture_key", None) == key and getattr(self, "_segmenter_model", None) == model:
+            self._picture_apply(p, face, how)
+            return
+        if how == "exclude":
+            self.statusBar().showMessage("Right-click leaves something out of an outline: click the "
+                                         "thing first", 5000)
+            return
+        cap = self.viewport.capture(p)
+        seg = getattr(self, "_segmenter", None) if getattr(self, "_segmenter_model", None) == model else None
+        self._picture_busy = True
+        gpu_first = model[1] == "gpu" and seg is None
+        self.statusBar().showMessage("Looking at the picture…" + (
+            " (the first time on the GPU it compiles the model, which can take a few minutes)"
+            if gpu_first else ""))
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        pid, mesh_id = p.id, id(p.mesh)
+
+        def job():
+            s = seg or picture.Segmenter(*model)
+            s.embed(cap["rgb"])
+            return s
+
+        def finish():
+            self._picture_busy = False
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
+
+        def done(s):
+            finish()
+            if s.gpu_error and model[1] == "gpu" and not getattr(self, "_gpu_warned", False):
+                self._gpu_warned = True
+                self.log_msg(f"Select by Picture runs on the CPU: the GPU didn't start ({s.gpu_error}).")
+            self._segmenter, self._segmenter_model = s, model
+            self._picture, self._picture_key = cap, key
+            q = self.scene.get(pid)
+            if q is not None and id(q.mesh) == mesh_id and self._picture_view_key(q) == key:
+                self._picture_apply(q, face, how)
+
+        def failed(msg):
+            finish()
             self._picture_key = None
+            QMessageBox.warning(self, APP, "Select by Picture failed: " + msg.splitlines()[0])
+        workers.submit(job, on_done=done, on_failed=failed)
+
+    def _picture_apply(self, p: Part, face: int, how: str) -> None:
+        """Add the click to the selection now that the picture has been looked at."""
+        cap = self._picture
+        c = p.world_mesh().triangles_center[face]
+        xy, _ = self.viewport._screen(np.asarray([c]), cap["vp"])
+        x, y = xy[0] * cap["dpr"] * cap["scale"]
+        r = self._region
+        same = r is not None and r["pid"] == p.id and r["mesh"] == id(p.mesh)
+        last = r["seeds"][-1] if same and r["seeds"] else None
+        refine = last is not None and last["kind"] == "picture" and last.get("view") == self._picture_key
+        if how == "exclude" and not refine:
+            self.statusBar().showMessage("Right-click leaves something out of an outline: click the "
+                                         "thing first", 5000)
+            return
+        if how in ("add", "exclude") and refine:
+            last["points"].append((float(x), float(y), how == "add"))
+            (last["faces_in"] if how == "add" else last["faces_out"]).append(face)
+            seed = last
+        else:
+            seed = {"kind": "picture", "face": face, "view": self._picture_key,
+                    "points": [(float(x), float(y), True)], "faces_in": [face], "faces_out": []}
+            if how == "add" and same:
+                r["seeds"].append(seed)
+            else:
+                self._region = {"pid": p.id, "mesh": id(p.mesh), "seeds": [seed], "grows": [], "mask": None}
+        try:
+            seed["cands"] = self._picture_candidates(p, seed)
+        except Exception as e:
             QMessageBox.warning(self, APP, f"Select by Picture failed: {e}")
-            return None
+            return
+        self._update_region()
+
+    def _picture_candidates(self, p: Part, seed: dict) -> list:
+        """The image model's outlines for a picture seed's points, as face masks, smallest
+        first."""
+        cap = self._picture
+        outs = self._segmenter.outlines(seed["points"])
         ids = cap["ids"]
-        s_y, s_x = ids.shape[0] // cap["rgb"].shape[0], ids.shape[1] // cap["rgb"].shape[1]
-        part_px = (ids[::s_y, ::s_x] >= 0)[:cap["rgb"].shape[0], :cap["rgb"].shape[1]]
         n = len(p.mesh.faces)
-        cands = [picture.faces_in_outline(ids, m, n) for m in picture.candidates(outs, part_px)]
-        for m in cands:
-            m[face] = True
-        return cands or [np.eye(1, n, face, dtype=bool)[0]]
+        surf = self._surface(p)
+        cands = []
+        for m in picture.candidates(outs, ids >= 0):
+            m = picture.drop_specks(surf, picture.faces_in_outline(ids, m, n), seed["faces_in"])
+            m[seed["faces_in"]] = True
+            m[seed["faces_out"]] = False
+            cands.append(m)
+        return cands or [np.isin(np.arange(n), seed["faces_in"])]
 
     def clear_region(self) -> None:
         self._region = None
@@ -296,11 +388,18 @@ class ModifyingMixin:
         pp.select_by.setCurrentIndex(i)
         pp.select_by.blockSignals(False)
         pp.show_select_by()
+        self.viewport.region_exclude = self.select_by() == "picture"
 
     def _surface(self, p: Part) -> modify.Surface:
+        """The part's surface in world space; cached per placement."""
         if self._adjacency is None or self._adjacency[0] != id(p.mesh):
             self._adjacency = (id(p.mesh), modify.adjacency(p.mesh))
-        return modify.surface(p.mesh, p.matrix(), self._adjacency[1])
+        M = p.matrix().tobytes()
+        c = getattr(self, "_surface_cache", None)            # (weakref to the mesh, matrix, surface)
+        if c is None or c[0]() is not p.mesh or c[1] != M:
+            c = self._surface_cache = (weakref.ref(p.mesh), M, modify.surface(p.mesh, p.matrix(),
+                                                                              self._adjacency[1]))
+        return c[2]
 
     def _update_region(self) -> None:
         """Recompute the selection from its seeds (spread, placement); the cutter preview

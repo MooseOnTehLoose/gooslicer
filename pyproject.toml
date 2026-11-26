@@ -22,7 +22,10 @@ dependencies = [
   "pillow>=10",
   "lxml>=5",
   "av>=14",                # printer camera (H.264 over RTSP)
-  "onnxruntime>=1.20",     # Select by Picture (MobileSAM), 11
+  # Select by Picture (11): image models. The MIGraphX build runs on the CPU too, and on an AMD
+  # GPU where ROCm 7 is installed
+  "onnxruntime-migraphx>=1.27; platform_machine == 'x86_64'",
+  "onnxruntime>=1.20; platform_machine != 'x86_64'",
 ]
 
 [project.optional-dependencies]

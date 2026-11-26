@@ -34,16 +34,44 @@ Nothing here is from SatelLite (it has no such tool in the strings we have); eve
   2. *Normalized cuts*: the patches form a graph. Two patches are joined by the length of their shared border, weighted by exp(−valley / 20°); ridges count 15 % as much as valleys. The graph is split in two along its Fiedler vector at the sweep point with the lowest normalized cut, and each half again, while the cut is under 0.1. This finds regions only weakly attached to the rest (an ear on its rim, a band between two strap edges) even where a crease has gaps.
   3. *Merge back*: normalized cuts also split smooth surfaces where nothing marks a border. So neighbouring parts are merged, the weakest first, while the length-weighted mean valley fold along their border is under the **Part edges** angle. Parts under 1 mm² always merge.
   - Measured on the hollowed `Lisa_head_D.stl` (618k triangles): about 1.2 s once per part placement, on top of the 1.1 s contour smoothing (cached and shared with contours). At 10° it gives 56 parts (70 at 6°, 38 at 15°); changing the angle only redoes the merge (0.02 s). The eye socket inside the mask, the ear and the hood edge come out as parts; some smooth skin is still split where the cut found no clear border, so Ctrl+click adds a neighbouring part.
-- **Picture** (`gooslicer/picture.py`) [GOOSLICER]: MobileSAM ("segment anything" for small devices; ONNX export by Acly, MIT, `huggingface.co/Acly/MobileSAM` at commit `0d3b4033`) run on the CPU with onnxruntime.
-  - On a click, the part alone is drawn as it's seen, opaque in the model colour on the view's background, with no overlays. That render goes to the image encoder (long side 1024 px, about 0.2–0.3 s). The embedding is cached until the view, the part or its placement changes. The clicked face's centre is the prompt point. The multi-mask decoder (about 0.03 s) returns 4 candidate outlines.
-  - Candidates are sorted by area. One covering at least 95 % of the part's own pixels is dropped when others remain. The Outline slider picks Small (the smallest), Medium (the middle one, or the larger of two) or Large (the largest).
-  - **From pixels to faces:** a second render of the part, at twice the size, writes each face's index into the colour (gl_PrimitiveID, 24 bits, no multisampling). A face is selected when any of its pixels is inside the outline. Faces smaller than a pixel leave holes, which *fill holes* closes as for every selection. Only visible faces can be selected, so the cavity wall and the far side are never taken.
-  - **Measured** in the app on the hollowed `Lisa_head_D.stl`:
-    - Clicked between the eyes, Small is the hood round the eyes, Medium the whole hood with both ears, and Large adds the face. Clicked on an ear, Medium is exactly that ear.
-    - The first click took 1.1 s (loading the model and encoding the view). Later clicks in the same view took 0.3 s.
-  - **Files:** `mobile_sam_image_encoder.onnx` (28,157,093 bytes, sha256 `580f5fb6…c749`) and `sam_mask_decoder_multi.onnx` (16,496,559 bytes, sha256 `8976b90a…2ffe`).
-  - **Where the app looks:** `$GOOSLICER_MODELS`, `/app/share/gooslicer/models` (the Flatpak downloads them at build time, pinned by sha256), `models/` in the source tree (`scripts/fetch-models.sh`, git-ignored), then `~/.local/share/gooslicer/models`.
-  - onnxruntime (MIT) is a dependency. Without it or the files, Picture is disabled and everything else works.
+- **Picture** (`gooslicer/picture.py`) [GOOSLICER]: a "segment anything" image model run with onnxruntime. Three models, chosen in Preferences → Picture selection (`picture/model`):
+  - **MobileSAM** (default, included): ONNX export by Acly (MIT), `huggingface.co/Acly/MobileSAM` at commit `0d3b4033`. 45 MB, about 0.25 s a picture on the CPU.
+  - **SAM 2.1 Small** and **SAM 2.1 Base+** (Meta, Apache-2.0; ONNX export by onnx-community, pinned to commits `a7df49d8` and `bab18593`): 184 MB and 327 MB, about 0.7 s and 1.3 s a picture on the CPU. They follow small features more closely.
+  - The SAM 2.1 models are downloaded from Preferences into `$XDG_DATA_HOME/gooslicer/models/<name>/`. Each file is checked against its sha256, and a bad or partial download is never left under its real name. Until one is downloaded, MobileSAM is used.
+- **Clicks** while picking in Picture mode:
+  - A click outlines the thing under it.
+  - Ctrl+click in the same view adds an include point to that outline. In a new view it adds another outline.
+  - Right-click (instead of the part menu) adds an exclude point, so a strap can be separated from the buckle it runs into.
+  - Points go to the model together (SAM's multi-point prompt). The clicked faces are always in and the excluded ones always out.
+- **The picture:** on a click the part alone is drawn as it's seen, opaque in the model colour on the view's background, with no overlays, at twice the view's resolution.
+  - It's **smooth-shaded** (per-vertex normals) even though the view is flat-shaded. Flat shading of a finely sculpted mesh sparkles triangle by triangle, and the models read that as texture: on `Lisa_head_D.stl` their outlines came out speckled, and a click on a strap selected half the face. With smooth shading every model outlines the strap as a clean band.
+  - The picture is looked at in the background (busy cursor; clicks wait), once per view, part and placement.
+  - MobileSAM's input is padded to a fixed 1024×1024 with its mean colour (what its own padding stands for), so a GPU compiles it once rather than for each window size. SAM 2.1 takes the picture stretched to 1024×1024.
+  - The decoder takes the click points and returns 3–4 candidate outlines in about 0.03 s.
+- **Candidates:**
+  - Sorted by area. One covering at least 95 % of the part's own pixels is dropped when others remain.
+  - The Outline slider picks Small (the smallest), Medium (the middle one, or the larger of two) or Large (the largest).
+  - **Specks** are dropped: loose pieces of an outline (connected through the mesh) smaller than 2 % of it or 1 mm², unless they hold a clicked face. A strap seen in two places either side of a ring stays, being big.
+- **From pixels to faces:** a second render of the part, at the same size, writes each face's index into the colour (gl_PrimitiveID, 24 bits, no multisampling). A face is selected when any of its pixels is inside the outline. Faces smaller than a pixel leave holes, which *fill holes* closes as for every selection. Only visible faces can be selected, so the cavity wall and the far side are never taken.
+- **GPU** (Preferences → Picture selection → Run on, `picture/device`, default CPU):
+  - Offered only when this onnxruntime build has a GPU provider (MIGraphX, ROCm or CUDA) and the GPU's own libraries load (`libamdhip64.so.7` and `libmigraphx_c.so.3` for MIGraphX). Otherwise the note says which is missing.
+  - The dependency is `onnxruntime-migraphx` (x86-64). It's the same CPU code, with AMD's MIGraphX provider for ROCm 7 besides.
+  - Only the encoder runs on the GPU. The decoder stays on the CPU: it takes 0.03 s there, and MIGraphX can't compile SAM 2.1's (its empty "boxes" input fails to parse).
+  - MIGraphX compiles a model for the card the first time (SAM 2.1 Small: 70–150 s on an RX 9070 XT). The result is kept in `$XDG_CACHE_HOME/gooslicer/gpu` (about 290 MB for SAM 2.1 Small), and later sessions load it in about 3 s.
+  - A GPU that fails to start falls back to the CPU, and the log says why (once).
+  - **Measured** on an RX 9070 XT (gfx1201) with Ubuntu's ROCm 7 packages, per picture: SAM 2.1 Small 0.16 s (CPU 0.7 s); MobileSAM 0.28 s (CPU 0.25 s); SAM 2.1 Base+ 1.6 s (CPU 1.3 s; MIGraphX leaves most of it on the CPU). So the GPU pays off for SAM 2.1 Small.
+  - **Flatpak** (`gooslicer/gpuhost.py`): the runtime has no ROCm. With `--device=all` (for `/dev/kfd`) and `--filesystem=host-os:ro` the host's libraries are under `/run/host/usr`. The app loads them itself, by full path and globally, before the provider starts, and only where the runtime has no library of that name (a missing dependency is looked up the same way). It doesn't set LD_LIBRARY_PATH, which would let the host's Qt and C++ libraries replace the runtime's.
+    - The host's ROCm must be built for a glibc no newer than the runtime's. Ubuntu's ROCm 7 needs glibc 2.44, so the Flatpak moved from the KDE 6.11 runtime (freedesktop 25.08, glibc 2.42) to freedesktop 26.08 (2.44), with Qt from the PySide6 wheel.
+    - **Measured** in the installed Flatpak (2026-11-25): HIP, HSA, comgr, hiprtc, MIGraphX and libnuma/libbz2 came from the host. SAM 2.1 Small took 0.17 s a picture on the GPU, and a click in a new view 1.0 s in the app, face mapping included.
+- **Measured** in the app on the hollowed `Lisa_head_D.stl`, with the smooth picture and the Small outline:
+  - A click on the cheek strap selects that strap: SAM 2.1 Base+ cleanest; MobileSAM also takes the buckle strap it joins; SAM 2.1 Small left specks, now dropped.
+  - A click on the ring takes the ring's tab; a click on the hood edge takes the hood.
+  - With MobileSAM, clicked between the eyes, Small was the hood round the eyes and Medium the whole hood with both ears. Clicked on an ear, Medium was exactly that ear.
+- **Files:**
+  - MobileSAM: `mobile_sam_image_encoder.onnx` (28,157,093 bytes, sha256 `580f5fb6…c749`) and `sam_mask_decoder_multi.onnx` (16,496,559 bytes, sha256 `8976b90a…2ffe`).
+  - SAM 2.1: `vision_encoder.onnx(+_data)` and `prompt_encoder_mask_decoder.onnx(+_data)`, with sizes and hashes in `picture.MODELS`.
+- **Where the app looks:** `$GOOSLICER_MODELS`, `/app/share/gooslicer/models` (the Flatpak downloads MobileSAM at build time, pinned by sha256), `models/` in the source tree (`scripts/fetch-models.sh`, git-ignored), then `$XDG_DATA_HOME/gooslicer/models` (downloads from Preferences). Each SAM 2.1 model sits in its own subfolder.
+  - onnxruntime (MIT) is a dependency. Without it or any model's files, Picture is disabled and everything else works.
 - **Grow selection** (button, with a distance −20…20 mm beside it, default 1 mm, `modify/grow`; placed just above Cut out selection): grows the selection by that distance along the surface, or shrinks it when negative.
   - Distances run along the mesh's edges (Dijkstra) from the selection's vertices. A face joins when all its corners are in reach. A shrink is the same grow applied to the rest, so +1 then −1 gives back about the same selection.
   - It doesn't stop at contours or the spread, and stays on the shells it's on.
@@ -88,7 +116,10 @@ The cut follows the selection's outline, not a plane (changed 2026-11-25 after t
 - `modify.grow_by` on a ball's cap: ±2 mm moves its edge 2 mm along the surface (±0.35); a grow keeps the cap and a shrink stays inside it.
 - `parts.parts` on a slab with a post standing in it: the post's sides and top are one part and the slab's top another. A ball is a single part.
 - `picture.faces_in_outline` maps a face-index image and an outline to faces; candidates are sorted, and the near-whole one is dropped.
-- GUI: Select by Parts selects the post of a slab-and-post part; Select by Picture, with a stand-in segmenter outlining the left half of the view, selects only visible faces on that side. The face-index render matches the faces the view's own pick finds.
+- `picture.drop_specks` keeps big pieces and clicked ones. `picture.download` keeps files that match their checksum and leaves nothing behind otherwise.
+- Each installed model outlines a block on a dark ground (skipped for a model that isn't installed).
+- Preferences → Picture selection lists the models with their download state, and offers the GPU only when it can start.
+- GUI: Select by Parts selects the post of a slab-and-post part; Select by Picture, with a stand-in segmenter outlining the left half of the view, selects only visible faces on that side; a right-click leaves a patch out without looking at the picture again. The face-index render matches the faces the view's own pick finds.
 - GUI: the Mesh pane starts folded with the status in its button; Select surface + click selects a region; the spread slider changes its size; Cut out selection gives two parts, a single undo restores one; refuses on an open mesh.
 
 ## 5. Open items

@@ -1091,9 +1091,11 @@ def test_select_by_parts_takes_the_post(app, win, tmp_path):
 
 
 def test_select_by_picture(app, win, tmp_path, monkeypatch):
-    """Select by Picture (11) with a stand-in image model outlining the left half of the view:
-    only faces seen, on that side, are selected. The face-index render matches the view's own
-    pick, and the Outline slider picks among the candidates."""
+    """Select by Picture (11) with a stand-in image model that outlines the left half of the
+    view (less a square round any excluded point): only faces seen on that side are selected.
+    The face-index render matches the view's own pick; the picture is looked at in the
+    background; Ctrl+click adds a point, right-click leaves something out; the Outline slider
+    picks among the candidates."""
     from gooslicer import picture
     v, f = trimesh.remesh.subdivide_to_size(*(lambda b: (b.vertices, b.faces))(trimesh.creation.box((20, 20, 20))),
                                             max_edge=1.0)
@@ -1108,43 +1110,66 @@ def test_select_by_picture(app, win, tmp_path, monkeypatch):
     pump(app)
     cap = vp.capture(p)
     ids = cap["ids"]
-    assert cap["rgb"].shape[:2] == (ids.shape[0] // 2, ids.shape[1] // 2)
+    k = cap["dpr"] * cap["scale"]
+    assert cap["rgb"].shape[:2] == ids.shape
     wm = p.world_mesh()
     for fx, fy in ((0.5, 0.5), (0.45, 0.55), (0.55, 0.45)):            # the GPU and the pick agree
         x, y = cap["w"] * fx, cap["h"] * fy
         o, d = vp._ray(QPointF(x, y))
         part, face, _hit = win.scene.pick(o, d)
         if part is not None:
-            got = ids[int(y * cap["dpr"] * 2), int(x * cap["dpr"] * 2)]
-            assert got == face, (fx, fy)
+            assert ids[int(y * k), int(x * k)] == face, (fx, fy)
 
     class Stub:
+        gpu_error = None
+        embeds = 0
+
         def embed(self, rgb):
             self.shape = rgb.shape[:2]
+            Stub.embeds += 1
 
-        def outlines(self, x, y):
+        def outlines(self, points):
             h, w = self.shape
             left = np.zeros((h, w), bool)
             left[:, : w // 2] = True
+            x, y, _ = points[0]
             small = np.zeros((h, w), bool)
-            small[int(y) - 3:int(y) + 4, int(x) - 3:int(x) + 4] = True
+            small[int(y) - 6:int(y) + 7, int(x) - 6:int(x) + 7] = True
+            for px, py, inc in points[1:]:
+                if not inc:
+                    left[int(py) - 40:int(py) + 41, int(px) - 40:int(px) + 41] = False
             return [left, small, np.ones((h, w), bool)]
-    monkeypatch.setattr(picture, "available", lambda: (True, ""))
-    win._segmenter = Stub()
+    monkeypatch.setattr(picture, "available", lambda key=None: (True, ""))
+    win._segmenter, win._segmenter_model = Stub(), win.picture_model_settings()
     pp = win.props
     pp.select_by.model().item(2).setEnabled(True)
     pp.select_by.setCurrentIndex(pp.select_by.findData("picture"))
-    assert pp.outline_size.isVisibleTo(pp) and pp.outline_label.text() == "Medium"
+    assert pp.outline_size.isVisibleTo(pp) and pp.outline_label.text() == "Medium" and vp.region_exclude
+
+    def settle():
+        for _ in range(200):
+            pump(app)
+            if not getattr(win, "_picture_busy", False):
+                return
+            QTest.qWait(10)
+    from PySide6.QtTest import QTest
     c = wm.triangles_center
     xy, _ = vp._screen(c)
     eye = vp.camera.eye()
     seen = np.einsum("ij,ij->i", wm.face_normals, eye - c) > 0
-    face = int(np.nonzero(seen & (xy[:, 0] < cap["w"] * 0.4))[0][0])
+    face = int(np.nonzero(seen & (xy[:, 0] < cap["w"] * 0.3) & (np.abs(xy[:, 1] - cap["h"] / 2) < 40))[0][0])
     win.region_pick(p.id, face, False)
+    settle()
     seed = win._region["seeds"][0]
     assert seed["kind"] == "picture" and len(seed["cands"]) == 2       # the whole-part one dropped
-    mask = win._region["mask"]
+    mask = win._region["mask"].copy()
     assert mask[face] and mask.sum() > 1
     assert (xy[mask, 0] < cap["w"] / 2 + 12).all() and seen[mask].all()       # faces ≤ 1 mm
-    pp.outline_size.setValue(0)                                          # Small: the 7 px square
-    assert win._region["mask"].sum() < mask.sum()
+    # right-click leaves out a patch; the same view isn't looked at again
+    other = int(np.nonzero(seen & mask & (np.hypot(xy[:, 0] - xy[face, 0], xy[:, 1] - xy[face, 1]) > 80))[0][0])
+    win.region_exclude(p.id, other)
+    settle()
+    assert len(seed["points"]) == 2 and not seed["points"][1][2] and Stub.embeds == 1
+    assert not win._region["mask"][other] and win._region["mask"].sum() < mask.sum()
+    pp.outline_size.setValue(0)                                          # Small: the square
+    assert win._region["mask"].sum() < 0.5 * mask.sum()

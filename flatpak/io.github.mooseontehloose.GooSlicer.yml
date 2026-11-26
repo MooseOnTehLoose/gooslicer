@@ -1,27 +1,25 @@
 app-id: io.github.mooseontehloose.GooSlicer
-runtime: org.kde.Platform
-runtime-version: '6.11'
-sdk: org.kde.Sdk
-base: io.qt.PySide.BaseApp
-base-version: '6.11'
+# freedesktop 26.08 (glibc 2.44) with Qt from the PySide6 wheels: the KDE runtime and PySide base
+# (6.11) are on 25.08 (glibc 2.42), too old to load the host's ROCm for the GPU (spec 11)
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
 command: gooslicer
 finish-args:
   - --share=ipc
   - --socket=wayland
   - --socket=fallback-x11
-  - --device=dri              # OpenGL viewport
+  # OpenGL viewport (/dev/dri), and the GPU's compute device (/dev/kfd) for Select by Picture on
+  # an AMD card: there is no narrower option for /dev/kfd
+  - --device=all
+  # Select by Picture on the GPU: the host's ROCm libraries, read-only, loaded by the app itself
+  # (gooslicer/gpuhost.py) only where the runtime has no library of that name
+  - --filesystem=host-os:ro
   - --share=network           # printer discovery (UDP broadcast), WebSocket and HTTP upload
   # SatelLite's printer, resin and support profiles are copied once from the user's own install
   # into the app's data folder (never shipped). This is the default Wine location; other locations:
   #   flatpak override --user --filesystem=/path/to/SatelLite:ro io.github.mooseontehloose.GooSlicer
   - --filesystem=~/.wine:ro
-build-options:
-  env:
-    BASEAPP_REMOVE_WEBENGINE: '1'   # GooSlicer uses no QtWebEngine/QtPdf/QtWebView
-cleanup-commands:
-  - /app/cleanup-BaseApp.sh
-  # libclang/LLVM and the generator are only needed to build PySide bindings, not to run them
-  - rm -rfv /app/lib/libLLVM*.so* /app/lib/libclang*.so* /app/lib/python3*/site-packages/shiboken6_generator*
 modules:
   - python3-deps.json
 

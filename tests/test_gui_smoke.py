@@ -1629,7 +1629,7 @@ def test_preferences_window(app, tmp_path, monkeypatch):
     assert isinstance(d, PreferencesDialog) and d.isVisible() and d.isModal()
     names = [d.categories.item(i).text() for i in range(d.categories.count())]
     assert names == ["Appearance", "3D view colors", "Printer", "Resin", "Slicing", "Hollowing", "Drain holes", "Supports",
-                     "Network", "Files and folders", "Windows", "Keyboard"]
+                     "Picture selection", "Network", "Files and folders", "Windows", "Keyboard"]
 
     # changes apply at once, both ways
     d.show_page("Appearance")
@@ -2099,5 +2099,35 @@ def test_view_color_preferences(app, tmp_path):
     assert abs(col.hsvHueF() - 0.25) < 0.02 and col.saturationF() > 0.95
     dlg.value.setValue(0)                                          # brightness 0: black
     assert dlg.color().getRgb()[:3] == (0, 0, 0) and dlg.hex.text() == "#000000"
+    d.close()
+    w.close()
+
+
+def test_picture_preferences(app, tmp_path, monkeypatch):
+    """Preferences → Picture selection (11): the model list with its download state, and the GPU
+    choice only when this onnxruntime has a GPU provider."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    from gooslicer import picture
+    from gooslicer_qt.main import MainWindow
+    monkeypatch.setattr(picture, "gpu_provider", lambda: None)
+    s = QtCore.QSettings(str(tmp_path / "s.ini"), QtCore.QSettings.IniFormat)
+    w = MainWindow(settings=s)
+    w.prefs_action.trigger()
+    d = w._preferences
+    d.show_page("Picture selection")
+    assert [d.picture_model.itemData(i) for i in range(d.picture_model.count())] == list(picture.MODELS)
+    assert not d.picture_device.model().item(1).isEnabled() and "ROCm 7" in d.picture_gpu_note.text()
+    d.picture_model.setCurrentIndex(d.picture_model.findData("sam2-small"))
+    assert s.value("picture/model") == "sam2-small" and "Not downloaded yet" in d.picture_status.text()
+    assert d.picture_download.isVisibleTo(d)
+    assert w.picture_model_settings() == (picture.DEFAULT_MODEL, "cpu")      # not there yet: the default
+    monkeypatch.setattr(picture, "gpu_provider", lambda: "MIGraphXExecutionProvider")
+    d.close()
+    w.prefs_action.trigger()
+    d = w._preferences
+    d.show_page("Picture selection")
+    assert d.picture_device.model().item(1).isEnabled() and "MIGraphX" in d.picture_gpu_note.text()
+    d.picture_device.setCurrentIndex(d.picture_device.findData("gpu"))
+    assert s.value("picture/device") == "gpu" and w.picture_model_settings()[1] == "gpu"
     d.close()
     w.close()

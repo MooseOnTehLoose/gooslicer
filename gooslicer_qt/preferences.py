@@ -78,7 +78,7 @@ class PreferencesDialog(QDialog):
         self.stack = QStackedWidget()
         self.pages: list[_Page] = []
         for build in (self._appearance, self._colors, self._printer, self._resin, self._slicing, self._hollowing,
-                      self._drain, self._supports, self._network, self._folders, self._windows, self._keyboard):
+                      self._drain, self._supports, self._picture, self._network, self._folders, self._windows, self._keyboard):
             page = build()
             self.pages.append(page)
             scroll = QScrollArea()
@@ -430,6 +430,124 @@ class PreferencesDialog(QDialog):
             self.support.setCurrentIndex(choices.index(cur) if cur in choices else 0)
         refresh()
         return _Page("Supports", w, reset=lambda: win.job_panel.set_support_choice(None), refresh=refresh)
+
+    def _picture(self) -> _Page:
+        """Select by Picture (11): which image model, and whether it runs on the GPU."""
+        from gooslicer import picture
+        st = self.win.settings
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        g = QGroupBox("Image model")
+        fl = QFormLayout(g)
+        self.picture_model = QComboBox()
+        self.picture_model.setToolTip("The model that outlines what you click in Select by Picture. The "
+                                      "SAM 2.1 models follow small features (a strap, a ring) more "
+                                      "closely but take longer, and are downloaded first.")
+        for m in picture.MODELS.values():
+            self.picture_model.addItem(m.title, m.key)
+        fl.addRow("Model", self.picture_model)
+        self.picture_status = QLabel()
+        self.picture_status.setWordWrap(True)
+        fl.addRow(self.picture_status)
+        self.picture_download = QPushButton("Download")
+        self.picture_download.setToolTip("Download the model's files (checked against their published "
+                                         "checksums) into GooSlicer's data folder")
+        fl.addRow(self.picture_download)
+        self.picture_device = QComboBox()
+        self.picture_device.addItem("CPU", "cpu")
+        self.picture_device.addItem("GPU (AMD ROCm)", "gpu")
+        self.picture_device.setToolTip("Run the image model on the graphics card, through ROCm (MIGraphX)")
+        fl.addRow("Run on", self.picture_device)
+        self.picture_gpu_note = _note("")
+        fl.addRow(self.picture_gpu_note)
+        lay.addWidget(g)
+        lay.addWidget(_note("MobileSAM: ONNX export by Acly (MIT). SAM 2.1: Meta (Apache-2.0), ONNX export by "
+                            "onnx-community. They run on this computer; nothing is sent anywhere."))
+
+        def refresh():
+            key = str(st.value("picture/model", picture.DEFAULT_MODEL))
+            i = self.picture_model.findData(key)
+            self.picture_model.blockSignals(True)
+            self.picture_model.setCurrentIndex(max(i, 0))
+            self.picture_model.blockSignals(False)
+            self._refresh_picture_status()
+            gpu = picture.gpu_provider()
+            item = self.picture_device.model().item(1)
+            item.setEnabled(gpu is not None)
+            dev = "gpu" if gpu and str(st.value("picture/device", "cpu")) == "gpu" else "cpu"
+            self.picture_device.blockSignals(True)
+            self.picture_device.setCurrentIndex(self.picture_device.findData(dev))
+            self.picture_device.blockSignals(False)
+            if gpu is None:
+                why = picture.gpu_status()[1]
+                self.picture_gpu_note.setText(
+                    f"The GPU can't be used: {why}. It needs an AMD card with ROCm 7 (MIGraphX) installed, "
+                    "and onnxruntime-migraphx.")
+            else:
+                self.picture_gpu_note.setText(
+                    f"Uses {gpu.replace('ExecutionProvider', '')}. The first time a model runs on the GPU it "
+                    "is compiled for your card, which can take a few minutes; the result is kept for next "
+                    "time. If the GPU doesn't start, the CPU is used and the log says why.")
+
+        def model_changed(_i):
+            st.setValue("picture/model", self.picture_model.currentData())
+            self._refresh_picture_status()
+
+        def device_changed(_i):
+            st.setValue("picture/device", self.picture_device.currentData())
+
+        def reset():
+            st.remove("picture/model")
+            st.remove("picture/device")
+            refresh()
+        self.picture_model.currentIndexChanged.connect(model_changed)
+        self.picture_device.currentIndexChanged.connect(device_changed)
+        self.picture_download.clicked.connect(self._download_picture_model)
+        return _Page("Picture selection", w, reset=reset, refresh=refresh)
+
+    def _refresh_picture_status(self) -> None:
+        from gooslicer import picture
+        key = self.picture_model.currentData()
+        m = picture.MODELS[key]
+        ok, why = picture.available(key)
+        busy = getattr(self, "_picture_dl", None) is not None
+        downloadable = all(f.url for f in m.files)
+        if ok:
+            self.picture_status.setText(f"Installed ({m.size / 1e6:,.0f} MB).")
+        elif downloadable:
+            self.picture_status.setText(f"Not downloaded yet ({m.size / 1e6:,.0f} MB). Until it is, "
+                                        f"{picture.MODELS[picture.DEFAULT_MODEL].title.split(' (')[0]} is used.")
+        else:
+            self.picture_status.setText("Not available: " + why + ".")
+        self.picture_download.setVisible(downloadable and not ok)
+        self.picture_download.setEnabled(not busy)
+
+    def _download_picture_model(self) -> None:
+        from gooslicer import picture
+
+        from . import workers
+        key = self.picture_model.currentData()
+        self._picture_dl = key
+        self._refresh_picture_status()
+
+        def work(progress):
+            last = [0.0]
+
+            def tick(done, total):
+                now = time.monotonic()
+                if now - last[0] > 0.2 or done >= total:
+                    last[0] = now
+                    progress(f"Downloading… {done / 1e6:,.0f} of {total / 1e6:,.0f} MB")
+            picture.download(key, tick)
+
+        def finished(msg=None):
+            self._picture_dl = None
+            self._refresh_picture_status()
+            if msg:
+                self.picture_status.setText("Download failed: " + msg.splitlines()[0])
+        workers.submit(work, on_progress=self.picture_status.setText,
+                       on_done=lambda _r: finished(), on_failed=finished)
 
     def _network(self) -> _Page:
         lan = self.win.lan

@@ -372,7 +372,7 @@ class PropertiesPanel(QWidget):
         for text, key in (("Surface", "surface"), ("Parts", "parts"), ("Picture (AI)", "picture")):
             self.select_by.addItem(text, key)
         from gooslicer import picture
-        ok, why = picture.available()
+        ok, why = picture.any_available()
         if not ok:
             item = self.select_by.model().item(2)
             item.setEnabled(False)
