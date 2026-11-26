@@ -26,6 +26,7 @@ def _scene():
     b.position = np.array([-30.0, 10.0, 11.0])
     b.elevation = 5.0
     b.opacity = 0.4
+    b.repaired = True
     rng = np.random.default_rng(1)
     pts = rng.normal(size=(7, 3))
     nrm = pts / np.linalg.norm(pts, axis=1)[:, None]
@@ -56,6 +57,7 @@ def test_round_trip(tmp_path):
         assert np.array_equal(old.rotation, new.rotation)
         assert np.array_equal(old.scale, new.scale)
         assert old.elevation == new.elevation and old.opacity == new.opacity
+        assert old.repaired == new.repaired
         assert np.array_equal(old.mesh.faces, new.mesh.faces)
         assert np.abs(old.mesh.vertices - new.mesh.vertices).max() <= 1e-6
         assert np.abs(old.world_vertices() - new.world_vertices()).max() <= 1e-5

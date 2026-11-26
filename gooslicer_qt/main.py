@@ -167,7 +167,8 @@ def _auto_supported(res):
     return res
 
 
-def _load_and_analyze(path: str):
+def _load_and_analyze(path: str, auto_repair: bool = False):
+    """[(part, report, problems found before an automatic repair or None)]"""
     if Path(path).suffix.lower() == ".3mf" and projmod.is_project(path):
         # a GooSlicer project imported into this one: its parts with their supports, no settings
         proj = projmod.load(path)
@@ -177,15 +178,21 @@ def _load_and_analyze(path: str):
                 seen[id(part.mesh)] = meshmod.analyze(part.mesh)
                 meshmod.slim(part.mesh)
                 prepare(part.mesh)
-            out.append((part, seen[id(part.mesh)]))
+            out.append((part, seen[id(part.mesh)], None))
         return out
     out = []
     for name, m in meshmod.load_meshes(path):
+        rep = meshmod.analyze(m)
+        before = None
+        if auto_repair and not rep.ok:          # repair on import (04 P1)
+            before = rep.problems() or ["problems"]
+            m = meshmod.repair(m)
+            rep = meshmod.analyze(m)
         part = Part.from_mesh(name, m)
-        rep = meshmod.analyze(part.mesh)
+        part.repaired = before is not None
         meshmod.slim(part.mesh)                 # picking needs no index (scene.ray_triangles)
         prepare(part.mesh)                      # hull and GPU arrays, off the GUI thread
-        out.append((part, rep))
+        out.append((part, rep, before))
     return out
 
 
@@ -1543,7 +1550,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().clearMessage()
                 return
             self.reports[id(fixed)] = rep
-            self.undo.push(MeshCommand(self, pid, fixed))
+            self.undo.push(MeshCommand(self, pid, fixed, repaired=True))
             # MeshCommand.set_mesh copies the mesh; register the stored one too
             self.reports[id(self.scene.get(pid).mesh)] = rep
             meshmod.slim(self.scene.get(pid).mesh)
@@ -1597,11 +1604,15 @@ class MainWindow(QMainWindow):
         if models:
             self.import_files(models)
 
+    def auto_repair(self) -> bool:
+        """Repair models with problems as they're imported (Preferences → Files and folders)."""
+        return str(self.settings.value("import/autoRepair", True)).lower() not in ("false", "0")
+
     def import_files(self, files: list[str]):
         for f in files:
             self._pending += 1
             self.log_msg(f"Loading {f}…")
-            workers.submit(_load_and_analyze, f,
+            workers.submit(_load_and_analyze, f, self.auto_repair(),
                            on_done=lambda res, f=f: self._imported(f, res),
                            on_failed=lambda msg, f=f: self._import_failed(f, msg))
 
@@ -1614,12 +1625,13 @@ class MainWindow(QMainWindow):
     def _imported(self, f, res):
         self._pending -= 1
         new = []
-        for part, rep in res:
+        for part, rep, before in res:
             part.position[:2] = 0.0
             self.reports[id(part.mesh)] = rep
             new.append(part)
             self.log_msg(f"Imported {part.name}: {rep.triangles:,} triangles, "
                          f"{' × '.join(f'{x:.2f}' for x in part.mesh.extents)} mm"
+                         + ("" if before is None else f" — repaired ({'; '.join(before)})")
                          + ("" if rep.ok else f" — ⚠ {'; '.join(rep.problems())}"))
         for p in new:
             self.scene.drop_to_plate(p)

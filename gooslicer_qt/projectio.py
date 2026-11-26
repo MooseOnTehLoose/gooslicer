@@ -42,7 +42,8 @@ def _snapshot_parts(parts: list[Part]) -> list[Part]:
     """Copies of the parts' placement for the save thread (meshes and plans are never changed in
     place, so they are shared)."""
     return [Part(p.name, p.mesh, p.position.copy(), p.rotation.copy(), p.scale.copy(),
-                 elevation=p.elevation, supports=p.supports, opacity=p.opacity) for p in parts]
+                 elevation=p.elevation, supports=p.supports, opacity=p.opacity,
+                 repaired=p.repaired) for p in parts]
 
 
 def _save_job(path, project, supports, thumb, progress=None):

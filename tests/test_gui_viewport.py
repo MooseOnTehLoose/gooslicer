@@ -169,7 +169,31 @@ def test_duplicate_delete_arrange_undo(app, win, tmp_path):
     assert len(win.scene.parts) == 1
 
 
+def test_repair_on_import(app, win, tmp_path):
+    """A model failing its check is repaired as it's imported and listed "(repaired)"; a clean
+    one is left alone; the preference turns it off."""
+    from gooslicer_qt.preferences import PreferencesDialog
+    assert win.auto_repair()
+    wait_import(app, win, [box_file(tmp_path, broken=True, name="holey.stl"), box_file(tmp_path)])
+    by = {p.name: p for p in win.scene.parts}
+    assert by["holey"].repaired and win.reports[id(by["holey"].mesh)].ok
+    assert not by["box"].repaired
+    texts = [win.parts.item(i).text() for i in range(win.parts.count())]
+    assert "holey (repaired)" in texts and "box" in texts
+    d = PreferencesDialog(win)
+    assert d.auto_repair.isChecked()
+    d.auto_repair.setChecked(False)
+    assert not win.auto_repair()
+    wait_import(app, win, [box_file(tmp_path, broken=True, name="holey2.stl")])
+    p2 = next(p for p in win.scene.parts if p.name == "holey2")
+    assert not p2.repaired and not win.reports[id(p2.mesh)].ok
+    d.pages[[pg.name for pg in d.pages].index("Files and folders")].reset()
+    assert win.auto_repair()
+    d.close()
+
+
 def test_repair_broken_mesh(app, win, tmp_path):
+    win.settings.setValue("import/autoRepair", False)      # import it broken, repair by hand
     wait_import(app, win, [box_file(tmp_path, broken=True, name="holey.stl")])
     p = win.scene.parts[0]
     win.select([p.id])
@@ -189,8 +213,10 @@ def test_repair_broken_mesh(app, win, tmp_path):
     # each step showed in the status bar, then the result
     assert "Repairing holey…" in seen and any(m.startswith("Repairing holey: closing holes") for m in seen)
     assert win.statusBar().currentMessage() == "Repaired holey"
+    assert p.repaired and win.parts.item(0).text() == "holey (repaired)"
     win.undo.undo()
     assert p.mesh is old and "open (hole)" in win.props.mesh_info.text()
+    assert not p.repaired and win.parts.item(0).text() == "holey"
 
 
 def test_arc_sample_and_printer_switch(app, win):
@@ -906,7 +932,13 @@ def test_layer_slider_hides_above_cut(app, win, tmp_path):
     # the outer wall above the cut is gone: the box's inside (back-face colour) shows there
     assert a != before and a.red() > a.green() + 80 and a.blue() > a.green() + 80
     assert b != bg
+    from PySide6.QtGui import QColor
+    win.set_view_color("cut", QColor(20, 200, 40))         # Preferences → 3D view colors
+    pump(app)
+    g = px(hi)
+    assert g.green() > 150 and g.red() < 80 and g.blue() < 100
     win.scene_changed()                                     # keeps its height when parts change
+
     assert sl.cut() == 10.0
     sl.set_cut(None)
     pump(app)

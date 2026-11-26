@@ -20,7 +20,11 @@ VIEW_COLORS = (
      "build area, and the text of their labels"),
     ("flaw_selected", "Selected flaw lines and labels", (0.95, 0.20, 0.18), 1.0,
      "A flaw's line and label outline after its label is clicked"),
+    ("cut", "Layer slider cut", (0.85, 0.15, 0.55), 1.0,
+     "The inside of a part cut open by the layer slider (the 3D view's right side), so the cut "
+     "reads as a cross-section"),
 )
+SOLID_ONLY = {"cut"}          # drawn solid: no transparency slider
 KEYS = tuple(k for k, *_ in VIEW_COLORS)
 PREFIX = "colors/"
 

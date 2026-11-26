@@ -48,6 +48,7 @@ A GooSlicer project is a standard 3MF package (3MF Core 1.3, unit millimetre) wi
 }
 ```
 - `parts[i]` may also carry `"opacity"` (0.05–1) for a part drawn see-through (07 §1); it is left out for solid parts. An older `"seeThrough": true` reads as 0.5.
+- `parts[i]` may carry `"repaired": true` when its mesh was repaired (on import or with Repair mesh; 04 P1); the Models list shows it as "(repaired)". Left out otherwise.
 - `parts[i]` matches build item `i` and names its object. Parts are restored in this order. Position, rotation and scale are stored exactly here; the build item's transform is for other programs, so GooSlicer never has to split a matrix back into them.
 - `plans` holds each `SupportPlan` once, as stored: points and normals in the part's local frame. A part's `plan` is its index; parts that share a plan (Duplicate) share it again on load.
 - `print_settings` is the full set, including values the user changed from the resin profile. On load the printer and resin are selected by name and then these values are applied on top. A printer or resin that no longer exists is logged and the saved values are still applied to the closest match (the same printer family, the first resin).
@@ -169,7 +170,7 @@ Moving was dragging on the plate plus number fields, and rotation already has ri
 
 ## 11. Layer slider in the 3D view [GOOSLICER]
 For looking inside a print at a given height (internal flaws, hollow walls, infill), the 3D view has a vertical slider down its right side, under the compass.
-- **What it does:** everything above the slider's height is not drawn: parts, supports, island and cavity overlays, drain-hole preview and flaw guide lines. It cuts with a GPU clip plane (`gl_ClipDistance`, world Z), so it costs nothing per move and never changes the scene, the slice or the undo history. A solid part cut open shows its inside faces in the back-face colour, so the cut reads as a cross-section.
+- **What it does:** everything above the slider's height is not drawn: parts, supports, island and cavity overlays, drain-hole preview and flaw guide lines. It cuts with a GPU clip plane (`gl_ClipDistance`, world Z), so it costs nothing per move and never changes the scene, the slice or the undo history. A solid part cut open shows its inside faces in the cut colour (Preferences → 3D view colors → "Layer slider cut", default magenta, always solid; `colors/cut`), so the cut reads as a cross-section. With no cut, inside faces keep the usual magenta.
 - **Range and steps:** 0 mm to the top of the highest part, in steps of the current layer height (0.05 mm with no printer chosen). Top of the slider = nothing hidden; the slider starts there. When parts change, a slider at the top stays at the top, otherwise it keeps its height, clamped to the new range.
 - **Labels:** a scale of mm ticks down the left of the groove at a round interval (1, 2, 5, 10, 20 or 50 mm, so the labels are at least ~28 px apart), and the current height next to the handle, e.g. "12.35 mm" (hidden at the top position, which reads "All").
 - **Hidden** when the plate is empty. Not saved between sessions.

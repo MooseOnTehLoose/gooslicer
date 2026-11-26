@@ -209,6 +209,9 @@ class PreferencesDialog(QDialog):
             sl.setRange(0, 100)
             sl.setToolTip(f"Transparency of: {label.lower()} (0% is solid)")
             sl.valueChanged.connect(lambda v, k=key: self._set_transparency(k, v))
+            if key in colormod.SOLID_ONLY:
+                sl.setEnabled(False)
+                sl.setToolTip(f"{label} is always drawn solid")
             val = QLabel()
             val.setMinimumWidth(40)
             self.color_buttons[key], self.color_sliders[key], self.color_values[key] = btn, sl, val
@@ -492,6 +495,13 @@ class PreferencesDialog(QDialog):
             proj.update_recent_menu()
         self.recent_spin.valueChanged.connect(set_recent)
         f.addRow("Recent projects", self.recent_spin)
+        self.auto_repair = QCheckBox("Repair models on import")
+        self.auto_repair.setToolTip("Fix holes, flipped and stray triangles of an imported model that "
+                                    "fails its mesh check; it's listed as \"(repaired)\"")
+        self.auto_repair.toggled.connect(lambda on: s.setValue("import/autoRepair", bool(on)))
+        f.addRow("Import", self.auto_repair)
+        f.addRow(_note("A model that checks clean is left as it is. With this off, Repair mesh (Mesh "
+                       "pane) still fixes a model on request."))
 
         def refresh():
             for key, lab in self.folder_labels.items():
@@ -500,12 +510,16 @@ class PreferencesDialog(QDialog):
                 spin.blockSignals(True)
                 spin.setValue(value)
                 spin.blockSignals(False)
+            self.auto_repair.blockSignals(True)
+            self.auto_repair.setChecked(self.win.auto_repair())
+            self.auto_repair.blockSignals(False)
 
         def reset():
             for key, *_ in FOLDERS:
                 s.remove(key)
             proj.set_autosave_minutes(5)
             s.remove("recent/max")
+            s.remove("import/autoRepair")
             proj.update_recent_menu()
         refresh()
         return _Page("Files and folders", w, reset=reset, refresh=refresh)

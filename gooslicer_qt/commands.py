@@ -69,21 +69,23 @@ class MeshCommand(QUndoCommand):
     """Replace a part's mesh (e.g. repair), keeping placement; optionally set its 3D-view
     opacity too (Hollow makes it see-through), which undo puts back."""
 
-    def __init__(self, win, pid: int, new_mesh, text="Repair mesh", opacity: float | None = None):
+    def __init__(self, win, pid: int, new_mesh, text="Repair mesh", opacity: float | None = None,
+                 repaired: bool | None = None):
         super().__init__(text)
         p = win.scene.get(pid)
         self.win, self.pid = win, pid
-        self.old = (p.mesh, p.state(), p.opacity)
+        self.old = (p.mesh, p.state(), p.opacity, p.repaired)
         p.set_mesh(new_mesh)
-        self.new = (p.mesh, p.state(), p.opacity if opacity is None else float(opacity))
-        p.mesh, _, _ = self.old
+        self.new = (p.mesh, p.state(), p.opacity if opacity is None else float(opacity),
+                    p.repaired if repaired is None else bool(repaired))
+        p.mesh = self.old[0]
         p.set_state(self.old[1])
 
-    def _apply(self, mesh, state, opacity):
+    def _apply(self, mesh, state, opacity, repaired):
         p = self.win.scene.get(self.pid)
         p.mesh = mesh
         p.set_state(state)
-        p.opacity = opacity
+        p.opacity, p.repaired = opacity, repaired
         self.win.scene_changed(mesh_changed=self.pid)
 
     def redo(self):

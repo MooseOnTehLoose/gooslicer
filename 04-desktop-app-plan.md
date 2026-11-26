@@ -115,6 +115,8 @@ Each phase ends with passing tests and a short demo. Specs are written before th
 
     These run up to three passes, until every edge has two triangles running opposite ways and nothing is duplicated.
     `samples/Lisa_head_C.stl` starts with 87 shells, 171 hole edges, 60 back-to-back pairs, a fin and a twist. It ends as one closed shell with its volume unchanged (11,693 mm³), in about 4 s; trimesh's repair took 33 s and left it broken. A fan over a strongly curved or concave hole can cross itself; the slicer's non-zero fill copes with that.
+  - **Repair on import** [GOOSLICER, 2026-11-25]: an imported STL/OBJ/3MF model whose check finds a problem is repaired (`mesh.repair`) before it lands on the plate, in the same background job. A model that checks clean is left alone. The log says what was wrong and what remains. Edit → Preferences → Files and folders → "Repair models on import" turns it off (`import/autoRepair`, on by default). GooSlicer projects imported or opened are never touched.
+  - **"(repaired)"**: a part whose mesh was repaired, on import or with Repair mesh, is listed in the Models list as "name (repaired)"; the part's name itself doesn't change. Undoing a Repair mesh clears it. Projects store it as `"repaired": true` on the part (09 §3); duplicates keep it.
   - undo/redo for every edit
   - Memory per model (2026-11-24): six models with 2.24 M triangles went from +1,586 MB to +401 MB (Xvfb, software GL, where the 3D view's buffers count as RAM; without drawing, +190 MB, about 85 bytes a triangle). How:
     - No rtree ray index for parts (it was about 280 bytes a triangle); picking uses `scene.ray_triangles`.

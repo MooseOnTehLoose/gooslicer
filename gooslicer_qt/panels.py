@@ -177,9 +177,12 @@ class PartsList(_RemovableList):
         self.clear()
         for p in scene.parts:
             warn = "" if scene.in_volume(p) else "  ⚠ outside build volume"
-            it = QListWidgetItem(f"{p.name}{warn}")
+            fixed = " (repaired)" if p.repaired else ""
+            it = QListWidgetItem(f"{p.name}{fixed}{warn}")
             it.setData(Qt.UserRole, p.id)
-            it.setToolTip(f"{p.name}{warn}\nThe red x removes it from the build plate")
+            it.setToolTip(f"{p.name}{warn}"
+                          + ("\nIts mesh was repaired (holes, flipped or stray triangles fixed)" if fixed else "")
+                          + "\nThe red x removes it from the build plate")
             self.addItem(it)
             it.setSelected(p.id in selected)
         self.blockSignals(False)

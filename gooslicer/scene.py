@@ -91,6 +91,7 @@ class Part:
     supports: object = None                  # gooslicer.supports.SupportPlan | None
     opacity: float = 1.0                     # 3D view only: below 1 the part is drawn see-through
                                              # (hollowed parts start at the Hollow panel's value)
+    repaired: bool = False                   # its mesh was repaired (on import or Repair mesh)
     _cache: tuple | None = field(default=None, repr=False)
     _bcache: tuple | None = field(default=None, repr=False)
 
@@ -204,7 +205,8 @@ class Scene:
     def duplicate(self, part_id: int, offset=None) -> Part:
         src = self.get(part_id)
         dup = Part(f"{src.name} copy", src.mesh, src.position.copy(), src.rotation.copy(), src.scale.copy(),
-                   elevation=src.elevation, supports=src.supports, opacity=src.opacity)
+                   elevation=src.elevation, supports=src.supports, opacity=src.opacity,
+                   repaired=src.repaired)
         dup.position += np.asarray(offset if offset is not None else (src.size()[0] + 2.0, 0, 0))
         return self.add(dup, place=False)
 

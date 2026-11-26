@@ -36,8 +36,9 @@ void main(){ vW = (model * vec4(pos, 1.0)).xyz; gl_Position = mvp * vec4(pos, 1.
 MESH_FS = """#version 330 core
 in vec3 vW; out vec4 frag;
 uniform vec3 color; uniform vec3 lightA; uniform vec3 lightB; uniform float alpha;
+uniform vec3 backColor;
 void main(){
-  if (!gl_FrontFacing) { frag = vec4(0.85, 0.15, 0.55, alpha); return; }  // inside/back faces
+  if (!gl_FrontFacing) { frag = vec4(backColor, alpha); return; }  // inside/back faces
   vec3 n = normalize(cross(dFdx(vW), dFdy(vW)));
   float d = 0.30 + 0.55 * max(dot(n, lightA), 0.0) + 0.25 * max(dot(n, lightB), 0.0);
   frag = vec4(color * d, alpha);
@@ -56,6 +57,7 @@ void main(){ frag = color; }
 # Viewport.colors (colors.py: Edit → Preferences → 3D view colors)
 COL_OUTSIDE = (0.90, 0.25, 0.22)
 COL_ISLAND = (0.92, 0.16, 0.14)       # unsupported islands, after the island check
+BACK_FACE = (0.85, 0.15, 0.55)         # inside / back faces (no layer cut)
 OPAQUE = 0.999                         # an opacity at least this is drawn solid
 GUIDE_DIM = 0.35                       # island guide lines where something is in front of them
 COL_HOLE = (0.15, 0.45, 1.0)           # drain-hole preview (blue)
@@ -419,6 +421,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             GL.glUseProgram(prog)
             GL.glUniform1f(GL.glGetUniformLocation(prog, "clipZ"), clip)
         GL.glEnable(GL.GL_CLIP_DISTANCE0)
+        # inside faces: the cut colour while the layer slider cuts, else the usual magenta
+        back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
+        GL.glUseProgram(self._mesh_prog)
+        GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *back)
         GL.glClearColor(0.16, 0.17, 0.19, 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         w, h = max(self.width(), 1), max(self.height(), 1)
