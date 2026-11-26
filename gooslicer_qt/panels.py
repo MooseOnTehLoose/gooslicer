@@ -380,11 +380,11 @@ class PropertiesPanel(QWidget):
         self.stop_contours.setToolTip("Don't let the selection spread across a contour: a groove, a "
                                       "strap's edge or a hairline (drawn on the part while selecting)")
         self.contour_angle = QSlider(Qt.Horizontal)
-        self.contour_angle.setRange(3, 30)
-        self.contour_angle.setValue(10)
-        self.contour_angle.setToolTip("How sharp a crease must be to count as a contour: lower finds "
-                                      "more, fainter contours")
-        self.contour_label = QLabel("10°")
+        self.contour_angle.setRange(10, 90)
+        self.contour_angle.setValue(35)
+        self.contour_angle.setToolTip("How sharply the surface must fold (within about a millimetre) "
+                                      "to count as a contour: lower finds more, fainter contours")
+        self.contour_label = QLabel("35°")
         self.contour_label.setMinimumWidth(32)
         crow = QHBoxLayout()
         fl.addRow(crow)

@@ -31,12 +31,18 @@ def _tools(s, faces, mask, depth, smooth, gap):
     return tool, inner, n
 
 
-def _cutter_mesh(s, faces, mask, depth, smooth, gap):
-    """Worker: the cutter as a world trimesh for the 3D view."""
+def _joint_mesh(world_mesh, s, faces, mask, depth, smooth, gap):
+    """Worker: the faces the cut would make inside the part (world), for the 3D view: where
+    the piece and the rest will meet. Nothing outside the part is shown."""
     tool, _ = modify.cutter(s, faces, mask, depth, smooth, max(gap / 2, CUT_EPS))
-    m = modify.to_trimesh(tool)
+    m = modify.joint(world_mesh, tool)
+    if m is None:
+        return None, None
     prepare(m)
-    return m
+    # its edges: where the cut meets the part's surfaces (the cut line), as segments
+    e = np.sort(np.asarray(m.faces)[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    rim = e[trimesh.grouping.group_rows(e, require_count=1)]
+    return m, np.asarray(m.vertices)[rim]
 
 
 def _cut_job(mesh, matrix, s, faces, mask, keep, depth, smooth, gap):
@@ -106,7 +112,7 @@ class ModifyingMixin:
         self._region_key = None
         self._preview_gen += 1
         self.viewport.region_mesh = None
-        self.viewport.cut_preview = None
+        self.viewport.cut_preview = self.viewport.cut_lines = None
         self._show_contours()
         self.update_region_panel()
         self.viewport.update()
@@ -123,10 +129,14 @@ class ModifyingMixin:
 
     def _contours(self, p: Part, s: modify.Surface):
         """Contour edges (per adjacency row) of a part at the current angle; cached."""
-        key = (id(p.mesh), p.matrix().tobytes(), int(self.props.contour_angle.value()))
+        place = (id(p.mesh), p.matrix().tobytes())
+        f = getattr(self, "_fold_cache", None)
+        if f is None or f[0] != place:                       # the slow part: once per placement
+            f = self._fold_cache = (place, modify.fold_angles(s))
+        key = place + (int(self.props.contour_angle.value()),)
         c = getattr(self, "_contour_cache", None)
         if c is None or c[0] != key:
-            c = self._contour_cache = (key, modify.contours(s, float(key[2])))
+            c = self._contour_cache = (key, modify.contours(s, float(key[2]), fold=f[1]))
         return c[1]
 
     def _show_contours(self) -> None:
@@ -146,7 +156,7 @@ class ModifyingMixin:
         st = self.settings
         st.setValue("modify/spread", int(self.props.spread.value()))
         st.setValue("modify/contours", bool(self.props.stop_contours.isChecked()))
-        st.setValue("modify/contourAngle", int(self.props.contour_angle.value()))
+        st.setValue("modify/contourFold", int(self.props.contour_angle.value()))
         for k, v in self.cut_settings().items():
             st.setValue(f"modify/{k}", float(v))
         if self._region is not None:
@@ -170,7 +180,7 @@ class ModifyingMixin:
         pp.stop_contours.setChecked(str(st.value("modify/contours", True)).lower() not in ("false", "0"))
         pp.stop_contours.blockSignals(False)
         pp.contour_angle.blockSignals(True)
-        pp.contour_angle.setValue(int(st.value("modify/contourAngle", 10)))
+        pp.contour_angle.setValue(int(st.value("modify/contourFold", 35)))
         pp.contour_label.setText(f"{pp.contour_angle.value()}°")
         pp.contour_angle.blockSignals(False)
         pp.grow_mm.blockSignals(True)
@@ -202,7 +212,7 @@ class ModifyingMixin:
         self._show_contours()
         self._region_key = (r["pid"], id(p.mesh), p.matrix().tobytes())
         self.viewport.region_mesh = trimesh.Trimesh(s.vertices, np.asarray(p.mesh.faces)[mask], process=False)
-        self.viewport.cut_preview = None
+        self.viewport.cut_preview = self.viewport.cut_lines = None
         self._preview_gen += 1
         if not hasattr(self, "_preview_timer"):
             self._preview_timer = QTimer(self)
@@ -220,18 +230,18 @@ class ModifyingMixin:
         gen = self._preview_gen
         c = self.cut_settings()
 
-        def done(m):
+        def done(res):
             if gen == self._preview_gen:
-                self.viewport.cut_preview = m
+                self.viewport.cut_preview, self.viewport.cut_lines = res
                 self.viewport.update()
 
         def failed(msg):
             if gen == self._preview_gen:
-                self.viewport.cut_preview = None
+                self.viewport.cut_preview = self.viewport.cut_lines = None
                 self.props.region_info.setText(self.props.region_info.text().split("\n")[0]
                                                + "\n⚠ " + msg.splitlines()[0])
-        workers.submit(_cutter_mesh, r["surface"], np.asarray(p.mesh.faces), r["mask"], c["depth"],
-                       c["smooth"], c["gap"], on_done=done, on_failed=failed)
+        workers.submit(_joint_mesh, p.world_mesh(), r["surface"], np.asarray(p.mesh.faces), r["mask"],
+                       c["depth"], c["smooth"], c["gap"], on_done=done, on_failed=failed)
 
     def _region_scene_changed(self) -> None:
         """After any scene change: drop the selection if its part or mesh went, follow moves."""

@@ -59,7 +59,6 @@ COL_OUTSIDE = (0.90, 0.25, 0.22)
 COL_ISLAND = (0.92, 0.16, 0.14)       # unsupported islands, after the island check
 BACK_FACE = (0.85, 0.15, 0.55)         # inside / back faces (no layer cut)
 CONTOUR_PULL = 4e-4                    # NDC depth the contour lines are pulled forward
-CUT_PLANE_ALPHA = 0.35                 # the cut plane preview (11)
 OPAQUE = 0.999                         # an opacity at least this is drawn solid
 GUIDE_DIM = 0.35                       # island guide lines where something is in front of them
 COL_HOLE = (0.15, 0.45, 1.0)           # drain-hole preview (blue)
@@ -263,10 +262,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self.lay_flat_mode = False
         self.region_mode = False                   # Select surface (11): clicks pick regions
         self.region_mesh = None                    # world trimesh of the selected surface
-        self.cut_preview = None                    # world trimesh: the cutter, drawn translucent
+        self.cut_preview = None                    # world trimesh: the cut's faces inside the part
         self.contour_lines = None                  # (k, 2, 3) world segments: Select surface contours
-        self._contour_buf = None
-        self._contour_src = None
+        self.cut_lines = None                      # (k, 2, 3) world segments: where the cut meets the part
+        self._line_bufs: dict = {}                 # attribute name -> (source array, _Buffer)
         self.hole_mode = False
         self.support_mode = False
         self._spress = None             # support mode: a left press waiting to become a click or a drag
@@ -388,9 +387,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if self._guide_buf is not None:
             self._guide_buf.delete()
             self._guide_buf, self._guide_src = None, None
-        if self._contour_buf is not None:
-            self._contour_buf.delete()
-            self._contour_buf, self._contour_src = None, None
+        for _src, buf in self._line_bufs.values():
+            if buf is not None:
+                buf.delete()
+        self._line_bufs.clear()
         if self._sel_buf is not None:
             self._sel_buf.delete()
             self._sel_buf, self._sel_src = None, None
@@ -494,6 +494,15 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 a = min(a, max(p.opacity, 0.05))
             (solid if a >= OPAQUE else clear).append((self._buffers[id(p.mesh)][1], p.matrix(), col, a))
         self._draw_meshes(solid, vp, u_mvp, u_n, u_c, u_alpha)
+        if self.cut_preview is not None:
+            # where the cut goes through the part: solid, so a see-through part shows it inside
+            *rgb, _a = colormod.rgba(self.colors["region"])
+            rgb = tuple(np.asarray(rgb) * 0.7)
+            GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *rgb)
+            self._draw_meshes([(self._buffers[id(self.cut_preview)][1], np.eye(4), rgb, 1.0)],
+                              vp, u_mvp, u_n, u_c, u_alpha)
+            back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
+            GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *back)
         if self.island_meshes or self.cavity_meshes:
             # the unsupported / cavity surface, drawn over the part's own faces (same depth):
             # pulled forward
@@ -555,61 +564,62 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         finally:
             painter.end()
 
-    def _draw_contours(self, vp) -> None:
-        """The contours Select surface stops at, as lines on the surface (pulled a little toward
-        the camera so the faces they lie on don't hide them)."""
-        src = self.contour_lines
-        if src is not self._contour_src:
-            if self._contour_buf is not None:
-                self._contour_buf.delete()
-            self._contour_buf = (_Buffer(np.asarray(src, float).reshape(-1, 3), False)
-                                 if src is not None and len(src) else None)
-            self._contour_src = src
-        if self._contour_buf is None:
-            return
+    def _line_buffer(self, name: str):
+        """The GL buffer of the segments in attribute `name`, rebuilt when it changes."""
+        src = getattr(self, name)
+        old = self._line_bufs.get(name)
+        if old is None or old[0] is not src:
+            if old is not None and old[1] is not None:
+                old[1].delete()
+            buf = _Buffer(np.asarray(src, float).reshape(-1, 3), False) if src is not None and len(src) else None
+            self._line_bufs[name] = old = (src, buf)
+        return old[1]
+
+    def _draw_surface_lines(self, vp, buf, rgb, thick: bool) -> None:
+        """Segments lying on a surface, pulled a little toward the camera so the faces they lie
+        on don't hide them; `thick` draws them again a pixel off each way."""
         GL.glUseProgram(self._line_prog)
-        T = np.eye(4)
-        T[2, 3] = -CONTOUR_PULL                      # clip z − pull·w: a constant NDC depth pull
-        GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._line_prog, "mvp"), 1, GL.GL_TRUE,
-                              (T @ vp).astype(np.float32))
-        rgb = np.asarray(colormod.rgba(self.colors["region"])[:3]) * 0.55
+        u_mvp = GL.glGetUniformLocation(self._line_prog, "mvp")
         GL.glUniform4f(GL.glGetUniformLocation(self._line_prog, "color"), *rgb, 1.0)
         GL.glDepthFunc(GL.GL_LEQUAL)
-        GL.glBindVertexArray(self._contour_buf.vao)
-        GL.glDrawArrays(GL.GL_LINES, 0, self._contour_buf.count)
+        GL.glBindVertexArray(buf.vao)
+        px, py = 2.0 / max(self.width(), 1), 2.0 / max(self.height(), 1)
+        for dx, dy in (((0, 0), (px, 0), (-px, 0), (0, py), (0, -py)) if thick else ((0, 0),)):
+            T = np.eye(4)
+            T[0, 3], T[1, 3] = dx, dy
+            T[2, 3] = -CONTOUR_PULL                  # clip z − pull·w: a constant NDC depth pull
+            GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (T @ vp).astype(np.float32))
+            GL.glDrawArrays(GL.GL_LINES, 0, buf.count)
         GL.glDepthFunc(GL.GL_LESS)
 
+    def _draw_contours(self, vp) -> None:
+        """The contours Select surface stops at (thin, dark) and the cut line where a cut out
+        would meet the part's surface (thick, light) (11)."""
+        region = np.asarray(colormod.rgba(self.colors["region"])[:3])
+        buf = self._line_buffer("contour_lines")
+        if buf is not None:
+            self._draw_surface_lines(vp, buf, region * 0.55, False)
+        buf = self._line_buffer("cut_lines")
+        if buf is not None:
+            self._draw_surface_lines(vp, buf, region * 0.4 + 0.6, True)
+
     def _draw_region(self, vp, u_mvp, u_n, u_c, u_alpha) -> None:
-        """The selected surface over its part (pulled forward, as the island overlay) and the
-        cutter (the solid the cut takes away) drawn translucent (11)."""
-        if self.region_mesh is None and self.cut_preview is None:
+        """The selected surface over its part (pulled forward, as the island overlay) (11)."""
+        if self.region_mesh is None:
             return
         rgb = colormod.rgba(self.colors["region"])[:3]
         GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, vp.astype(np.float32))
         GL.glUniformMatrix4fv(u_n, 1, GL.GL_TRUE, np.eye(4, dtype=np.float32))
         GL.glUniform3f(u_c, *rgb)
-        if self.region_mesh is not None:
-            GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
-            GL.glPolygonOffset(-1.0, -2.0)
-            GL.glDepthFunc(GL.GL_LEQUAL)
-            GL.glEnable(GL.GL_CULL_FACE)
-            GL.glCullFace(GL.GL_BACK)
-            self._buffers[id(self.region_mesh)][1].draw()
-            GL.glDisable(GL.GL_CULL_FACE)
-            GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
-            GL.glDepthFunc(GL.GL_LESS)
-        if self.cut_preview is not None:
-            GL.glEnable(GL.GL_BLEND)
-            GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)
-            GL.glDepthMask(GL.GL_FALSE)
-            GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *rgb)
-            GL.glUniform1f(u_alpha, CUT_PLANE_ALPHA)
-            self._buffers[id(self.cut_preview)][1].draw()
-            GL.glUniform1f(u_alpha, 1.0)
-            GL.glDepthMask(GL.GL_TRUE)
-            GL.glDisable(GL.GL_BLEND)
-            back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
-            GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *back)
+        GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
+        GL.glPolygonOffset(-1.0, -2.0)
+        GL.glDepthFunc(GL.GL_LEQUAL)
+        GL.glEnable(GL.GL_CULL_FACE)
+        GL.glCullFace(GL.GL_BACK)
+        self._buffers[id(self.region_mesh)][1].draw()
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
+        GL.glDepthFunc(GL.GL_LESS)
 
     def _draw_meshes(self, items, vp, u_mvp, u_n, u_c, u_alpha, cull: bool = False,
                      layered: bool = False) -> None:

@@ -1014,7 +1014,7 @@ def test_modifying_select_and_cut(app, win, tmp_path):
     assert int(win._region["mask"].sum()) > n35 and int(win.settings.value("modify/spread")) == 60
     pp.spread.setValue(40)
     # contours: shown while selecting (a smooth ball has none); Grow selection by mm
-    assert pp.stop_contours.isChecked() and pp.contour_angle.value() == 10
+    assert pp.stop_contours.isChecked() and pp.contour_angle.value() == 35
     assert vp.contour_lines is not None and len(vp.contour_lines) == 0
     assert pp.grow_btn.isEnabled() and pp.grow_mm.value() == 1.0
     n40 = int(win._region["mask"].sum())
@@ -1029,7 +1029,7 @@ def test_modifying_select_and_cut(app, win, tmp_path):
     loop = QEventLoop()                                      # the cutter preview follows
     QTimer.singleShot(1500, loop.quit)
     loop.exec()
-    assert vp.cut_preview is not None and vp.cut_preview.is_watertight
+    assert vp.cut_preview is not None and len(vp.cut_preview.faces)    # the cut's faces inside the ball
     from PySide6.QtTest import QTest
     QTest.keyClick(vp, Qt.Key_Escape)                        # stops picking, keeps the selection
     assert not vp.region_mode and not pp.select_btn.isChecked() and win._region is not None

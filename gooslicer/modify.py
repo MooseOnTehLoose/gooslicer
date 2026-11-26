@@ -8,8 +8,9 @@ import scipy.sparse as sp
 import trimesh
 
 SEED_RADIUS = 2.0          # mm: faces this close to the click give the seed direction
-SMOOTH_STEPS = 8           # neighbour-averaging passes before creases are measured (~0.5–1 mm)
-MIN_CONTOUR = 3.0          # mm: shorter crease lines are surface texture, not contours
+SMOOTH_MM = 0.5            # mm: creases are measured on the surface smoothed over about this
+MAX_SMOOTH_STEPS = 60      # neighbour-averaging passes at most (fine meshes)
+MIN_CONTOUR = 4.0          # mm: a contour line spans at least this end to end; less is texture
 
 
 class CutError(ValueError):
@@ -81,10 +82,14 @@ def _face_graph(s: Surface, weights=None):
     return sp.coo_matrix((np.r_[w, w], (np.r_[a[:, 0], a[:, 1]], np.r_[a[:, 1], a[:, 0]])), shape=(n, n)).tocsr()
 
 
-def smoothed_normals(s: Surface, steps: int = SMOOTH_STEPS) -> np.ndarray:
-    """Face normals averaged with their neighbours `steps` times (area-weighted start), so
-    creases are measured at a fraction of a millimetre, not per triangle."""
+def smoothed_normals(s: Surface, radius: float = SMOOTH_MM) -> np.ndarray:
+    """Face normals averaged with their neighbours until they're smoothed over about `radius` mm
+    (repeated averaging spreads like √steps × the face spacing), area-weighted, so creases are
+    measured at that scale and not per triangle."""
     A = _face_graph(s)
+    a = s.adjacency
+    h = float(np.median(np.linalg.norm(s.centers[a[:, 0]] - s.centers[a[:, 1]], axis=1))) if len(a) else 1.0
+    steps = int(np.clip(round((radius / max(h, 1e-6)) ** 2), 1, MAX_SMOOTH_STEPS))
     N = s.normals * s.areas[:, None]
     for _ in range(steps):
         N = N + A @ N
@@ -92,29 +97,79 @@ def smoothed_normals(s: Surface, steps: int = SMOOTH_STEPS) -> np.ndarray:
     return N
 
 
-def contours(s: Surface, angle_deg: float, min_len: float = MIN_CONTOUR, steps: int = SMOOTH_STEPS) -> np.ndarray:
-    """Bool per adjacency row: the edge lies on a contour, a valley-like crease where the
-    smoothed surface turns more than `angle_deg` between the two faces (a groove, a strap's
-    edge, a hairline). Crease lines shorter than `min_len` mm in all are left out: they're
-    surface texture (hair, skin), not outlines."""
+def _face_edges(s: Surface) -> np.ndarray:
+    """(n, 3) the adjacency rows touching each face (-1 where a face has fewer)."""
+    a = s.adjacency
+    n = len(s.normals)
+    rows = np.r_[np.arange(len(a)), np.arange(len(a))]
+    faces = np.r_[a[:, 0], a[:, 1]]
+    order = np.argsort(faces, kind="stable")
+    faces, rows = faces[order], rows[order]
+    start = np.searchsorted(faces, np.arange(n))
+    slot = np.arange(len(faces)) - start[faces]
+    out = np.full((n, 3), -1, np.int64)
+    ok = slot < 3
+    out[faces[ok], slot[ok]] = rows[ok]
+    return out
+
+
+def fold_angles(s: Surface, radius: float = SMOOTH_MM) -> np.ndarray:
+    """Per adjacency row: how sharply the surface folds there, as the angle (degrees) it would
+    turn across a 2·radius wide band — the turn between smoothed normals per mm of face spacing,
+    times 2·radius. Signed: negative for a ridge, positive for a valley (by the faces' own
+    normals; smoothed ones lean over a corner)."""
+    N = smoothed_normals(s, radius)
+    a = s.adjacency
+    cos = np.clip(np.einsum("ij,ij->i", N[a[:, 0]], N[a[:, 1]]), -1.0, 1.0)
+    d = np.linalg.norm(s.centers[a[:, 0]] - s.centers[a[:, 1]], axis=1)
+    fold = np.degrees(np.arccos(cos)) / np.maximum(d, 1e-9) * 2 * radius
+    valley = np.einsum("ij,ij->i", s.centers[a[:, 1]] - s.centers[a[:, 0]], s.normals[a[:, 0]]) > 0
+    return np.where(valley, fold, -fold)
+
+
+def contours(s: Surface, fold_deg: float, min_span: float = MIN_CONTOUR, radius: float = SMOOTH_MM,
+             fold: np.ndarray | None = None) -> np.ndarray:
+    """Bool per adjacency row: the edge lies on a contour, a valley (a groove, a strap's edge, a
+    hairline) folding at least `fold_deg` within about 2·radius mm. Cleaned like an edge
+    detector's output:
+    - thinned: an edge is kept only where its fold is the largest of the edges around its two
+      faces, so a crease is one line, not a band;
+    - joined: edges folding half as much carry a line on from a strong edge (hysteresis), so
+      lines don't break up;
+    - only lines: a connected line must span at least `min_span` mm end to end; texture (hair,
+      skin) makes tangles that are long but small, and those go.
+    `fold`: `fold_angles(s, radius)` if already worked out (it's the slow part)."""
     if s.edges is None:
         raise ValueError("surface built without edges")
-    N = smoothed_normals(s, steps)
+    if fold is None:
+        fold = fold_angles(s, radius)
+    fe = _face_edges(s)
     a = s.adjacency
-    cos = np.einsum("ij,ij->i", N[a[:, 0]], N[a[:, 1]])
-    # valley or ridge: by the faces' own normals (smoothed ones lean over a corner)
-    concave = np.einsum("ij,ij->i", s.centers[a[:, 1]] - s.centers[a[:, 0]], s.normals[a[:, 0]]) > 0
-    crease = (cos < np.cos(np.radians(angle_deg))) & concave
-    if not crease.any():
-        return crease
-    e = s.edges[crease]
+    around = np.concatenate([fe[a[:, 0]], fe[a[:, 1]]], axis=1)
+    nb = np.where(around >= 0, fold[np.maximum(around, 0)], -np.inf)
+    peak = fold >= nb.max(axis=1) - 1e-9
+    weak = peak & (fold >= fold_deg / 2)
+    if not weak.any():
+        return np.zeros(len(a), bool)
+    strong = weak & (fold >= fold_deg)
+    e = s.edges[weak]
     nv = len(s.vertices)
     g = sp.coo_matrix((np.ones(len(e), np.int8), (e[:, 0], e[:, 1])), shape=(nv, nv))
     _, lab = sp.csgraph.connected_components(g, directed=False)
-    length = np.linalg.norm(s.vertices[e[:, 0]] - s.vertices[e[:, 1]], axis=1)
-    total = np.bincount(lab[e[:, 0]], weights=length, minlength=lab.max() + 1)
+    line = lab[e[:, 0]]
+    k = line.max() + 1
+    has_strong = np.zeros(k, bool)
+    has_strong[line[strong[weak]]] = True
+    pts = s.vertices[e].reshape(-1, 3)
+    lab2 = np.repeat(line, 2)
+    lo = np.full((k, 3), np.inf)
+    hi = np.full((k, 3), -np.inf)
+    np.minimum.at(lo, lab2, pts)
+    np.maximum.at(hi, lab2, pts)
+    span = np.linalg.norm(hi - lo, axis=1)
+    keep_line = has_strong & (span >= min_span)
     out = np.zeros(len(a), bool)
-    out[np.nonzero(crease)[0][total[lab[e[:, 0]]] >= min_len]] = True
+    out[np.nonzero(weak)[0][keep_line[line]]] = True
     return out
 
 
@@ -151,6 +206,21 @@ def _manifold(mesh: trimesh.Trimesh):
 def _trimesh(mf) -> trimesh.Trimesh:
     m = mf.to_mesh()
     return trimesh.Trimesh(np.asarray(m.vert_properties)[:, :3], np.asarray(m.tri_verts), process=False)
+
+
+def _tidy(t: trimesh.Trimesh) -> trimesh.Trimesh:
+    """A boolean result can hold vertices at exactly the same place under different indices
+    (zero-length edges, zero-area triangles): weld them and drop the triangles that collapse,
+    if the mesh stays closed."""
+    w = trimesh.Trimesh(t.vertices.copy(), t.faces.copy(), process=False)
+    w.merge_vertices(merge_tex=True, merge_norm=True)
+    f = np.asarray(w.faces)
+    ok = (f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 2] != f[:, 0])
+    if ok.all():
+        return t
+    w.update_faces(ok)
+    w.remove_unreferenced_vertices()
+    return w if w.is_watertight else t
 
 
 def fill_holes(s: Surface, mask: np.ndarray) -> np.ndarray:
@@ -222,22 +292,84 @@ def _signed_area(c: np.ndarray) -> float:
     return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
 
 
+HEIGHT_CELL = 0.25         # mm: the grid the selection's height is sampled on, for the cutter
+
+
+def _height_map(tri: np.ndarray, bounds, cell: float):
+    """Lowest height (frame z) of the selected surface over a grid covering `bounds` (frame x/y):
+    (grid, x0, y0). Every triangle marks its corners, edge midpoints and centre; empty cells take
+    their nearest neighbour's height. Each cell keeps its lowest point, so a steep slope's
+    bottom is at most a cell's rise too low."""
+    from scipy import ndimage
+    x0, y0, x1, y1 = bounds
+    x0, y0 = x0 - 2 * cell, y0 - 2 * cell
+    nx = int(np.ceil((x1 - x0) / cell)) + 3
+    ny = int(np.ceil((y1 - y0) / cell)) + 3
+    pts = np.concatenate([tri.reshape(-1, 3), tri.mean(axis=1),
+                          (tri[:, [0, 1, 2]] + tri[:, [1, 2, 0]]).reshape(-1, 3) / 2])
+    ix = np.clip(((pts[:, 0] - x0) / cell).astype(int), 0, nx - 1)
+    iy = np.clip(((pts[:, 1] - y0) / cell).astype(int), 0, ny - 1)
+    h = np.full((nx, ny), np.inf)
+    np.minimum.at(h, (ix, iy), pts[:, 2])
+    empty = ~np.isfinite(h)
+    if empty.all():
+        raise CutError("The selection is edge-on to its cut direction")
+    if empty.any():
+        idx = ndimage.distance_transform_edt(empty, return_distances=False, return_indices=True)
+        h = h[tuple(idx)]
+    return h, x0, y0
+
+
 def cutter(s: Surface, faces: np.ndarray, mask: np.ndarray, depth: float = 3.0, smooth: float = 0.5,
            grow: float = 0.0):
-    """The cutting solid in world space (manifold): the selection's outline (grown by `grow` mm)
-    pushed along its cut direction, from `depth` mm below the selection's lowest point to past
-    the top of the part. Its walls follow the outline, so the piece lifts out along the
-    direction and fits back only one way. Returns (cutter, direction)."""
+    """The cutting solid in world space (manifold), returned with the cut direction n.
+    Seen along n it's the selection's outline (grown by `grow` mm); its bottom follows the
+    selected surface `depth` mm beneath it, and it reaches up past the part. So it takes only the
+    selected surface and what's under it to that depth (on a hollowed part: the wall, through to
+    the cavity), never material elsewhere. Its walls run along n and follow the outline, so the
+    piece lifts out along n and fits back only one way."""
+    from scipy import ndimage
     n = cut_direction(s, mask)
     cs = outline(s, faces, mask, n, smooth, grow)
-    sel_v = s.vertices[np.unique(np.asarray(faces)[mask])]
-    bottom = float((sel_v @ n).min()) - float(depth)
-    top = float((s.vertices @ n).max()) + 2.0
     R = _frame(n)
+    tri = s.vertices[np.asarray(faces)[mask]] @ R.T
+    h, gx, gy = _height_map(tri, cs.bounds(), HEIGHT_CELL)
+    bottom = h - float(depth)
+    b0 = float(bottom.min())
+    top = float((s.vertices @ n).max()) + 2.0
+    H = top - b0
+    prism = cs.extrude(H).refine_to_length(max(4 * HEIGHT_CELL, 0.5))
+
+    def warp(p):
+        p = np.array(p, float, copy=True)
+        b = ndimage.map_coordinates(bottom, [(p[:, 0] - gx) / HEIGHT_CELL, (p[:, 1] - gy) / HEIGHT_CELL],
+                                    order=1, mode="nearest") - b0
+        b = np.minimum(b, H - 1.0)
+        p[:, 2] = b + p[:, 2] / H * (H - b)          # bottom onto the surface, top stays
+        return p
+    tool = prism.warp_batch(warp)
     T = np.zeros((3, 4))
     T[:, :3] = R.T
-    T[:, 3] = n * bottom
-    return cs.extrude(top - bottom).transform(T), n
+    T[:, 3] = n * b0
+    return tool.transform(T), n
+
+
+def joint(mesh_or_manifold, tool) -> trimesh.Trimesh | None:
+    """The faces the cut makes inside the part (where piece and rest will meet), in the tool's
+    coordinates: the tool's own faces that end up on the piece."""
+    mf = mesh_or_manifold if not isinstance(mesh_or_manifold, trimesh.Trimesh) else _manifold(mesh_or_manifold)
+    t = tool.as_original()
+    tid = t.original_id()
+    m = (mf ^ t).to_mesh()
+    runs = np.asarray(m.run_original_id)
+    idx = np.asarray(m.run_index) // 3
+    keep = np.zeros(len(np.asarray(m.tri_verts)), bool)
+    for i, rid in enumerate(runs):
+        if rid == tid:
+            keep[idx[i]:idx[i + 1]] = True
+    if not keep.any():
+        return None
+    return trimesh.Trimesh(np.asarray(m.vert_properties)[:, :3], np.asarray(m.tri_verts)[keep], process=False)
 
 
 def to_local(solid, matrix: np.ndarray):
@@ -295,7 +427,7 @@ def cut(mesh: trimesh.Trimesh, tool, keep_points, piece_tool=None) -> tuple[trim
     rest = m3.Manifold.batch_boolean(kept, m3.OpType.Add) if len(kept) > 1 else kept[0]
     piece = m3.Manifold.batch_boolean(piece_parts, m3.OpType.Add) if len(piece_parts) > 1 else piece_parts[0]
     # the cut walls can graze mesh vertices: collapse the zero-area slivers that leaves
-    return _trimesh(rest.simplify(SLIVER)), _trimesh(piece.simplify(SLIVER)), dropped
+    return _tidy(_trimesh(rest.simplify(SLIVER))), _tidy(_trimesh(piece.simplify(SLIVER))), dropped
 
 
 def lay_on_plane_rotation(normal) -> np.ndarray:

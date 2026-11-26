@@ -179,3 +179,24 @@ def test_grow_by_mm_along_the_surface():
     assert np.array_equal(modify.grow_by(s, cap, 0, m.faces), cap)
     grown = modify.grow_by(s, cap, 2.0, m.faces)
     assert np.all(grown[cap]) and not np.any(modify.grow_by(s, cap, -2.0, m.faces)[~cap])
+
+
+def test_cutter_takes_only_a_skin_under_the_selection():
+    """The cutter's bottom follows the selected surface at the cut depth: on a solid ball the
+    piece is a curved skin about that thick (no plug reaching into the ball), and the joint is
+    the cut's inside faces only."""
+    m = trimesh.creation.icosphere(subdivisions=5, radius=12)
+    s = modify.surface(m, np.eye(4))
+    mask = modify.grow_region(s, top_face(m), 50)
+    tool, n = modify.cutter(s, m.faces, mask, depth=2.0, smooth=0.3)
+    keep = m.vertices[np.unique(m.faces[mask])]
+    rest, piece, _ = modify.cut(m, tool, keep)
+    v = piece.vertices
+    under = np.sqrt(np.maximum(144 - v[:, 0] ** 2 - v[:, 1] ** 2, 0)) - v[:, 2]   # depth below the surface
+    # a cell (0.25 mm) of a 50° slope rises 0.3 mm: the bottom can sit that much deeper there
+    assert under.max() < 2.0 + 0.45 and under.max() > 1.6
+    assert abs(rest.volume + piece.volume - m.volume) < 1e-3 * m.volume
+    j = modify.joint(m, tool)
+    assert j is not None
+    jd = np.sqrt(np.maximum(144 - j.vertices[:, 0] ** 2 - j.vertices[:, 1] ** 2, 0)) - j.vertices[:, 2]
+    assert jd.min() > -1e-3 and jd.max() < 2.4                 # inside the ball, within the skin
