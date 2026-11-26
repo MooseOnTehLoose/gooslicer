@@ -1140,6 +1140,8 @@ def test_select_by_picture(app, win, tmp_path, monkeypatch):
                     left[int(py) - 40:int(py) + 41, int(px) - 40:int(px) + 41] = False
             return [left, small, np.ones((h, w), bool)]
     monkeypatch.setattr(picture, "available", lambda key=None: (True, ""))
+    win.settings.setValue("picture/views", 1)          # the clicked view only (more views below)
+    win.settings.setValue("picture/turn", False)
     win._segmenter, win._segmenter_model = Stub(), win.picture_model_settings()
     pp = win.props
     pp.select_by.model().item(2).setEnabled(True)
@@ -1173,3 +1175,245 @@ def test_select_by_picture(app, win, tmp_path, monkeypatch):
     assert not win._region["mask"][other] and win._region["mask"].sum() < mask.sum()
     pp.outline_size.setValue(0)                                          # Small: the square
     assert win._region["mask"].sum() < 0.5 * mask.sum()
+
+def test_select_by_picture_more_views(app, win, tmp_path, monkeypatch):
+    """More views (11): with a stand-in model that outlines all of whatever it's shown, faces
+    the clicked view can't see, but the views turned round the outline can, join it; the cavity
+    wall of a hollow box, which no view sees, never does. A second click in the same view only
+    decodes again."""
+    from gooslicer import picture
+    from PySide6.QtTest import QTest
+    outer = trimesh.creation.box((20, 20, 20))
+    inner = trimesh.creation.box((14, 14, 14))
+    inner.invert()
+    v, f = trimesh.remesh.subdivide_to_size(*(lambda m: (m.vertices, m.faces))(
+        trimesh.util.concatenate([outer, inner])), max_edge=2.0)
+    path = tmp_path / "hollow.stl"
+    trimesh.Trimesh(v, f).export(path)
+    wait_import(app, win, [path])
+    p = win.scene.parts[0]
+    win.select([p.id])
+    vp = win.viewport
+    vp.set_view(-60, 30)
+    vp.frame_selection()
+    pump(app)
+
+    class Stub:
+        gpu_error = None
+        embeds = 0
+
+        def embed(self, rgb):
+            Stub.embeds += 1
+            self.shape = rgb.shape[:2]
+            return self.shape
+
+        def outlines(self, points, emb=None, size=None):
+            return [np.ones(size or emb or self.shape, bool)]
+
+    def settle():
+        for _ in range(600):
+            pump(app)
+            if not getattr(win, "_picture_busy", False):
+                return
+            QTest.qWait(10)
+        raise AssertionError("still busy")
+    monkeypatch.setattr(picture, "available", lambda key=None: (True, ""))
+    # two (identical) candidates, so the Outline slider has somewhere to move to
+    monkeypatch.setattr(picture, "candidates", lambda outs, px: [o & px for o in outs] * 2)
+    win.settings.setValue("picture/views", 5)
+    win.settings.setValue("picture/turn", False)
+    win._segmenter, win._segmenter_model = Stub(), win.picture_model_settings()
+    pp = win.props
+    pp.select_by.model().item(2).setEnabled(True)
+    pp.select_by.setCurrentIndex(pp.select_by.findData("picture"))
+    pp.select_btn.click()
+    wm = p.world_mesh()
+    c = wm.triangles_center
+    eye = vp.camera.eye()
+    centre = wm.bounds.mean(axis=0)
+    shell = np.abs(c - centre).max(axis=1) > 8.5                       # the outer box's faces
+    seen = shell & (np.einsum("ij,ij->i", wm.face_normals, eye - c) > 0)
+    face = int(np.nonzero(seen)[0][len(np.nonzero(seen)[0]) // 2])
+    win.region_pick(p.id, face, False)
+    settle()
+    seed = win._region["seeds"][0]
+    assert len(seed["views"]) == 4 and Stub.embeds == 5
+    prim = seed["prim"][-1]
+    mask = win._region["mask"]
+    assert not prim[shell & ~seen].any()                               # one view: only what it sees
+    assert mask[shell & ~seen].any()                                   # more views: round the side
+    assert not mask[~shell].any()                                      # never the cavity wall
+    assert mask.sum() > prim.sum()
+    win.region_pick(p.id, face, True)                                  # Ctrl+click: same view
+    settle()
+    assert Stub.embeds == 5 and len(seed["points"]) == 2
+    assert all("rgb" not in v for v in seed["views"])
+    pp.outline_size.setValue(1)
+    settle()
+    assert list(seed["refined"]) == [1]                                # Medium: the one refined
+    pp.outline_size.setValue(0)                                        # Small: refined now
+    settle()
+    assert sorted(seed["refined"]) == [0, 1] and Stub.embeds == 5
+
+
+def test_select_by_picture_full_turn(app, win, tmp_path, monkeypatch):
+    """All the way round (11): with a stand-in model that outlines all of whatever it's shown,
+    the outline is carried round all four sides of a hollow box, never onto the cavity wall,
+    behind a modal progress window that closes after. Stop keeps the clicked view's outline."""
+    from gooslicer import picture
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QProgressDialog
+    outer = trimesh.creation.box((20, 20, 20))
+    inner = trimesh.creation.box((14, 14, 14))
+    inner.invert()
+    v, f = trimesh.remesh.subdivide_to_size(*(lambda m: (m.vertices, m.faces))(
+        trimesh.util.concatenate([outer, inner])), max_edge=2.0)
+    path = tmp_path / "hollow.stl"
+    trimesh.Trimesh(v, f).export(path)
+    wait_import(app, win, [path])
+    p = win.scene.parts[0]
+    win.select([p.id])
+    vp = win.viewport
+    vp.set_view(-60, 30)
+    vp.frame_selection()
+    pump(app)
+    dialogs = []
+
+    class Stub:
+        gpu_error = None
+        embeds = 0
+        stop = False
+
+        def embed(self, rgb):
+            Stub.embeds += 1
+            if Stub.stop and Stub.embeds > 1:
+                raise picture.Cancelled()
+            self.shape = rgb.shape[:2]
+            return self.shape
+
+        def outlines(self, points, emb=None, size=None):
+            return [np.ones(size or emb or self.shape, bool)]
+
+    def settle():
+        for _ in range(1500):
+            pump(app)
+            dialogs.extend(d.windowModality() for d in win.findChildren(QProgressDialog) if d.isVisible())
+            if not getattr(win, "_picture_busy", False):
+                return
+            QTest.qWait(10)
+        raise AssertionError("still busy")
+    monkeypatch.setattr(picture, "available", lambda key=None: (True, ""))
+    win.settings.setValue("picture/turn", True)
+    win._segmenter, win._segmenter_model = Stub(), win.picture_model_settings()
+    pp = win.props
+    pp.select_by.model().item(2).setEnabled(True)
+    pp.select_by.setCurrentIndex(pp.select_by.findData("picture"))
+    pp.select_btn.click()
+    wm = p.world_mesh()
+    c = wm.triangles_center
+    centre = wm.bounds.mean(axis=0)
+    shell = np.abs(c - centre).max(axis=1) > 8.5
+    eye = vp.camera.eye()
+    seen = shell & (np.einsum("ij,ij->i", wm.face_normals, eye - c) > 0)
+    face = int(np.nonzero(seen)[0][len(np.nonzero(seen)[0]) // 2])
+    win.region_pick(p.id, face, False)
+    settle()
+    seed = win._region["seeds"][0]
+    assert len(seed["turn"]) == 2 * picture.TURN_STEPS - 1 and Stub.embeds == 1 + len(seed["turn"])
+    mask = win._region["mask"]
+    n = wm.face_normals
+    for axis in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)):          # every side, round the back
+        side = shell & (n @ np.array(axis) > 0.9)
+        assert mask[side].mean() > 0.9, axis
+    assert not mask[~shell].any()                                      # never the cavity wall
+    assert dialogs and set(dialogs) == {Qt.ApplicationModal}
+    assert not any(d.isVisible() for d in win.findChildren(QProgressDialog))
+    # Stop: the clicked view's outline stays
+    win.clear_region()
+    win._picture_key = None
+    Stub.embeds, Stub.stop = 0, True
+    vp.set_view(-50, 30)
+    pump(app)
+    win.region_pick(p.id, face, False)
+    settle()
+    seed = win._region["seeds"][0]
+    assert not seed["refined"] and np.array_equal(win._region["mask"] & ~seed["prim"][0], np.zeros_like(mask))
+    assert "Stopped" in win.statusBar().currentMessage()
+
+
+
+def test_select_by_drawing(app, win, tmp_path):
+    """Select by Drawing (11): a rough loop dragged round a boss on a block selects the boss,
+    its edge cut along the crease at its foot (not at the loop). The brush ring follows the
+    cursor; Ctrl+scroll changes the brush; an open line selects nothing; Clear clears the
+    drawing."""
+    import manifold3d as m3
+    block = trimesh.creation.box((40, 40, 10))
+    boss = trimesh.creation.cylinder(radius=6, height=6, sections=48)
+    boss.apply_translation((0, 0, 8))
+
+    def M(t):
+        return m3.Manifold(m3.Mesh(t.vertices.astype(np.float32), t.faces.astype(np.uint32)))
+    u = (M(block) + M(boss)).to_mesh()
+    v, f = trimesh.remesh.subdivide_to_size(u.vert_properties[:, :3], u.tri_verts, max_edge=1.0)
+    path = tmp_path / "boss.stl"
+    trimesh.Trimesh(v, f).export(path)
+    wait_import(app, win, [path])
+    p = win.scene.parts[0]
+    win.select([p.id])
+    vp = win.viewport
+    pp = win.props
+    pp.draw_ai.setChecked(False)
+    pp.select_by.setCurrentIndex(pp.select_by.findData("draw"))
+    assert vp.region_draw and pp.brush.isVisibleTo(pp) and not pp.outline_size.isVisibleTo(pp)
+    pp.select_btn.click()
+    vp.set_view(0, 89)
+    vp.frame_selection()
+    pump(app)
+    wm = p.world_mesh()
+    top = wm.bounds[0][2] + 10                                   # the block's top face
+    cx, cy = wm.bounds.mean(axis=0)[:2]
+    rr = np.hypot(wm.triangles_center[:, 0] - cx, wm.triangles_center[:, 1] - cy)
+    boss_faces = (rr < 6.05) & (wm.triangles_center[:, 2] > top + 0.01)
+
+    def screen(pts):
+        xy, _ = vp._screen(np.asarray(pts, float))
+        return [QPointF(float(x), float(y)) for x, y in xy]
+    t = np.linspace(0, 2 * np.pi, 60)
+    rough = 9.5 + 1.0 * np.sin(3 * t)                            # 8.5–10.5 mm round a 6 mm boss
+    loop = screen(np.c_[cx + rough * np.cos(t), cy + rough * np.sin(t), np.full_like(t, top)])
+    mouse(vp, QEvent.MouseMove, loop[0], Qt.NoButton, Qt.NoButton)
+    assert vp.brush_ring is not None                             # the brush follows the cursor
+    win.props.brush.setValue(3)                                  # 1.5 mm
+    assert vp.brush_mm == 1.5
+    mouse(vp, QEvent.MouseButtonPress, loop[0])
+    for q in loop[1:]:
+        mouse(vp, QEvent.MouseMove, q, Qt.NoButton, Qt.LeftButton)
+    mouse(vp, QEvent.MouseButtonRelease, loop[-1], Qt.LeftButton, Qt.NoButton)
+    pump(app)
+    seed = win._region["seeds"][-1]
+    assert seed["kind"] == "draw" and vp.draw_lines is not None and len(vp.draw_lines) > 20
+    mask = win._region["mask"]
+    A = wm.area_faces
+    assert A[mask & boss_faces].sum() / A[boss_faces].sum() > 0.97
+    flat = ~boss_faces & mask
+    assert rr[flat].max() < 7.5 if flat.any() else True          # the edge is at the boss's foot
+    # Ctrl+scroll changes the brush
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtCore import QPoint
+    ev = QWheelEvent(loop[0], vp.mapToGlobal(loop[0]), QPoint(), QPoint(0, 240), Qt.NoButton,
+                     Qt.ControlModifier, Qt.NoScrollPhase, False)
+    QApplication.sendEvent(vp, ev)
+    assert pp.brush.value() > 3
+    # Clear; then an open line selects nothing
+    pp.clear_region_btn.click()
+    assert vp.draw_lines is None
+    arc = loop[:15]
+    mouse(vp, QEvent.MouseButtonPress, arc[0])
+    for q in arc[1:]:
+        mouse(vp, QEvent.MouseMove, q, Qt.NoButton, Qt.LeftButton)
+    mouse(vp, QEvent.MouseButtonRelease, arc[-1], Qt.LeftButton, Qt.NoButton)
+    pump(app)
+    assert not win._region["mask"].any() and "all the way round" in win.statusBar().currentMessage()
+    vp.stop_region_mode()
+    assert vp.brush_ring is None

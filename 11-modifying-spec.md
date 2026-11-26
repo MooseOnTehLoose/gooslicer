@@ -25,19 +25,48 @@ Nothing here is from SatelLite (it has no such tool in the strings we have); eve
     - *Spanning:* a connected line must span 4 mm end to end. Hair and skin texture makes tangles that are long but small, and those go.
   - **Why not per triangle:** per-triangle creases on `Lisa_head_D.stl` gave 187k crease edges at 30°, all joined into one network. The first smoothed version still drew hair speckle. The cleaned one at 35° draws the ear, the hairline and the gag (about 5,500 edges); lower the fold to pick up the straps.
   - The smoothing is the slow part (about 1.1 s on the hollowed head, 618k triangles). It's cached per part placement, so moving the slider only redoes the rest. A pick takes about 0.2 s.
-- **Select by** (added 2026-11-25; combobox above Spread, `modify/selectBy`) sets what a click selects. Ctrl+click adds to the selection in any mode, and a selection can mix modes. Grow selection, Clear and the cut work the same for all three. Each mode shows only its own controls.
+- **Select by** (added 2026-11-25; combobox above Spread, `modify/selectBy`) sets what a click selects. Ctrl+click adds to the selection in any mode, and a selection can mix modes. Grow selection, Clear and the cut work the same for all of them. Each mode shows only its own controls.
   - **Surface** (default): the spread and contours above.
   - **Parts**: the click selects the whole part of the model it lands on (see *Parts* below). Part edges are drawn on the model while picking, in place of contours. **Part edges** slider (2°–30°, default 10°, `modify/partEdges`): how deep a valley must run along a border for it to stay a part edge. Lower gives more, smaller parts.
   - **Picture (AI)**: an image model outlines the thing you clicked in the 3D view, the way you see it (see *Picture* below). **Outline** slider, Small / Medium / Large (default Medium, `modify/outline`): which of the model's candidate outlines to use, from smallest to largest. Changing it re-applies the stored candidates; nothing is recomputed. Shown only when the model is installed; otherwise the entry is disabled, with a tooltip saying so.
+  - **Drawing**: drag on the model to paint a rough line round a part; the part inside is selected, with its edge found along the creases near the line (see *Drawing* below). **Brush** slider (0.5–10 mm, default 2 mm, `modify/brush`; Ctrl+scroll over the model also changes it), shown on the model as a ring round the cursor. **Use the AI for the edge** (`modify/drawAI`, default off; disabled without an image model): the image model's outline of the drawn region helps place the edge (see *Drawing: does the AI help?*). Each drag adds to the drawing until Clear; strokes needn't join up perfectly.
+- **Drawing** (`gooslicer/drawsel.py`) [GOOSLICER]:
+  - **Painting:** while dragging, the view picks the model every few pixels along the mouse's path, so a fast stroke stays continuous. Each picked face paints the faces within the brush radius of it along the surface (Dijkstra over face centres), so a brush never reaches through a thin part to its far side. The painted line shows on the model as it's drawn.
+  - **Inside:** the unpainted surface falls apart along the drawing into pieces. The piece the drawing walls off is the smallest of those touching the paint (an ear inside a loop round its base; a band between two loops round a cylinder); the others are outside. Gaps in the drawing are closed by widening the paint, up to 3 times by half the brush more each time; the first width that walls off the most pieces is used (a gap in one of two loops round a band joins the band to the top; closing it gives three pieces, and the band is the smallest). Unpainted islands smaller than two brush dabs (gaps between dabs) count as paint. If nothing is walled off even then, the status bar says to draw all the way round, and nothing is selected.
+  - **The edge** is the cheapest cut through the drawn region (the inside and the paint) between its core and the outside: a minimum s–t cut over faces (`scipy.sparse.csgraph.maximum_flow`). The line is drawn roughly round the part, so the true edge can be anywhere between the line and the core.
+    - *Core:* the inside faces farthest from the paint along the surface (at least half the greatest distance) are always kept. The outside is always left out.
+    - *Crossing* between two faces costs their shared edge's length × exp(−valley / 20°), with ridges counting 15 % as much (the Parts rule).
+    - *Toward the line:* each inside face kept earns 0.05 /mm × its area. On a smooth surface that moves the edge out to the line; a crease is so cheap to cut along that it wins where there is one.
+  - **With the AI:** the clicked view is drawn as for Picture and looked at once per view (in the background). The model is prompted with a box round the inside and the paint, as seen, include points deep inside the inside, and exclude points deep in the outside within that box. Of its outlines, the largest that covers 80 % of the core (as seen) and reaches outside the drawing by under 10 % of its area is used; none, and the AI is left out. (Matching the outline to the drawing instead just gave the rough line back.) Each face of the drawn region it covers is pulled to the inside, each it leaves out (and that the view sees) to the outside, by its area × 0.5 /mm, against the cut cost. So the AI helps place the edge where the geometry is ambiguous, but can't take anything outside the line or drop the core.
+  - **Drawing: does the AI help?** Measured on four test shapes, seen from 60° above. A rough loop was dragged round each: *tight* is 8.5–10.5 mm out, *loose* 9.5–14.5 mm. IoU is against the true part (area-weighted). The times are for the whole stroke under the test harness; the AI's picture is looked at once per view.
+
+    | Shape | Loop | Geometry only | MobileSAM | SAM 2.1 Small | SAM 2.1 Base+ | HQ-SAM 2 |
+    |---|---|---|---|---|---|---|
+    | Boss, sharp foot | tight / loose | 0.999 / 0.999 | 0.999 / 0.999 | 0.999 / 0.999 | 0.999 / 0.999 | 0.999 / 0.999 |
+    | Boss, rough surface (0.12 mm noise) | tight / loose | 0.856 / 0.545 | 0.761 / 0.545 | 0.480 / 0.512 | 0.856 / 0.545 | 0.487 / 0.604 |
+    | Smooth dome, no crease | tight / loose | 0.893 / 0.771 | 0.960 / 0.804 | 0.885 / 0.768 | 0.865 / 0.772 | 0.961 / 0.771 |
+    | Boss inside a groove | tight / loose | 0.518 / 0.518 | 0.496 / 0.498 | 0.497 / 0.518 | 0.484 / 0.518 | 0.484 / 0.484 |
+    | Time (s) | | 0.6–1.2 | 1.2–1.9 | 1.7–2.6 | 2.4–3.6 | 6.7–8.2 |
+
+    - Where there's a crease at the part's foot, the geometry finds it exactly and the AI adds nothing.
+    - Where the part blends in smoothly, with no crease, the AI helps: 0.89 → 0.96 with MobileSAM or HQ-SAM 2 on a tight loop. On a loose loop the gain is small.
+    - On a rough or textured surface it can hurt: the noise breaks the outline, and the outlines that fit the drawing take in surface round the part (HQ-SAM 2: 0.86 → 0.49).
+    - Boss inside a groove: both stop at the groove, the outermost crease inside the line, rather than at the boss's foot. That is what was drawn round. To get the boss alone, draw inside the groove.
+    - Stronger pulls (2 /mm) and taking the smallest outline instead of the largest were also tried. Neither was better overall.
+    - So the AI is an option, off by default. Its tooltip says when it helps.
 - **Parts** (`gooslicer/parts.py`) [GOOSLICER]: splits the surface into the pieces a person would name (an ear, a strap, the mask round the eyes), by the *minima rule*: one shape meets another along a valley.
   1. *Patches*: one seed per 1.2 mm cell of each shell. Faces go to the nearest seed along the surface, where crossing a contour (the fold at 20°, cleaned as in *Contours*) costs 200× its length (a near-wall; a 10× wall let a seed on one side take a strip of the other). So patch borders lie on creases where there are creases.
   2. *Normalized cuts*: the patches form a graph. Two patches are joined by the length of their shared border, weighted by exp(−valley / 20°); ridges count 15 % as much as valleys. The graph is split in two along its Fiedler vector at the sweep point with the lowest normalized cut, and each half again, while the cut is under 0.1. This finds regions only weakly attached to the rest (an ear on its rim, a band between two strap edges) even where a crease has gaps.
   3. *Merge back*: normalized cuts also split smooth surfaces where nothing marks a border. So neighbouring parts are merged, the weakest first, while the length-weighted mean valley fold along their border is under the **Part edges** angle. Parts under 1 mm² always merge.
   - Measured on the hollowed `Lisa_head_D.stl` (618k triangles): about 1.2 s once per part placement, on top of the 1.1 s contour smoothing (cached and shared with contours). At 10° it gives 56 parts (70 at 6°, 38 at 15°); changing the angle only redoes the merge (0.02 s). The eye socket inside the mask, the ear and the hood edge come out as parts; some smooth skin is still split where the cut found no clear border, so Ctrl+click adds a neighbouring part.
-- **Picture** (`gooslicer/picture.py`) [GOOSLICER]: a "segment anything" image model run with onnxruntime. Three models, chosen in Preferences → Picture selection (`picture/model`):
+- **Picture** (`gooslicer/picture.py`) [GOOSLICER]: a "segment anything" image model run with onnxruntime. Five models, chosen in Preferences → Picture selection (`picture/model`):
   - **MobileSAM** (default, included): ONNX export by Acly (MIT), `huggingface.co/Acly/MobileSAM` at commit `0d3b4033`. 45 MB, about 0.25 s a picture on the CPU.
   - **SAM 2.1 Small** and **SAM 2.1 Base+** (Meta, Apache-2.0; ONNX export by onnx-community, pinned to commits `a7df49d8` and `bab18593`): 184 MB and 327 MB, about 0.7 s and 1.3 s a picture on the CPU. They follow small features more closely.
-  - The SAM 2.1 models are downloaded from Preferences into `$XDG_DATA_HOME/gooslicer/models/<name>/`. Each file is checked against its sha256, and a bad or partial download is never left under its real name. Until one is downloaded, MobileSAM is used.
+  - **SAM 2.1 Large** and **HQ-SAM 2 Large** (Apache-2.0): SAM 2.1's largest model, and SysCV's HQ-SAM 2, which adds a high-quality output to it for fine structures (thin edges, straps, rims). HQ-SAM 2 keeps SAM 2.1 Large's image encoder frozen, so both use one 852 MB encoder, downloaded once into a shared folder. Their decoders are 17 MB each.
+    - ONNX: the encoder and the SAM 2.1 decoder are vietanhdev's samexporter export, as republished unchanged by latolukasz (`huggingface.co/latolukasz/sam2.1-hiera-large-onnx`, commit `ccbb4af9`). The HQ decoder is latolukasz's export of SysCV's checkpoint (`…/sam2.1-hq-hiera-large-onnx`, commit `5d5e61bc`). [INFERRED from their model cards] that they're faithful exports: a single person's uploads, pinned by sha256 and checked here on test pictures, not against the original PyTorch models.
+    - samexporter's form: the picture stretched to 1024×1024, ImageNet-normalised (`image`), giving `image_embed` and `high_res_feats_0/1`. The decoder takes points in 1024² pixels with float labels (a padding point, label −1, as for SAM 1), and returns 3 candidate outlines as 256² logits, which are scaled up to the picture.
+  - Not added: EfficientSAM and EdgeSAM (faster, not more precise; EdgeSAM's licence is non-commercial) and Semantic-SAM (no ONNX export).
+  - The downloadable models are downloaded from Preferences into `$XDG_DATA_HOME/gooslicer/models/<name>/`. Each file is checked against its sha256, and a bad or partial download is never left under its real name. Until one is downloaded, MobileSAM is used.
 - **Clicks** while picking in Picture mode:
   - A click outlines the thing under it.
   - Ctrl+click in the same view adds an include point to that outline. In a new view it adds another outline.
@@ -52,7 +81,37 @@ Nothing here is from SatelLite (it has no such tool in the strings we have); eve
   - Sorted by area. One covering at least 95 % of the part's own pixels is dropped when others remain.
   - The Outline slider picks Small (the smallest), Medium (the middle one, or the larger of two) or Large (the largest).
   - **Specks** are dropped: loose pieces of an outline (connected through the mesh) smaller than 2 % of it or 1 mm², unless they hold a clicked face. A strap seen in two places either side of a ring stays, being big.
-- **From pixels to faces:** a second render of the part, at the same size, writes each face's index into the colour (gl_PrimitiveID, 24 bits, no multisampling). A face is selected when any of its pixels is inside the outline. Faces smaller than a pixel leave holes, which *fill holes* closes as for every selection. Only visible faces can be selected, so the cavity wall and the far side are never taken.
+- **All the way round** (Preferences → Picture selection → Look all the way round, `picture/turn`, default on; Views is then unused) [GOOSLICER]: for parts that wrap round the model (a strap, a band, a collar). Accuracy comes before speed: a click can take minutes, behind a progress window.
+  - **Where from:** two rings of pictures round the middle of the part's bounding box, 30° apart, one above and one below the middle. Each ring sits at the clicked view's own pitch, kept between 20° and 45°, mirrored for the other ring. The part's bounding sphere fills 80 % of each picture. Order: straight below the click, then ±30°, ±60°, … 180°, each above then below. That's 23 pictures besides the clicked one.
+  - **Carried round:** each picture is prompted by the selection so far, using only faces that some picture already saw fairly head-on (votes ≥ 0.5). Its outline that agrees best with that selection (area-weighted overlap ≥ 0.3, on faces seen before) votes. A picture with almost none of the selection in sight is skipped.
+  - **The vote** is weighted by how directly each picture sees each face (the cosine between the face's normal and the direction to the camera), so faces seen edge-on count for little. A face is kept when its in-votes are at least half its votes. Specks, clicked and excluded faces as for one view.
+  - **While it runs:** a modal window ("Looking at … from all round: 7 of 23, about 1 min left"; the first time it says how many pictures) blocks the app, with a busy cursor. **Stop** ends it and keeps the clicked view's outline. Ctrl+click, right-click and the Outline slider reuse the pictures (kept at half precision, about 200 MB for a SAM 2.1 model; only the latest outline keeps them), so they only decode again: seconds.
+  - **Measured** on a test cylinder (radius 15 mm) with a raised band round its middle, clicked on the band, Small outline:
+
+    | Model | One view | All the way round (24 pictures) |
+    |---|---|---|
+    | MobileSAM (GPU) | 35 % of the band | 100 %, plus 13 % of the band's area outside it, 9 s |
+    | SAM 2.1 Base+ (CPU) | 36 % | 100 %, 10 % outside, 38 s |
+    | HQ-SAM 2 (CPU) | 37 % | 98 %, 6 % outside, 108 s |
+    | SAM 2.1 Small (GPU) | 18 % | 49 %, 2 % outside, 8 s: it outlines short pieces of a thin band |
+
+    - One ring at the clicked pitch reached only 79 % (MobileSAM): the band's underside faces no picture from above. 5 More views reached 52 %.
+    - On `Lisa_head_D.stl`'s cheek strap, which ends under the hood rather than wrapping round, it changed little. It also carries a wrong start round: a Medium outline that already took half the cylinder spread further. Pick the outline size that's right in the clicked view first.
+    - Filling holes used to fill the smaller side of a ring selected all the way round (the whole top of the cylinder); now only patches smaller than the selection are holes (*Selection used*, below).
+- **From pixels to faces:** a second render of the part, at the same size, writes each face's index into the colour (gl_PrimitiveID, 24 bits, no multisampling). A face is selected when any of its pixels is inside the outline. Faces smaller than a pixel leave holes, which *fill holes* closes as for every selection. Only faces seen in a view can be selected, so the cavity wall is never taken, and the far side only with More views.
+- **More views** (Preferences → Picture selection → Views, `picture/views`, 1–9, default 3) [GOOSLICER]: the outline is checked against, and extended by, the model's outlines from other angles. The far side of a strap or an ear can then be selected, and one view's mistakes are outvoted.
+  - **Where from:** after the clicked view's candidates are known, up to 8 more pictures of the part are drawn, all aimed at the centre of the largest candidate. The distance is where that candidate's bounding sphere fills about half the picture, but no farther than the view's own distance. Directions, in this order: the view's own (nearer), turned 45° either way round the vertical, tilted 35° up and down, turned 90° either way, then the 45° turns tilted up. Same size, shading, clipping and background as the clicked view.
+  - **Prompts in each view, per candidate:** include points at the clicked faces it sees, plus up to 3 points deep inside the candidate's pixels there (by distance to its edge, spread apart); exclude points at the excluded faces it sees.
+  - **Which outline:** of the outlines the model returns, the one that agrees best with the candidate on faces both views see (area-weighted overlap). A view is skipped for a candidate when it sees under 10 % of the candidate's area, or when the best overlap is under 0.3 (it outlined something else).
+  - **The vote:** a face is selected when it's inside the outline in at least half the used views that see it, the clicked one included. Faces seen in no view aren't selected; fill holes closes small gaps as before. Specks are then dropped, and clicked and excluded faces forced, as for one view.
+  - Only the candidate the Outline slider is on is refined; moving the slider refines the new one when it's needed (decoding only by then, so well under a second). The clicked view's outline shows straight away, and the refined one replaces it when ready (busy cursor meanwhile).
+  - The vote works on the views' face pictures cut to about 800 px on the long side (every k-th pixel), and the model's outlines are scaled straight to that size: they're 256² before scaling, so nothing finer is lost. Points deep inside are found at half that again.
+  - Ctrl+click and right-click on the same outline reuse its views' pictures: only the decoder runs again. Only the latest outline keeps its views (to save memory).
+  - Cost: one picture per view.
+  - **Measured** on the hollowed `Lisa_head_D.stl` (cheek strap, Small outline; under Xvfb, so the pictures are drawn in software):
+    - Per click: MobileSAM on the GPU 0.7 s with 1 view and 3.7 s with 5; SAM 2.1 Small on the GPU 0.6 s and 3.7 s; HQ-SAM 2 on the CPU 6 s and 25 s. Moving the Outline slider to an unrefined candidate: 1–2.5 s.
+    - For the strap, 5 views changed little (it's nearly all in sight from the clicked view): the band's ends came out a little cleaner. HQ-SAM 2 gave the cleanest band, from the ring down to the jaw, with 1 view. The gain from more views is on things that wrap round: on a hollow box (GUI test), faces round the side joined, and the cavity wall stayed out.
+    - Hence the default of 3 views: the clicked one, nearer, and turned 45°.
 - **GPU** (Preferences → Picture selection → Run on, `picture/device`, default CPU):
   - Offered only when this onnxruntime build has a GPU provider (MIGraphX, ROCm or CUDA) and the GPU's own libraries load (`libamdhip64.so.7` and `libmigraphx_c.so.3` for MIGraphX). Otherwise the note says which is missing.
   - The dependency is `onnxruntime-migraphx` (x86-64). It's the same CPU code, with AMD's MIGraphX provider for ROCm 7 besides.
@@ -69,7 +128,8 @@ Nothing here is from SatelLite (it has no such tool in the strings we have); eve
   - With MobileSAM, clicked between the eyes, Small was the hood round the eyes and Medium the whole hood with both ears. Clicked on an ear, Medium was exactly that ear.
 - **Files:**
   - MobileSAM: `mobile_sam_image_encoder.onnx` (28,157,093 bytes, sha256 `580f5fb6…c749`) and `sam_mask_decoder_multi.onnx` (16,496,559 bytes, sha256 `8976b90a…2ffe`).
-  - SAM 2.1: `vision_encoder.onnx(+_data)` and `prompt_encoder_mask_decoder.onnx(+_data)`, with sizes and hashes in `picture.MODELS`.
+  - SAM 2.1 Small and Base+: `vision_encoder.onnx(+_data)` and `prompt_encoder_mask_decoder.onnx(+_data)`, with sizes and hashes in `picture.MODELS`.
+  - SAM 2.1 Large and HQ-SAM 2: `encoder.onnx`, with `decoder.onnx` or `decoder_hq.onnx`, in `sam2.1-hiera-large/`.
 - **Where the app looks:** `$GOOSLICER_MODELS`, `/app/share/gooslicer/models` (the Flatpak downloads MobileSAM at build time, pinned by sha256), `models/` in the source tree (`scripts/fetch-models.sh`, git-ignored), then `$XDG_DATA_HOME/gooslicer/models` (downloads from Preferences). Each SAM 2.1 model sits in its own subfolder.
   - onnxruntime (MIT) is a dependency. Without it or any model's files, Picture is disabled and everything else works.
 - **Grow selection** (button, with a distance −20…20 mm beside it, default 1 mm, `modify/grow`; placed just above Cut out selection): grows the selection by that distance along the surface, or shrinks it when negative.
@@ -83,7 +143,7 @@ Nothing here is from SatelLite (it has no such tool in the strings we have); eve
 
 ## 3. Cut out selection
 The cut follows the selection's outline, not a plane (changed 2026-11-25 after trying a plane on `Lisa_head_D.stl`: a plane cut didn't follow the model). The curved, irregular joint also indexes the piece: it seats back only one way, so no pins are needed.
-- **Selection used:** the grown regions plus the holes they enclose (unselected patches surrounded by the selection, e.g. a bump in the hair). Shells not touching the selection, such as a hollow's inside wall, are never added.
+- **Selection used:** the grown regions plus the holes they enclose (unselected patches surrounded by the selection, e.g. a bump in the hair). Shells not touching the selection, such as a hollow's inside wall, are never added. A hole is smaller than the selection round it: a band selected all the way round a cylinder leaves two patches, its ends, and neither is a hole (filling the smaller, as before, took the whole top).
 - **Cut direction** n: the area-weighted mean normal of the selected faces. The piece lifts out along it.
 - **Cutter:** a solid that, seen along n, is the selection's outline: the union of the selected triangles projected on the plane across n, rounded by **Smoothing** (a round offset out then back in, default 0.5 mm, 0–5), holes filled.
   - **Its bottom follows the selected surface** **Cut depth** beneath it (default 3 mm, 0.2–100). The height comes from the lowest selected point in each 0.25 mm cell of a grid along n; empty cells take their nearest neighbour's. The extruded outline is refined to 1 mm and its bottom warped down onto that height.
@@ -107,7 +167,7 @@ The cut follows the selection's outline, not a plane (changed 2026-11-25 after t
 
 ## 4. Tests
 - `modify.grow_region` on an icosphere: the region is a connected cap around the seed, and it grows with the spread angle (5° < 35° < 90°).
-- `modify.fill_holes` fills holes punched in a cap and nothing else (not the hollow's inside).
+- `modify.fill_holes` fills holes punched in a cap and nothing else (not the hollow's inside), and leaves the ends of a ring round a cylinder alone.
 - `modify.cutter` and `modify.cut` on a hollow ball, with a 40° cap: two watertight solids adding up to the ball. The piece is a curved cap of wall with no floor, as wide as the outline, its lowest points where the cutter's walls meet the inside of the wall. A fit gap shrinks the piece by the gap and leaves the hole as it was.
 - On a U shape cut across both arms with one arm selected, only that arm becomes the piece.
 - `mesh.repair` keeps a cavity facing in (and turns in one facing out), with a solid core inside it facing out.
@@ -116,10 +176,15 @@ The cut follows the selection's outline, not a plane (changed 2026-11-25 after t
 - `modify.grow_by` on a ball's cap: ±2 mm moves its edge 2 mm along the surface (±0.35); a grow keeps the cap and a shrink stays inside it.
 - `parts.parts` on a slab with a post standing in it: the post's sides and top are one part and the slab's top another. A ball is a single part.
 - `picture.faces_in_outline` maps a face-index image and an outline to faces; candidates are sorted, and the near-whole one is dropped.
+- `picture.propagate` (all the way round): an outline is carried from view to view, faces it never reaches stay out, and Stop raises `Cancelled`. `turn_layout` gives two rings, nearest first.
+- `picture.refine` (More views): a face only another view sees, inside its outline, is added; a view that outlined something else is ignored; two views outvote the clicked one on a face it got wrong.
 - `picture.drop_specks` keeps big pieces and clicked ones. `picture.download` keeps files that match their checksum and leaves nothing behind otherwise.
 - Each installed model outlines a block on a dark ground (skipped for a model that isn't installed).
 - Preferences → Picture selection lists the models with their download state, and offers the GPU only when it can start.
+- GUI: all the way round, with a stand-in that outlines everything, reaches all four sides of a hollow box and never its cavity wall, behind a modal window that closes after; Stop keeps the clicked view's outline.
 - GUI: Select by Parts selects the post of a slab-and-post part; Select by Picture, with a stand-in segmenter outlining the left half of the view, selects only visible faces on that side; a right-click leaves a patch out without looking at the picture again. The face-index render matches the faces the view's own pick finds.
+- Drawing: two rough loops round a band on a cylinder select the band (≥ 97 %, under 10 % else); a gap in one loop is closed; an open line selects nothing; the brush paints along the surface, never through a thin plate; the AI's answer moves the edge only within the drawing and never drops the core. `Segmenter.outlines` takes a box prompt.
+- GUI: Select by Drawing: a rough loop dragged round a boss on a block selects the boss, cut at its foot; the brush ring follows the cursor; the Brush slider and Ctrl+scroll change it; an open line selects nothing and says so; Clear clears the drawing.
 - GUI: the Mesh pane starts folded with the status in its button; Select surface + click selects a region; the spread slider changes its size; Cut out selection gives two parts, a single undo restores one; refuses on an open mesh.
 
 ## 5. Open items

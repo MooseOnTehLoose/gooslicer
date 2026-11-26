@@ -368,8 +368,9 @@ class PropertiesPanel(QWidget):
         self.select_by = QComboBox()
         self.select_by.setToolTip("What a click selects: the surface round it (spread and contours), "
                                   "the whole part of the model it's on, or what an image model sees "
-                                  "there in the 3D view")
-        for text, key in (("Surface", "surface"), ("Parts", "parts"), ("Picture (AI)", "picture")):
+                                  "there in the 3D view; or draw round a part on the model")
+        for text, key in (("Surface", "surface"), ("Parts", "parts"), ("Picture (AI)", "picture"),
+                          ("Drawing", "draw")):
             self.select_by.addItem(text, key)
         from gooslicer import picture
         ok, why = picture.any_available()
@@ -428,7 +429,37 @@ class PropertiesPanel(QWidget):
         fl.addRow("Outline", orow)
         orow.addWidget(self.outline_size, 1)
         orow.addWidget(self.outline_label)
-        self._mode_rows = {"surface": (srow, crow), "parts": (prow,), "picture": (orow,)}
+        self.brush = QSlider(Qt.Horizontal)
+        self.brush.setRange(1, 20)                  # half-millimetres: 0.5–10 mm
+        self.brush.setValue(4)
+        self.brush.setToolTip("The brush's radius: drag on the model to draw round a part. Ctrl+scroll "
+                              "over the model changes it too.")
+        self.brush_label = QLabel("2 mm")
+        self.brush_label.setMinimumWidth(52)
+        brow = QHBoxLayout()
+        fl.addRow("Brush", brow)
+        brow.addWidget(self.brush, 1)
+        brow.addWidget(self.brush_label)
+        self.draw_ai = QCheckBox("Use the AI for the edge")
+        self.draw_ai.setChecked(False)
+        self.draw_ai.setToolTip("Let the image model's outline of what you drew round help place the "
+                                "edge. Helps where a part blends smoothly into the rest with no crease; "
+                                "can hurt on rough or textured surfaces. Preferences → Picture "
+                                "selection sets the model.")
+        if not ok:
+            self.draw_ai.setChecked(False)
+            self.draw_ai.setToolTip("Not available: " + why)
+        arow = QHBoxLayout()
+        fl.addRow(arow)
+        arow.addWidget(self.draw_ai)
+        self.draw_hint = QLabel("Drag on the model to draw all the way round the part (the line can "
+                                "be rough). Each drag adds to the drawing; Clear starts again.")
+        self.draw_hint.setWordWrap(True)
+        hrow = QHBoxLayout()
+        fl.addRow(hrow)
+        hrow.addWidget(self.draw_hint)
+        self._mode_rows = {"surface": (srow, crow), "parts": (prow,), "picture": (orow,),
+                           "draw": (brow, arow, hrow)}
         self.region_info = QLabel("Nothing selected")
         self.region_info.setWordWrap(True)
         fl.addRow(self.region_info)
@@ -491,6 +522,9 @@ class PropertiesPanel(QWidget):
         self.select_by.currentIndexChanged.connect(lambda _i: (self.show_select_by(), win.select_by_changed()))
         self.part_edges.valueChanged.connect(
             lambda v: (self.part_edges_label.setText(f"{v}°"), win.region_settings_changed()))
+        self.brush.valueChanged.connect(lambda v: (self.brush_label.setText(f"{v / 2:g} mm"),
+                                                   win.brush_changed()))
+        self.draw_ai.toggled.connect(lambda _on: win.region_settings_changed())
         self.outline_size.valueChanged.connect(lambda v: (self.outline_label.setText(
             ("Small", "Medium", "Large")[v]), win.region_settings_changed()))
         self.grow_btn.clicked.connect(win.grow_selection)
@@ -528,6 +562,8 @@ class PropertiesPanel(QWidget):
         for t in (QDoubleSpinBox, QPushButton, QCheckBox, QComboBox):
             for w in self.findChildren(t):
                 w.setEnabled(enabled)
+        if enabled and not self.draw_ai.toolTip().startswith("Let"):      # no image model
+            self.draw_ai.setEnabled(False)
         if getattr(self.win, "_orienting", False):
             self.btn_auto.setEnabled(False)             # one Auto Position at a time
         self.btn_arrange.setEnabled(bool(self.win.scene.parts))    # works on all parts, selected or not

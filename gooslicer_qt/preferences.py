@@ -443,7 +443,8 @@ class PreferencesDialog(QDialog):
         self.picture_model = QComboBox()
         self.picture_model.setToolTip("The model that outlines what you click in Select by Picture. The "
                                       "SAM 2.1 models follow small features (a strap, a ring) more "
-                                      "closely but take longer, and are downloaded first.")
+                                      "closely but take longer, and are downloaded first. HQ-SAM 2 has "
+                                      "the finest edges; the Large models run only on the CPU.")
         for m in picture.MODELS.values():
             self.picture_model.addItem(m.title, m.key)
         fl.addRow("Model", self.picture_model)
@@ -461,9 +462,25 @@ class PreferencesDialog(QDialog):
         fl.addRow("Run on", self.picture_device)
         self.picture_gpu_note = _note("")
         fl.addRow(self.picture_gpu_note)
+        self.picture_views = QSpinBox()
+        self.picture_views.setRange(1, picture.MAX_VIEWS)
+        self.picture_views.setToolTip("How many pictures the outline is checked in: the view you click, "
+                                      "plus pictures from other angles round it. More views reach the far "
+                                      "side and outvote one view's mistakes; each takes as long as one "
+                                      "picture.")
+        fl.addRow("Views", self.picture_views)
+        self.picture_turn = QCheckBox("Look all the way round (most accurate, slow)")
+        self.picture_turn.setToolTip("Follow the outline round the whole model, in two rings of 12 pictures "
+                                     "above and below it. A part that wraps round (a strap, a band, a "
+                                     "collar) is found all the way round. Each click takes about 24 times "
+                                     "one picture (seconds with MobileSAM on a GPU, about 2 minutes with "
+                                     "HQ-SAM 2); a window shows the progress, and Stop keeps the outline "
+                                     "from the view you clicked in.")
+        fl.addRow(self.picture_turn)
         lay.addWidget(g)
         lay.addWidget(_note("MobileSAM: ONNX export by Acly (MIT). SAM 2.1: Meta (Apache-2.0), ONNX export by "
-                            "onnx-community. They run on this computer; nothing is sent anywhere."))
+                            "onnx-community; Large by vietanhdev (samexporter). HQ-SAM 2: SysCV (Apache-2.0), "
+                            "ONNX export by latolukasz. They run on this computer; nothing is sent anywhere."))
 
         def refresh():
             key = str(st.value("picture/model", picture.DEFAULT_MODEL))
@@ -472,6 +489,13 @@ class PreferencesDialog(QDialog):
             self.picture_model.setCurrentIndex(max(i, 0))
             self.picture_model.blockSignals(False)
             self._refresh_picture_status()
+            self.picture_views.blockSignals(True)
+            self.picture_views.setValue(self.win.picture_views())
+            self.picture_views.blockSignals(False)
+            self.picture_turn.blockSignals(True)
+            self.picture_turn.setChecked(self.win.picture_turn())
+            self.picture_turn.blockSignals(False)
+            self.picture_views.setEnabled(not self.picture_turn.isChecked())
             gpu = picture.gpu_provider()
             item = self.picture_device.model().item(1)
             item.setEnabled(gpu is not None)
@@ -500,9 +524,17 @@ class PreferencesDialog(QDialog):
         def reset():
             st.remove("picture/model")
             st.remove("picture/device")
+            st.remove("picture/views")
+            st.remove("picture/turn")
             refresh()
         self.picture_model.currentIndexChanged.connect(model_changed)
         self.picture_device.currentIndexChanged.connect(device_changed)
+        self.picture_views.valueChanged.connect(lambda v: st.setValue("picture/views", int(v)))
+
+        def turn_changed(on):
+            st.setValue("picture/turn", bool(on))
+            self.picture_views.setEnabled(not on)
+        self.picture_turn.toggled.connect(turn_changed)
         self.picture_download.clicked.connect(self._download_picture_model)
         return _Page("Picture selection", w, reset=reset, refresh=refresh)
 

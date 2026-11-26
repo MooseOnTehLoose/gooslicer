@@ -3,16 +3,20 @@ along the selection's outline. A mixin of MainWindow: it uses the window's scene
 undo stack, settings and panels (and its `cutFinished` signal)."""
 from __future__ import annotations
 
+import math
+import time
 import weakref
 
 import numpy as np
 import trimesh
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from gooslicer import mesh as meshmod
 from gooslicer import modify, picture
+from gooslicer import drawsel
 from gooslicer import parts as partsmod
+from gooslicer.camera import OrbitCamera
 from gooslicer.scene import Part, prepare
 
 from . import workers
@@ -123,7 +127,148 @@ class ModifyingMixin:
     def select_by_changed(self) -> None:
         self.settings.setValue("modify/selectBy", self.select_by())
         self.viewport.region_exclude = self.select_by() == "picture"
+        self.viewport.region_draw = self.select_by() == "draw"
+        self.viewport.brush_ring = None
         self._show_contours()
+
+    def brush_changed(self) -> None:
+        mm = self.props.brush.value() / 2
+        self.settings.setValue("modify/brush", float(mm))
+        self.viewport.brush_mm = mm
+        self.viewport.update()
+
+    # ------------------------------------------------------------ Select by Drawing (11)
+    def region_stroke(self, pid: int, faces, path) -> None:
+        """A stroke drawn on a part: add it to the drawing (a new drawing on another part, or
+        after another kind of selection) and select what the drawing walls off."""
+        p = self.scene.get(pid)
+        if p is None or self.select_by() != "draw":
+            return
+        if pid not in self.selected_ids():
+            self.select([pid])
+        r = self._region
+        last = r["seeds"][-1] if r and r["pid"] == pid and r["mesh"] == id(p.mesh) and r["seeds"] else None
+        stroke = {"faces": np.asarray(faces, np.int64), "radius": self.viewport.brush_mm,
+                  "path": np.asarray(path, float)}
+        if last is not None and last["kind"] == "draw":
+            last["strokes"].append(stroke)
+            seed = last
+        else:
+            seed = {"kind": "draw", "face": int(stroke["faces"][0]), "strokes": [stroke], "mask": None}
+            self._region = {"pid": pid, "mesh": id(p.mesh), "seeds": [seed], "grows": [], "mask": None}
+        self._draw_lines(seed)
+        self._draw_select(p, seed)
+
+    def _draw_lines(self, seed) -> None:
+        segs = [np.stack([st["path"][:-1], st["path"][1:]], axis=1) for st in seed["strokes"] if len(st["path"]) > 1]
+        self.viewport.draw_lines = np.concatenate(segs) if segs else None
+        self.viewport.update()
+
+    def _draw_select(self, p: Part, seed: dict) -> None:
+        """Work out the drawing's selection: the paint, the inside, then the cut, with the AI's
+        outline when "Use the AI for the edge" is on (its picture looked at in the background)."""
+        s = self._surface(p)
+        with _Busy(self, "Finding the part you drew round…"):
+            for st in seed["strokes"]:
+                if "painted" not in st:
+                    st["painted"] = drawsel.paint(s, st["faces"], st["radius"])
+            painted = np.logical_or.reduce([st["painted"] for st in seed["strokes"]])
+            radius = max(st["radius"] for st in seed["strokes"])
+            got = drawsel.inside(s, painted, radius)
+        if got is None:
+            seed["mask"] = np.zeros(len(s.areas), bool)
+            seed.pop("parts", None)
+            self.statusBar().showMessage("Draw all the way round the part: the drawing doesn't wall "
+                                         "anything off yet.", 8000)
+            self._update_region()
+            return
+        seed["parts"] = got
+        use_ai = self.props.draw_ai.isChecked() and self.props.draw_ai.isEnabled()
+        if not use_ai or not picture.available(self.picture_model_settings()[0])[0]:
+            self._draw_cut(p, seed, None)
+            return
+        model = self.picture_model_settings()
+        key = self._picture_view_key(p)
+        if getattr(self, "_picture_key", None) == key and getattr(self, "_segmenter_model", None) == model:
+            self._draw_cut(p, seed, self._draw_ai(p, seed))
+            return
+        if getattr(self, "_picture_busy", False):
+            return
+        cap = self.viewport.capture(p)
+        seg = getattr(self, "_segmenter", None) if getattr(self, "_segmenter_model", None) == model else None
+        self._picture_busy = True
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        self.statusBar().showMessage("Looking at the picture…")
+        pid, mesh_id = p.id, id(p.mesh)
+
+        def job():
+            sg = seg or picture.Segmenter(*model)
+            sg.embed(cap["rgb"])
+            return sg
+
+        def finish():
+            self._picture_busy = False
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
+
+        def done(sg):
+            finish()
+            self._segmenter, self._segmenter_model = sg, model
+            self._picture, self._picture_key = cap, key
+            q = self.scene.get(pid)
+            r = self._region
+            if q is None or id(q.mesh) != mesh_id or r is None or not any(x is seed for x in r["seeds"]):
+                return
+            self._draw_cut(q, seed, self._draw_ai(q, seed) if self._picture_view_key(q) == key else None)
+
+        def failed(msg):
+            finish()
+            self._picture_key = None
+            self.log_msg("Select by Drawing: the AI didn't run: " + msg.splitlines()[0])
+            self._draw_cut(p, seed, None)
+        workers.submit(job, on_done=done, on_failed=failed)
+
+    def _draw_ai(self, p: Part, seed: dict):
+        """(the image model's outline of the drawn region, the faces its picture sees), or None."""
+        inn, out, painted = seed["parts"]
+        cap = self._picture
+        ids = cap["ids"]
+        n = len(inn)
+        ok = (ids >= 0) & (ids < n)
+        dom_px = np.zeros(ids.shape, bool)
+        dom_px[ok] = (inn | painted)[ids[ok]]
+        if dom_px.sum() < 50:
+            return None
+        ys, xs = np.nonzero(dom_px)
+        box = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+        s = self._surface(p)
+        core = drawsel.core(s, inn, painted)
+        core_px = np.zeros(ids.shape, bool)
+        core_px[ok] = core[ids[ok]]
+        if not core_px.any():
+            core_px[ok] = inn[ids[ok]]
+        out_px = np.zeros(ids.shape, bool)
+        out_px[ok] = out[ids[ok]]
+        out_px[:int(box[1]), :] = out_px[int(box[3]) + 1:, :] = False
+        out_px[:, :int(box[0])] = out_px[:, int(box[2]) + 1:] = False
+        k = 4                                            # points found on a coarser grid
+        pts = [(k * x + k / 2, k * y + k / 2, True) for x, y in picture.inside_points(core_px[::k, ::k], 3)]
+        pts += [(k * x + k / 2, k * y + k / 2, False) for x, y in picture.inside_points(out_px[::k, ::k], 3)]
+        if not any(q[2] for q in pts):
+            return None
+        return drawsel.pick_outline(s, inn, painted, core,
+                                    [picture.faces_in_outline(ids, o, n) for o in
+                                     picture.candidates(self._segmenter.outlines(pts, box=box), ok)],
+                                    picture.seen_faces(ids, n))
+
+    def _draw_cut(self, p: Part, seed: dict, ai) -> None:
+        s = self._surface(p)
+        inn, out, painted = seed["parts"]
+        with _Busy(self, "Finding the part's edge…"):
+            seed["mask"] = drawsel.cut(s, inn, out, painted, self._fold(p, s),
+                                       None if ai is None else ai[0], None if ai is None else ai[1])
+        seed["ai"] = ai is not None
+        self._update_region()
 
     def region_pick(self, pid: int, face: int, add: bool) -> None:
         p = self.scene.get(pid)
@@ -222,7 +367,7 @@ class ModifyingMixin:
             finish()
             if s.gpu_error and model[1] == "gpu" and not getattr(self, "_gpu_warned", False):
                 self._gpu_warned = True
-                self.log_msg(f"Select by Picture runs on the CPU: the GPU didn't start ({s.gpu_error}).")
+                self.log_msg(f"Select by Picture runs on the CPU ({s.gpu_error}).")
             self._segmenter, self._segmenter_model = s, model
             self._picture, self._picture_key = cap, key
             q = self.scene.get(pid)
@@ -261,11 +406,216 @@ class ModifyingMixin:
             else:
                 self._region = {"pid": p.id, "mesh": id(p.mesh), "seeds": [seed], "grows": [], "mask": None}
         try:
-            seed["cands"] = self._picture_candidates(p, seed)
+            seed["cands"] = seed["prim"] = self._picture_candidates(p, seed)
+            seed["refined"] = {}
         except Exception as e:
             QMessageBox.warning(self, APP, f"Select by Picture failed: {e}")
             return
         self._update_region()
+        self._picture_more(p, seed)
+
+    def picture_turn(self) -> bool:
+        """Preferences → Picture selection → All the way round (default on)."""
+        return str(self.settings.value("picture/turn", "true")).lower() in ("true", "1")
+
+    def _picture_more(self, p: Part, seed: dict) -> None:
+        """After the clicked view's outline: the full turn, or More views."""
+        if self.picture_turn():
+            self._picture_turn(p, seed)
+        else:
+            self._picture_refine(p, seed)
+
+    def _picture_turn(self, p: Part, seed: dict) -> None:
+        """Full turn (11): carry the outline the Outline slider picks round the model, in two
+        rings of pictures, in the background behind a modal progress dialog (it can take
+        minutes). Stop keeps the clicked view's outline."""
+        prim = seed.get("prim")
+        if not prim or getattr(self, "_picture_busy", False):
+            return
+        i = (0, len(prim) // 2, len(prim) - 1)[int(self.props.outline_size.value())]
+        if i in seed["refined"]:
+            return
+        r = self._region
+        surf = self._surface(p)
+        cam = self.viewport.camera
+        self._picture_busy = True                  # before the window shows (it lets events through)
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        dlg = QProgressDialog(self)
+        dlg.setWindowTitle("Select by Picture")
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setCancelButtonText("Stop")
+        dlg.setLabelText(f"Drawing {p.name} from all round…")
+        dlg.setRange(0, 0)
+        dlg.show()
+        QApplication.processEvents()
+        if "turn" not in seed:
+            for q in r["seeds"]:                       # only the latest outline keeps its pictures
+                if q is not seed:
+                    q.pop("turn", None)
+                    q.pop("views", None)
+            b = p.bounds()
+            centre = (b[0] + b[1]) / 2
+            rad = max(float(np.linalg.norm(b[1] - b[0])) / 2, 1.0)
+            dist = rad / (picture.TURN_FILL * math.sin(math.radians(cam.fov) / 2))
+            v = cam.eye() - centre
+            yaw0 = math.degrees(math.atan2(v[1], v[0]))
+            pitch0 = math.degrees(math.asin(max(-1.0, min(1.0, v[2] / max(float(np.linalg.norm(v)), 1e-9)))))
+            cams = [OrbitCamera(target=centre.copy(), distance=dist, yaw=(yaw0 + o) % 360.0, pitch=pt, fov=cam.fov)
+                    for o, pt in picture.turn_layout(pitch0)]
+            try:
+                caps = self.viewport.capture_views(p, cams)
+            except Exception as e:
+                self._picture_busy = False
+                QApplication.restoreOverrideCursor()
+                dlg.close()
+                dlg.deleteLater()
+                self.log_msg(f"Select by Picture: drawing the model from all round failed: {e}")
+                return
+            seed["turn"] = [{"rgb": c["rgb"], "ids": c["ids"].astype(np.int32), "eye": cm.eye()}
+                            for c, cm in zip(caps, cams)]
+            seed["eye0"] = cam.eye().copy()
+        seed["gen"] = gen = seed.get("gen", 0) + 1
+        views, seg, ids0 = seed["turn"], self._segmenter, self._picture["ids"]
+        fin, fout, eye0 = list(seed["faces_in"]), list(seed["faces_out"]), seed["eye0"]
+        first = any("emb" not in v for v in views)
+        dlg.setRange(0, len(views))
+        dlg.setValue(0)
+        what = (f"Looking at {p.name} from all round, in {len(views)} pictures" if first else
+                f"Following the outline round {p.name}")
+        dlg.setLabelText(what + "…\nPlease wait; Stop keeps the outline from this view.")
+        stop = [False]
+        dlg.canceled.connect(lambda: stop.__setitem__(0, True))
+        t0 = time.monotonic()
+
+        def on_progress(text):
+            j, total = (int(x) for x in text.split("/"))
+            dlg.setValue(j)
+            left = ""
+            if j >= 2 and j < total:
+                sec = (time.monotonic() - t0) / j * (total - j)
+                left = f", about {max(1, round(sec / 60))} min left" if sec >= 90 else f", about {max(1, round(sec))} s left"
+            dlg.setLabelText(f"{what}: {j} of {total}{left}.\nPlease wait; Stop keeps the outline from this view.")
+
+        def job(progress):
+            return picture.propagate(seg, views, prim[i], ids0, eye0, surf, fin, fout,
+                                     progress=lambda a, b: progress(f"{a}/{b}"), cancelled=lambda: stop[0])
+
+        def finish():
+            self._picture_busy = False
+            QApplication.restoreOverrideCursor()
+            dlg.close()
+            dlg.deleteLater()
+
+        def done(res):
+            finish()
+            rr = self._region
+            if seed.get("gen") != gen or rr is None or not any(q is seed for q in rr["seeds"]):
+                return
+            m = picture.drop_specks(surf, res, fin)
+            m[fin] = True
+            m[fout] = False
+            seed["refined"][i] = m
+            seed["cands"] = [seed["refined"].get(j, c) for j, c in enumerate(prim)]
+            self._update_region()
+            self.statusBar().showMessage(f"Took {time.monotonic() - t0:.0f} s to look all the way round.", 8000)
+            self._picture_refine_last()       # the slider may have moved meanwhile
+
+        def failed(msg):
+            finish()
+            if "Cancelled" in msg:
+                self.statusBar().showMessage("Stopped: the outline is from this view only.", 8000)
+                return
+            seed.pop("turn", None)
+            self.log_msg("Select by Picture: looking all the way round failed: " + msg.splitlines()[0])
+        workers.submit(job, on_done=done, on_failed=failed, on_progress=on_progress)
+
+    def picture_views(self) -> int:
+        """Preferences → Picture selection → Views (the clicked one included)."""
+        try:
+            n = int(self.settings.value("picture/views", picture.VIEWS))
+        except (TypeError, ValueError):
+            n = picture.VIEWS
+        return max(1, min(picture.MAX_VIEWS, n))
+
+    def _picture_cameras(self, p: Part, mask: np.ndarray, k: int) -> list:
+        """k cameras round the middle of a candidate's faces (11, More views)."""
+        surf = self._surface(p)
+        if k <= 0 or not mask.any():
+            return []
+        c, a = surf.centers[mask], surf.areas[mask]
+        centre = (c * a[:, None]).sum(axis=0) / max(a.sum(), 1e-12)
+        r = max(float(np.linalg.norm(c - centre, axis=1).max()), 1.0)
+        cam = self.viewport.camera
+        v = cam.eye() - centre
+        d0 = float(np.linalg.norm(v))
+        d = min(r / (picture.FILL * math.sin(math.radians(cam.fov) / 2)), d0)
+        yaw = math.degrees(math.atan2(v[1], v[0]))
+        pitch = math.degrees(math.asin(max(-1.0, min(1.0, v[2] / max(d0, 1e-9)))))
+        return [OrbitCamera(target=centre.copy(), distance=d, yaw=(yaw + dy) % 360.0,
+                            pitch=float(np.clip(pitch + dp, -85.0, 85.0)), fov=cam.fov)
+                for dy, dp in picture.VIEW_TURNS[:k]]
+
+    def _picture_refine(self, p: Part, seed: dict) -> None:
+        """More views (11): vote on the outline the Outline slider picks from other angles, in
+        the background; the clicked view's outline shows meanwhile. The others are refined when
+        the slider moves to them (decoding only, by then)."""
+        n = self.picture_views()
+        if n <= 1 or not seed.get("prim") or getattr(self, "_picture_busy", False):
+            return
+        prim = seed["prim"]
+        i = (0, len(prim) // 2, len(prim) - 1)[int(self.props.outline_size.value())]
+        if i in seed["refined"]:
+            return
+        r = self._region
+        if "views" not in seed:
+            for q in r["seeds"]:                       # only the latest outline keeps its views
+                if q is not seed:
+                    q.pop("views", None)
+            cams = self._picture_cameras(p, seed["prim"][-1], n - 1)
+            caps = self.viewport.capture_views(p, cams)
+            seed["views"] = [{"rgb": c["rgb"], "ids": c["ids"].astype(np.int32)} for c in caps]
+        seed["gen"] = gen = seed.get("gen", 0) + 1
+        seg, ids0, surf = self._segmenter, self._picture["ids"], self._surface(p)
+        views = seed["views"]
+        fin, fout = list(seed["faces_in"]), list(seed["faces_out"])
+        first = any("emb" not in v for v in views)
+        self._picture_busy = True
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        if first:
+            self.statusBar().showMessage(f"Looking from {len(views)} more views…")
+
+        def job():
+            out = picture.refine(seg, views, [prim[i]], ids0, surf.areas, fin, fout)[0]
+            for v in views:
+                v.pop("rgb", None)                     # embedded: the picture isn't needed again
+            return out
+
+        def finish():
+            self._picture_busy = False
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
+
+        def done(res):
+            finish()
+            rr = self._region
+            if seed.get("gen") != gen or rr is None or not any(q is seed for q in rr["seeds"]):
+                return
+            m = picture.drop_specks(surf, res, fin)
+            m[fin] = True
+            m[fout] = False
+            seed["refined"][i] = m
+            seed["cands"] = [seed["refined"].get(j, c) for j, c in enumerate(prim)]
+            self._update_region()
+            self._picture_refine_last()       # the slider may have moved meanwhile
+
+        def failed(msg):
+            finish()
+            seed.pop("views", None)
+            self.log_msg("Select by Picture: looking from more views failed: " + msg.splitlines()[0])
+        workers.submit(job, on_done=done, on_failed=failed)
 
     def _picture_candidates(self, p: Part, seed: dict) -> list:
         """The image model's outlines for a picture seed's points, as face masks, smallest
@@ -285,6 +635,7 @@ class ModifyingMixin:
 
     def clear_region(self) -> None:
         self._region = None
+        self.viewport.draw_lines = None
         self._region_key = None
         self._preview_gen += 1
         self.viewport.region_mesh = None
@@ -345,12 +696,24 @@ class ModifyingMixin:
         st.setValue("modify/contourFold", int(self.props.contour_angle.value()))
         st.setValue("modify/partEdges", int(self.props.part_edges.value()))
         st.setValue("modify/outline", int(self.props.outline_size.value()))
+        st.setValue("modify/drawAI", bool(self.props.draw_ai.isChecked()))
         for k, v in self.cut_settings().items():
             st.setValue(f"modify/{k}", float(v))
         if self._region is not None:
             self._update_region()
+            self._picture_refine_last()
         else:
             self._show_contours()
+
+    def _picture_refine_last(self) -> None:
+        """Refine the latest picture outline at the Outline slider's position, if it isn't."""
+        r = self._region
+        seed = r["seeds"][-1] if r and r["seeds"] else None
+        if seed is not None and seed.get("kind") == "picture" and seed.get("prim") \
+                and getattr(self, "_picture", None) is not None and seed.get("view") == self._picture_key:
+            p = self.scene.get(r["pid"])
+            if p is not None:
+                self._picture_more(p, seed)
 
     def load_modify_settings(self) -> None:
         pp, st = self.props, self.settings
@@ -387,8 +750,17 @@ class ModifyingMixin:
         pp.select_by.blockSignals(True)
         pp.select_by.setCurrentIndex(i)
         pp.select_by.blockSignals(False)
+        pp.brush.blockSignals(True)
+        pp.brush.setValue(int(round(float(st.value("modify/brush", 2.0)) * 2)))
+        pp.brush_label.setText(f"{pp.brush.value() / 2:g} mm")
+        pp.brush.blockSignals(False)
+        self.viewport.brush_mm = pp.brush.value() / 2
+        pp.draw_ai.blockSignals(True)
+        pp.draw_ai.setChecked(pp.draw_ai.isEnabled() and str(st.value("modify/drawAI", False)).lower() not in ("false", "0"))
+        pp.draw_ai.blockSignals(False)
         pp.show_select_by()
         self.viewport.region_exclude = self.select_by() == "picture"
+        self.viewport.region_draw = self.select_by() == "draw"
 
     def _surface(self, p: Part) -> modify.Surface:
         """The part's surface in world space; cached per placement."""
@@ -418,6 +790,9 @@ class ModifyingMixin:
                 mask |= lab == lab[f]
             elif q["kind"] == "picture":
                 mask |= picture.pick(q["cands"], int(self.props.outline_size.value()))
+            elif q["kind"] == "draw":
+                if q.get("mask") is not None:
+                    mask |= q["mask"]
             else:
                 barrier = self._contours(p, s) if self.props.stop_contours.isChecked() else None
                 mask |= modify.grow_region(s, f, float(self.props.spread.value()), barrier=barrier)

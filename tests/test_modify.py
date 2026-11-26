@@ -63,6 +63,21 @@ def test_fill_holes_takes_surrounded_patches_only():
     assert not filled[s.normals[:, 2] < -0.5].any()             # the inside shell untouched
 
 
+def test_fill_holes_leaves_the_ends_of_a_ring_alone():
+    """A band selected all the way round a cylinder splits it in two: neither end is a hole."""
+    v, f = trimesh.remesh.subdivide_to_size(*(lambda c: (c.vertices, c.faces))(
+        trimesh.creation.cylinder(radius=10, height=40, sections=48)), max_edge=2.0)
+    m = trimesh.Trimesh(v, f)
+    s = modify.surface(m, np.eye(4))
+    ring = (np.abs(s.centers[:, 2] - 5) < 2) & (np.abs(s.normals[:, 2]) < 0.5)
+    assert np.array_equal(modify.fill_holes(s, ring), ring)
+    holey = ring.copy()
+    mid = np.nonzero(ring & (np.abs(s.centers[:, 2] - 5) < 0.6))[0]
+    holey[mid[::7]] = False                                     # pinholes in its middle still close
+    assert holey.sum() < ring.sum()
+    assert np.array_equal(modify.fill_holes(s, holey), ring)
+
+
 def test_cutter_follows_outline_and_opens_the_cavity():
     m = hollow_ball()
     s = modify.surface(m, np.eye(4))

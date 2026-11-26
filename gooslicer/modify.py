@@ -226,7 +226,8 @@ def _tidy(t: trimesh.Trimesh) -> trimesh.Trimesh:
 def fill_holes(s: Surface, mask: np.ndarray) -> np.ndarray:
     """`mask` plus the unselected patches it surrounds (bumps inside the selected area): every
     unselected connected patch bordering the selection except the largest (the rest of the
-    model). Shells not touching the selection (a hollow's inside) are left alone."""
+    model), and smaller than the selection (a ring round a cylinder doesn't make either end a
+    hole). Shells not touching the selection (a hollow's inside) are left alone."""
     n = len(mask)
     a = s.adjacency
     un = ~mask
@@ -240,6 +241,7 @@ def fill_holes(s: Surface, mask: np.ndarray) -> np.ndarray:
         return mask.copy()
     area = np.bincount(lab, weights=s.areas, minlength=lab.max() + 1)
     fill = comps[comps != comps[np.argmax(area[comps])]]
+    fill = fill[area[fill] < s.areas[mask].sum()]
     return mask | np.isin(lab, fill)
 
 

@@ -2117,6 +2117,16 @@ def test_picture_preferences(app, tmp_path, monkeypatch):
     d.show_page("Picture selection")
     assert [d.picture_model.itemData(i) for i in range(d.picture_model.count())] == list(picture.MODELS)
     assert not d.picture_device.model().item(1).isEnabled() and "ROCm 7" in d.picture_gpu_note.text()
+    assert d.picture_views.value() == 3 and w.picture_views() == 3          # More views (11)
+    d.picture_views.setValue(7)
+    assert int(w.settings.value("picture/views")) == 7 and w.picture_views() == 7
+    w.settings.setValue("picture/views", "nonsense")
+    assert w.picture_views() == 3
+    w.settings.remove("picture/views")
+    assert d.picture_turn.isChecked() and w.picture_turn() and not d.picture_views.isEnabled()
+    d.picture_turn.setChecked(False)
+    assert not w.picture_turn() and d.picture_views.isEnabled()
+    w.settings.remove("picture/turn")
     d.picture_model.setCurrentIndex(d.picture_model.findData("sam2-small"))
     assert s.value("picture/model") == "sam2-small" and "Not downloaded yet" in d.picture_status.text()
     assert d.picture_download.isVisibleTo(d)
