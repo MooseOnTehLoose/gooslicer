@@ -20,6 +20,8 @@ VIEW_COLORS = (
      "build area, and the text of their labels"),
     ("flaw_selected", "Selected flaw lines and labels", (0.95, 0.20, 0.18), 1.0,
      "A flaw's line and label outline after its label is clicked"),
+    ("region", "Selected surface", (0.30, 0.85, 0.35), 1.0,
+     "The surface picked with Select surface (Models tab → Modifying) and its cut plane"),
     ("cut", "Layer slider cut", (0.85, 0.15, 0.55), 1.0,
      "The inside of a part cut open by the layer slider (the 3D view's right side), so the cut "
      "reads as a cross-section"),

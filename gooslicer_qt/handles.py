@@ -91,7 +91,7 @@ class HandlesMixin:
 
     # ------------------------------------------------------------ geometry
     def _handles_allowed(self) -> bool:
-        return not (self.support_mode or self.hole_mode or self.lay_flat_mode)
+        return not (self.support_mode or self.hole_mode or self.lay_flat_mode or self.region_mode)
 
     def _selected_parts(self) -> list:
         return [p for p in (self.scene.get(i) for i in self.selected) if p]

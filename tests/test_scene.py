@@ -68,6 +68,23 @@ def test_analyze_and_repair_hole_flip_duplicate():
     assert r2.volume == pytest.approx(1000)
 
 
+def test_repair_keeps_a_hollow_cavity():
+    """A cavity's wall faces into the cavity; repair must not turn it outwards (that fills the
+    hollow back in). Nested twice: a solid ball inside the cavity faces out again."""
+    outer = trimesh.creation.icosphere(subdivisions=3, radius=10)
+    cavity = trimesh.creation.icosphere(subdivisions=3, radius=8)
+    cavity.invert()
+    core = trimesh.creation.icosphere(subdivisions=2, radius=3)
+    hollow = trimesh.util.concatenate([outer, cavity, core])
+    want = outer.volume + cavity.volume + core.volume
+    bad = trimesh.Trimesh(hollow.vertices, np.vstack([hollow.faces, hollow.faces[:1]]), process=False)
+    assert not M.analyze(bad).ok                     # a duplicate triangle: repair runs
+    fixed = M.repair(bad)
+    assert M.analyze(fixed).ok and fixed.volume == pytest.approx(want, rel=1e-6)
+    flipped = trimesh.util.concatenate([outer, trimesh.creation.icosphere(subdivisions=3, radius=8), core])
+    assert M.repair(flipped).volume == pytest.approx(want, rel=1e-6)   # a cavity facing out is turned in
+
+
 def test_repair_inverted():
     box = trimesh.creation.box((10, 10, 10))
     box.invert()

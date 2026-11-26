@@ -111,7 +111,7 @@ Each phase ends with passing tests and a short demo. Specs are written before th
     - make orientation consistent with one breadth-first walk over all shells;
     - close every hole: a triangle for three edges, otherwise a fan from a new vertex at the loop's centre;
     - if a crumpled patch still can't be oriented (a twist), cut it out with a ring of neighbours that widens each try, and close it again;
-    - turn each shell outwards by its signed volume.
+    - turn each shell outwards by its signed volume, except a shell inside an odd number of others (a hollow's cavity wall, found by winding number), which is turned to face into its cavity (2026-11-25; turning it out filled hollowed models in).
 
     These run up to three passes, until every edge has two triangles running opposite ways and nothing is duplicated.
     `samples/Lisa_head_C.stl` starts with 87 shells, 171 hole edges, 60 back-to-back pairs, a fin and a twist. It ends as one closed shell with its volume unchanged (11,693 mm³), in about 4 s; trimesh's repair took 33 s and left it broken. A fan over a strongly curved or concave hole can cross itself; the slicer's non-zero fill copes with that.

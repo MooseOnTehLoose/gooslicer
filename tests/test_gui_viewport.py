@@ -174,7 +174,8 @@ def test_repair_on_import(app, win, tmp_path):
     one is left alone; the preference turns it off."""
     from gooslicer_qt.preferences import PreferencesDialog
     assert win.auto_repair()
-    wait_import(app, win, [box_file(tmp_path, broken=True, name="holey.stl"), box_file(tmp_path)])
+    wait_import(app, win, [box_file(tmp_path, broken=True, name="holey.stl")])   # one file per wait
+    wait_import(app, win, [box_file(tmp_path)])
     by = {p.name: p for p in win.scene.parts}
     assert by["holey"].repaired and win.reports[id(by["holey"].mesh)].ok
     assert not by["box"].repaired
@@ -960,3 +961,89 @@ def test_layer_slider_hides_above_cut(app, win, tmp_path):
     win.undo.undo()                                         # plate empty again: slider hidden, all shown
     pump(app)
     assert sl.isHidden() and vp.clip_z is None
+
+
+def wait_cut(app, w):
+    loop = QEventLoop()
+    got = []
+    w.cutFinished.connect(lambda ok: (got.append(ok), loop.quit()))
+    QTimer.singleShot(60000, loop.quit)
+    started = w.cut_selection()
+    if started:
+        loop.exec()
+    w.cutFinished.disconnect()
+    return bool(got and got[0])
+
+
+def test_modifying_select_and_cut(app, win, tmp_path):
+    """Models tab → Modifying (11): the Mesh pane starts folded with its verdict; Select surface
+    picks a cap that the spread grows; Cut out selection cuts along its outline into the
+    cavity of a hollow ball, giving two parts in one undo step."""
+    import manifold3d as m3
+    import trimesh
+
+    def mf(m):
+        return m3.Manifold(m3.Mesh(np.asarray(m.vertices, np.float32), np.asarray(m.faces, np.uint32)))
+    shell = (mf(trimesh.creation.icosphere(subdivisions=4, radius=12))
+             - mf(trimesh.creation.icosphere(subdivisions=4, radius=10.5))).to_mesh()
+    f = tmp_path / "ball.stl"
+    trimesh.Trimesh(np.asarray(shell.vert_properties)[:, :3], np.asarray(shell.tri_verts)).export(f)
+    assert wait_import(app, win, [f]) == 1
+    p = win.scene.parts[0]
+    win.select([p.id])
+    pump(app)
+    pp = win.props
+    assert pp.mesh_btn.text() == "Mesh: OK" and pp.mesh_box.isHidden() and not pp.mesh_btn.isChecked()
+    assert not pp.cut_btn.isEnabled() and pp.region_info.text() == "Nothing selected"
+    assert pp.cut_depth.value() == 3.0 and pp.cut_smooth.value() == 0.5 and pp.cut_gap.value() == 0.1
+    pp.select_btn.click()
+    vp = win.viewport
+    assert vp.region_mode and vp.rings() is None
+    top = p.bounds()[1].copy()
+    top[:2] = p.bounds().mean(axis=0)[:2]
+    vp.set_view(-90, 89)                                     # from above
+    pump(app)
+    at = project(vp, top)
+    mouse(vp, QEvent.MouseButtonPress, at)
+    mouse(vp, QEvent.MouseButtonRelease, at, Qt.LeftButton, Qt.NoButton)
+    r = win._region
+    assert r is not None and r["pid"] == p.id and vp.region_mesh is not None
+    n35 = int(r["mask"].sum())
+    assert "triangles" in pp.region_info.text() and pp.cut_btn.isEnabled()
+    pp.spread.setValue(60)
+    assert int(win._region["mask"].sum()) > n35 and int(win.settings.value("modify/spread")) == 60
+    pp.spread.setValue(40)
+    loop = QEventLoop()                                      # the cutter preview follows
+    QTimer.singleShot(1500, loop.quit)
+    loop.exec()
+    assert vp.cut_preview is not None and vp.cut_preview.is_watertight
+    from PySide6.QtTest import QTest
+    QTest.keyClick(vp, Qt.Key_Escape)                        # stops picking, keeps the selection
+    assert not vp.region_mode and not pp.select_btn.isChecked() and win._region is not None
+    vol = p.mesh.volume
+    assert wait_cut(app, win)
+    assert len(win.scene.parts) == 2 and win._region is None and vp.region_mesh is None
+    piece = next(q for q in win.scene.parts if q.id != p.id)
+    assert piece.name == "ball piece" and win.primary() is piece
+    assert win.reports[id(piece.mesh)].ok and win.reports[id(p.mesh)].ok
+    # the fit gap took a 0.1 mm ring out: the two add up to a little less than the ball
+    assert 0.9 * vol < piece.mesh.volume + p.mesh.volume < vol
+    assert piece.mesh.volume < 0.2 * vol                     # a curved cap of wall, no floor
+    assert abs(piece.bounds()[0][2]) < 1e-6                  # cut side down on the plate
+    assert piece.bounds()[0][0] > p.bounds()[1][0]           # beside the rest
+    win.undo.undo()                                          # one step
+    assert len(win.scene.parts) == 1 and abs(win.scene.parts[0].mesh.volume - vol) < 1e-6 * vol
+
+
+def test_cut_refuses_open_mesh(app, win, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    win.settings.setValue("import/autoRepair", False)
+    wait_import(app, win, [box_file(tmp_path, broken=True, name="holey.stl")])
+    p = win.scene.parts[0]
+    win.select([p.id])
+    top = int(np.argmax(p.world_mesh().triangles_center[:, 2]))
+    win.region_pick(p.id, top, False)
+    assert win._region["mask"].any()
+    said = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: said.append(a[2]))
+    assert not win.cut_selection() and "Repair it first" in said[0] and len(win.scene.parts) == 1

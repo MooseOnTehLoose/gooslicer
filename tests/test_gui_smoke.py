@@ -2052,7 +2052,7 @@ def test_view_color_preferences(app, tmp_path):
     w.prefs_action.trigger()
     d = w._preferences
     d.show_page("3D view colors")
-    assert set(d.color_buttons) == {"model", "selected", "support", "flaw", "flaw_selected", "cut"}
+    assert set(d.color_buttons) == {"model", "selected", "support", "flaw", "flaw_selected", "region", "cut"}
     assert not d.color_sliders["cut"].isEnabled()           # the cut is always drawn solid
     assert d.color_sliders["support"].value() == 50 and d.color_sliders["model"].value() == 0
     assert d.color_buttons["model"].text() == C.default_color("model").name()

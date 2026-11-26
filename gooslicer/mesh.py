@@ -353,6 +353,31 @@ def _clean(f: np.ndarray) -> bool:
                 and len(np.unique(np.sort(f, axis=1), axis=0)) == len(f))
 
 
+def _nesting(v: np.ndarray, f: np.ndarray, lab: np.ndarray, k: int) -> np.ndarray:
+    """How many other shells each shell lies inside: one vertex of each, tested against every
+    other shell whose box holds it by the winding number (summed solid angles; orientation
+    doesn't matter, so |w| ≈ 1 inside, 0 outside)."""
+    out = np.zeros(k, int)
+    if k < 2:
+        return out
+    shells = [f[lab == i] for i in range(k)]
+    boxes = [(v[np.unique(s)].min(axis=0), v[np.unique(s)].max(axis=0)) for s in shells]
+    for i in range(k):
+        q = v[shells[i][0, 0]]
+        for j in range(k):
+            if i == j or not (np.all(q > boxes[j][0]) and np.all(q < boxes[j][1])):
+                continue
+            t = v[shells[j]] - q
+            a, b, c = t[:, 0], t[:, 1], t[:, 2]
+            la, lb, lc = (np.linalg.norm(x, axis=1) for x in (a, b, c))
+            num = np.einsum("ij,ij->i", a, np.cross(b, c))
+            den = la * lb * lc + np.einsum("ij,ij->i", a, b) * lc + np.einsum("ij,ij->i", a, c) * lb \
+                + np.einsum("ij,ij->i", b, c) * la
+            w = 2 * np.arctan2(num, den).sum() / (4 * np.pi)
+            out[i] += abs(w) > 0.5
+    return out
+
+
 def repair(mesh: trimesh.Trimesh, progress=None) -> trimesh.Trimesh:
     """Return a repaired copy: weld vertices; drop degenerate triangles, duplicates (a pair facing
     opposite ways is a zero-thickness wall: both go), debris (shells with no thickness or smaller
@@ -400,8 +425,12 @@ def repair(mesh: trimesh.Trimesh, progress=None) -> trimesh.Trimesh:
     say("turning shells outwards")
     lab, k = _face_labels(f)
     if k:
-        inward = _signed_volumes(v, f, lab, k) < 0
-        f[inward[lab]] = f[inward[lab]][:, ::-1]
+        # a shell inside an odd number of others is a cavity's wall (a hollowed model): it faces
+        # into the cavity, i.e. its signed volume is negative; every other shell faces out
+        vol = _signed_volumes(v, f, lab, k)
+        want_neg = _nesting(v, f, lab, k) % 2 == 1
+        flip = (vol < 0) != want_neg
+        f[flip[lab]] = f[flip[lab]][:, ::-1]
     out = trimesh.Trimesh(vertices=v, faces=f, process=False)
     out.remove_unreferenced_vertices()
     return out

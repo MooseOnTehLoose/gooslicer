@@ -6,7 +6,7 @@ from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QPushButton, QSizePolicy, QStyle, QStyledItemDelegate,
+                               QListWidgetItem, QPushButton, QSizePolicy, QSlider, QStyle, QStyledItemDelegate,
                                QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget)
 
 from gooslicer.mesh import MeshReport
@@ -332,13 +332,76 @@ class PropertiesPanel(QWidget):
         lay.addLayout(auto_row)
 
         g = QGroupBox("Mesh")
-        ml = QFormLayout(g)
+        gl = QVBoxLayout(g)
+        # folded away like Position, size and scale; the button carries the check's verdict
+        self.mesh_btn = disclosure_button("Mesh", "The mesh check (holes, flipped or stray triangles) and Repair")
+        self.mesh_btn.toggled.connect(self.set_mesh_visible)
+        gl.addWidget(self.mesh_btn)
+        self.mesh_box = QWidget()
+        gl.addWidget(self.mesh_box)
+        ml = QFormLayout(self.mesh_box)
+        ml.setContentsMargins(0, 0, 0, 0)
         self.mesh_info = QLabel("–")
         self.mesh_info.setWordWrap(True)
         self.mesh_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.btn_repair = QPushButton("Repair")
         ml.addRow(self.mesh_info)
         ml.addRow(self.btn_repair)
+        self.mesh_box.setVisible(False)
+        lay.addWidget(g)
+
+        # Modifying (11): select part of the surface by curvature, cut it off as its own part
+        g = QGroupBox("Modifying")
+        g.setObjectName("modifyingBox")
+        fl = QFormLayout(g)
+        self.select_btn = QPushButton("Select surface")
+        self.select_btn.setCheckable(True)
+        self.select_btn.setToolTip("Click a part's surface to select the area around the click, up to "
+                                   "where it curves away; Ctrl+click adds another area. Esc stops.")
+        self.clear_region_btn = QPushButton("Clear")
+        self.clear_region_btn.setToolTip("Clear the selected surface")
+        row = QHBoxLayout()
+        fl.addRow(row)                      # attached before it gets widgets (PySide ownership)
+        row.addWidget(self.select_btn, 1)
+        row.addWidget(self.clear_region_btn)
+        self.spread = QSlider(Qt.Horizontal)
+        self.spread.setRange(5, 90)
+        self.spread.setValue(35)
+        self.spread.setToolTip("How far the selection spreads: surface turned less than this from "
+                               "where you clicked is selected")
+        self.spread_label = QLabel("35°")
+        self.spread_label.setMinimumWidth(32)
+        srow = QHBoxLayout()
+        fl.addRow("Spread", srow)
+        srow.addWidget(self.spread, 1)
+        srow.addWidget(self.spread_label)
+        self.region_info = QLabel("Nothing selected")
+        self.region_info.setWordWrap(True)
+        fl.addRow(self.region_info)
+        self.cut_depth = _spin(0.2, 100, 2, " mm", 0.5)
+        self.cut_depth.setValue(3.0)
+        self.cut_depth.setToolTip("How far the cut reaches below the selection's lowest edge. On a "
+                                  "hollowed part, more than its wall thickness opens the cavity.")
+        fl.addRow("Cut depth", self.cut_depth)
+        self.cut_smooth = _spin(0, 5, 2, " mm", 0.1)
+        self.cut_smooth.setValue(0.5)
+        self.cut_smooth.setToolTip("Round off the outline's small notches and spikes (0: follow every "
+                                   "triangle edge)")
+        fl.addRow("Smoothing", self.cut_smooth)
+        self.cut_gap = _spin(0, 1, 2, " mm", 0.05)
+        self.cut_gap.setValue(0.1)
+        self.cut_gap.setToolTip("Room left between the piece and the part all round its cut, for "
+                                "glue (0: an exact fit)")
+        fl.addRow("Fit gap", self.cut_gap)
+        self.lay_cut = QCheckBox("Lay cut side on the plate")
+        self.lay_cut.setChecked(True)
+        self.lay_cut.setToolTip("Turn the new piece so its cut side faces the plate, beside the part")
+        fl.addRow(self.lay_cut)
+        self.cut_btn = QPushButton("Cut out selection")
+        self.cut_btn.setToolTip("Cut the selection off along its outline (shown in the 3D view) as a "
+                                "new part, to print separately and glue back on. The cut follows "
+                                "the outline's curves, so the piece fits back only one way.")
+        fl.addRow(self.cut_btn)
         lay.addWidget(g)
         lay.addStretch(1)
 
@@ -353,9 +416,22 @@ class PropertiesPanel(QWidget):
         self.btn_center.clicked.connect(lambda: self._edit("Center", self._center))
         self.btn_reset.clicked.connect(lambda: self._edit("Reset transform", self._reset))
         self.btn_repair.clicked.connect(win.repair_selected)
+        self.select_btn.toggled.connect(win.set_region_mode)
+        self.clear_region_btn.clicked.connect(win.clear_region)
+        self.spread.valueChanged.connect(lambda v: (self.spread_label.setText(f"{v}°"), win.region_settings_changed()))
+        for w in (self.cut_depth, self.cut_smooth, self.cut_gap):
+            w.valueChanged.connect(lambda _v: win.region_settings_changed())
+        self.lay_cut.toggled.connect(lambda on: win.settings.setValue("modify/layFlat", bool(on)))
+        self.cut_btn.clicked.connect(win.cut_selection)
         self.btn_auto.clicked.connect(win.auto_position)
         self.btn_arrange.clicked.connect(win.arrange_all)
         self.set_part(None, None)
+
+    def set_mesh_visible(self, on: bool) -> None:
+        self.mesh_box.setVisible(on)
+        self.mesh_btn.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        if self.mesh_btn.isChecked() != on:
+            self.mesh_btn.setChecked(on)
 
     def set_transform_visible(self, on: bool) -> None:
         self.transform.setVisible(on)
@@ -373,9 +449,12 @@ class PropertiesPanel(QWidget):
         if getattr(self.win, "_orienting", False):
             self.btn_auto.setEnabled(False)             # one Auto Position at a time
         self.btn_arrange.setEnabled(bool(self.win.scene.parts))    # works on all parts, selected or not
+        self.spread.setEnabled(enabled)
         if not enabled:
             self.title.setText("No part selected")
             self.mesh_info.setText("–")
+            self.mesh_btn.setText("Mesh")
+            self.win.update_region_panel()
             return
         self.title.setText(f"<b>{part.name}</b>")
         lo, hi = part.bounds()
@@ -386,12 +465,16 @@ class PropertiesPanel(QWidget):
                 w.setValue(float(x))
                 w.blockSignals(False)
         self.set_report(report)
+        self.win.update_region_panel()
 
     def set_report(self, r: MeshReport | None):
         if r is None:
             self.mesh_info.setText("Analysing…")
+            self.mesh_btn.setText("Mesh: checking…")
             self.btn_repair.setEnabled(False)
             return
+        n = len(r.problems())
+        self.mesh_btn.setText("Mesh: OK" if r.ok else f"Mesh: ⚠ {max(n, 1)} problem{'s' if n != 1 else ''}")
         vol = f"{r.volume:,.1f} mm³" if r.volume is not None else "n/a (not closed)"
         status = "✔ printable mesh" if r.ok else "⚠ " + "; ".join(r.problems())
         self.mesh_info.setText(f"{r.triangles:,} triangles · {r.components} shell(s)<br>"

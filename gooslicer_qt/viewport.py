@@ -58,6 +58,7 @@ void main(){ frag = color; }
 COL_OUTSIDE = (0.90, 0.25, 0.22)
 COL_ISLAND = (0.92, 0.16, 0.14)       # unsupported islands, after the island check
 BACK_FACE = (0.85, 0.15, 0.55)         # inside / back faces (no layer cut)
+CUT_PLANE_ALPHA = 0.35                 # the cut plane preview (11)
 OPAQUE = 0.999                         # an opacity at least this is drawn solid
 GUIDE_DIM = 0.35                       # island guide lines where something is in front of them
 COL_HOLE = (0.15, 0.45, 1.0)           # drain-hole preview (blue)
@@ -233,6 +234,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     selectionChanged = Signal(list)                # [part ids]
     moveFinished = Signal(object)                  # {id: (before PartState, after PartState)}
     layFlatPicked = Signal(int, int)               # part id, local face index
+    regionPicked = Signal(int, int, bool)          # part id, local face index, add (Ctrl)
+    regionModeEnded = Signal()
     holePicked = Signal(int, int, object)          # part id, local face index, world hit point
     holeModeEnded = Signal()
     escapePressed = Signal()                       # Esc with no mode or drag to cancel
@@ -257,6 +260,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self.camera = OrbitCamera()
         self.selected: list[int] = []
         self.lay_flat_mode = False
+        self.region_mode = False                   # Select surface (11): clicks pick regions
+        self.region_mesh = None                    # world trimesh of the selected surface
+        self.cut_preview = None                    # world trimesh: the cutter, drawn translucent
         self.hole_mode = False
         self.support_mode = False
         self._spress = None             # support mode: a left press waiting to become a click or a drag
@@ -393,6 +399,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         live.update({id(m): m for m, _ in self._extras})
         live.update({id(m): m for m in self.island_meshes})
         live.update({id(m): m for m in self.cavity_meshes})
+        for m in (self.region_mesh, self.cut_preview):
+            if m is not None:
+                live[id(m)] = m
         if self.hole_preview is not None:
             live[id(self.hole_preview)] = self.hole_preview
         for k in [k for k in self._buffers if k not in live]:
@@ -517,6 +526,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         # supports first when solid (they hide what's behind them), last when see-through
         self._draw_meshes(sup if sa >= OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha, cull=True)
         self._draw_meshes(clear, vp, u_mvp, u_n, u_c, u_alpha, layered=True)
+        self._draw_region(vp, u_mvp, u_n, u_c, u_alpha)
         self._draw_meshes(sup if sa < OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha)
         self._draw_selected_guides(vp)
         if self.hole_preview is not None:
@@ -535,6 +545,38 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 self._draw_drag_marker(painter, vp)
         finally:
             painter.end()
+
+    def _draw_region(self, vp, u_mvp, u_n, u_c, u_alpha) -> None:
+        """The selected surface over its part (pulled forward, as the island overlay) and the
+        cutter (the solid the cut takes away) drawn translucent (11)."""
+        if self.region_mesh is None and self.cut_preview is None:
+            return
+        rgb = colormod.rgba(self.colors["region"])[:3]
+        GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, vp.astype(np.float32))
+        GL.glUniformMatrix4fv(u_n, 1, GL.GL_TRUE, np.eye(4, dtype=np.float32))
+        GL.glUniform3f(u_c, *rgb)
+        if self.region_mesh is not None:
+            GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
+            GL.glPolygonOffset(-1.0, -2.0)
+            GL.glDepthFunc(GL.GL_LEQUAL)
+            GL.glEnable(GL.GL_CULL_FACE)
+            GL.glCullFace(GL.GL_BACK)
+            self._buffers[id(self.region_mesh)][1].draw()
+            GL.glDisable(GL.GL_CULL_FACE)
+            GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
+            GL.glDepthFunc(GL.GL_LESS)
+        if self.cut_preview is not None:
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)
+            GL.glDepthMask(GL.GL_FALSE)
+            GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *rgb)
+            GL.glUniform1f(u_alpha, CUT_PLANE_ALPHA)
+            self._buffers[id(self.cut_preview)][1].draw()
+            GL.glUniform1f(u_alpha, 1.0)
+            GL.glDepthMask(GL.GL_TRUE)
+            GL.glDisable(GL.GL_BLEND)
+            back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
+            GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *back)
 
     def _draw_meshes(self, items, vp, u_mvp, u_n, u_c, u_alpha, cull: bool = False,
                      layered: bool = False) -> None:
@@ -884,7 +926,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     def rings(self):
         """(centre, radius) of the rotation rings around the selection, or None."""
         if (not self.show_rings or self.handle_mode != "rotate" or self.support_mode or self.hole_mode
-                or self.lay_flat_mode):
+                or self.lay_flat_mode or self.region_mode):
             return None
         parts = [p for p in (self.scene.get(i) for i in self.selected) if p]
         if not parts:
@@ -1126,6 +1168,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                     self.unsetCursor()
                     self.layFlatPicked.emit(part.id, face)
                 return
+            if self.region_mode:
+                if part is not None:
+                    self.regionPicked.emit(part.id, face, bool(e.modifiers() & Qt.ControlModifier))
+                return
             if part is None:
                 if not (e.modifiers() & Qt.ControlModifier):
                     self.set_selection([])
@@ -1142,7 +1188,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                           "before": {p.id: p.state() for p in moving}}
 
     def _restore_cursor(self) -> None:
-        if self.support_mode or self.hole_mode or self.lay_flat_mode:
+        if self.support_mode or self.hole_mode or self.lay_flat_mode or self.region_mode:
             self.setCursor(Qt.CrossCursor)
         elif self._ring_hover is not None or self._handle_hover is not None:
             self.setCursor(Qt.OpenHandCursor)
@@ -1250,6 +1296,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape and self.cancel_handle_drag():
             return
+        if e.key() == Qt.Key_Escape and self.region_mode:
+            self.stop_region_mode()
+            return
         if e.key() == Qt.Key_Escape and (self.lay_flat_mode or self.hole_mode or self.support_mode):
             if self.hole_mode:
                 self.stop_hole_mode()
@@ -1289,6 +1338,16 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if self.hole_mode and self._hole_hover is not None:
             self.clear_hole_hover()
         super().leaveEvent(e)
+
+    def start_region_mode(self):
+        self.region_mode = True
+        self.setCursor(Qt.CrossCursor)
+
+    def stop_region_mode(self):
+        if self.region_mode:
+            self.region_mode = False
+            self.unsetCursor()
+            self.regionModeEnded.emit()
 
     def start_lay_flat(self):
         self.lay_flat_mode = True
