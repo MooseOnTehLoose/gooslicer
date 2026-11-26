@@ -133,8 +133,8 @@ def save(path: str | os.PathLike, project: Project, *, support_meshes: dict | No
                     entry = {"object": objects[id(part.mesh)], "item": i, "name": part.name,
                              "position": part.position.tolist(), "rotation": part.rotation.tolist(),
                              "scale": part.scale.tolist(), "elevation": float(part.elevation)}
-                    if part.see_through:
-                        entry["seeThrough"] = True
+                    if part.opacity < 1.0:
+                        entry["opacity"] = round(float(part.opacity), 3)
                     if part.supports is not None:
                         if id(part.supports) not in plans:
                             plans[id(part.supports)] = len(plan_list)
@@ -259,6 +259,14 @@ def _plan(d: dict):
     return SupportPlan(params, pts, nrm, kinds, d.get("template", ""))
 
 
+def _opacity(d: dict) -> float:
+    """A part's 3D-view opacity: "opacity" (0.05–1), or 0.5 for the older "seeThrough": true."""
+    v = d.get("opacity")
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
+        return float(min(max(v, 0.05), 1.0))
+    return 0.5 if d.get("seeThrough") is True else 1.0
+
+
 def load(path: str | os.PathLike, progress=None) -> Project:
     """Read a GooSlicer or SatelLite project. Raises ProjectError for anything else or anything
     damaged."""
@@ -315,7 +323,7 @@ def _build(doc: dict, model: bytes, progress) -> Project:
                     np.asarray(d["position"], float).reshape(3).copy(),
                     np.asarray(d["rotation"], float).reshape(3, 3).copy(),
                     np.asarray(d["scale"], float).reshape(3).copy(),
-                    elevation=float(d.get("elevation", 0.0)), see_through=d.get("seeThrough") is True)
+                    elevation=float(d.get("elevation", 0.0)), opacity=_opacity(d))
         if np.any(part.scale <= 0):
             raise ProjectError(f"part {part.name!r} has a scale that isn't positive")
         if "plan" in d:

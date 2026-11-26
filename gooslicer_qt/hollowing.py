@@ -22,6 +22,18 @@ HOLE_FORM_LABELS = ("Hole (through the wall)", "Slot (fixed depth)")
 CLEARANCE_LABELS = ("Pin smaller", "Hole larger", "Both, half each")    # clearanceType 1, 2, 3
 
 
+DEFAULT_OPACITY = 0.5           # hollowed parts are drawn at 50 % opacity [GOOSLICER]
+
+
+def see_through_opacity(settings) -> float:
+    """The Hollow panel's see-through opacity (0.05–1), saved as hollow/opacity in percent."""
+    try:
+        v = float(settings.value("hollow/opacity", DEFAULT_OPACITY * 100))
+    except (TypeError, ValueError):
+        v = DEFAULT_OPACITY * 100
+    return min(max(v, 5.0), 100.0) / 100.0
+
+
 def _dspin(lo, hi, val, dec=2, suffix=" mm", step=0.1):
     w = QDoubleSpinBox()
     w.setRange(lo, hi)
@@ -63,6 +75,13 @@ class HollowFields(QWidget):
         self.infill_size.setToolTip("Lattice cell size")
         self.infill_radius = _dspin(0.1, 10, d.infill_radius, step=0.1)
         self.infill_radius.setToolTip("Strut radius")
+        self.opacity = QSpinBox()
+        self.opacity.setRange(5, 100)
+        self.opacity.setSuffix(" %")
+        self.opacity.setSingleStep(5)
+        self.opacity.setValue(round(DEFAULT_OPACITY * 100))
+        self.opacity.setToolTip("How solid hollowed parts look in the 3D view afterwards, so the cavity "
+                                "shows through (100 % = solid). Only the view: printing is not affected.")
         f = QFormLayout(self)
         f.setContentsMargins(0, 0, 0, 0)
         f.addRow("Wall thickness", self.thickness)
@@ -75,8 +94,10 @@ class HollowFields(QWidget):
         f.addRow("Infill type", self.infill_type)
         f.addRow("Cell size", self.infill_size)
         f.addRow("Strut radius", self.infill_radius)
+        f.addRow("Opacity", self.opacity)
         self.load()
-        for w in (self.thickness, self.accuracy, self.angle, self.cavities, self.infill_size, self.infill_radius):
+        for w in (self.thickness, self.accuracy, self.angle, self.cavities, self.infill_size, self.infill_radius,
+                  self.opacity):
             w.valueChanged.connect(self.changed)
         self.kind.currentIndexChanged.connect(self.changed)
         self.infill_type.currentIndexChanged.connect(self.changed)
@@ -111,6 +132,16 @@ class HollowFields(QWidget):
             infill_type=self.qs.value("hollow/infillType", d.infill_type)
             if self.qs.value("hollow/infillType", d.infill_type) in INFILL_TYPES else d.infill_type,
             infill_size=v("infillSize", d.infill_size), infill_radius=v("infillRadius", d.infill_radius)))
+        self.set_view_opacity(see_through_opacity(self.qs))
+
+    def set_view_opacity(self, v: float) -> None:
+        self.opacity.blockSignals(True)
+        self.opacity.setValue(round(v * 100))
+        self.opacity.blockSignals(False)
+
+    def view_opacity(self) -> float:
+        """Opacity of hollowed parts in the 3D view (0.05–1)."""
+        return self.opacity.value() / 100.0
 
     def set_value(self, s: HollowSettings) -> None:
         self.blockSignals(True)
@@ -144,7 +175,7 @@ class HollowFields(QWidget):
                        ("surfaceAngle", s.surface_angle), ("isFilter", s.filter_small_shells),
                        ("cavities", s.max_cavities), ("infill", self.infill.isChecked()),
                        ("infillType", s.infill_type), ("infillSize", s.infill_size),
-                       ("infillRadius", s.infill_radius)):
+                       ("infillRadius", s.infill_radius), ("opacity", self.opacity.value())):
             self.qs.setValue(f"hollow/{k}", val)
 
 

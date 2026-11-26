@@ -28,10 +28,10 @@ from gooslicer.scene import Part, Scene, prepare, ray_triangles, rotation_betwee
 
 from . import colors as colormod
 from . import workers
-from .commands import (AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, SeeThroughCommand,
+from .commands import (AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsCommand, OpacityCommand,
                        StateCommand)
 from .camera import CameraPanel
-from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowPanel, drill_part_keep, hole_axis_world,
+from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowPanel, see_through_opacity, drill_part_keep, hole_axis_world,
                         hole_preview_mesh)
 from .jobpanel import JobPanel
 from .memory import MemoryMonitor, StatusBar, trim_memory_soon
@@ -657,10 +657,15 @@ class MainWindow(QMainWindow):
         a.setToolTip("Draw the model see-through, to look at its inside (hollowed models start so)")
         return m
 
+    def see_through_opacity(self) -> float:
+        """The opacity see-through parts get: the Hollow panel's setting (50 % by default)."""
+        return see_through_opacity(self.settings)
+
     def set_see_through(self, ids, on: bool) -> None:
+        val = self.see_through_opacity() if on else 1.0
         ids = [i for i in ids if self.scene.get(i) and self.scene.get(i).see_through != on]
         if ids:
-            self.undo.push(SeeThroughCommand(self, ids, on))
+            self.undo.push(OpacityCommand(self, ids, val))
 
     def toggle_see_through(self) -> None:
         """View → See-through: the selected parts (all if none is selected) switch together."""
@@ -766,13 +771,13 @@ class MainWindow(QMainWindow):
         self.statusBar().clearMessage()
 
     # ------------------------------------------------------- hollow / drain holes
-    def _replace_mesh(self, pid, mesh, text, report=None, see_through=None):
+    def _replace_mesh(self, pid, mesh, text, report=None, opacity=None):
         """Swap in a new mesh as an undo step. Pass the mesh's analysis if it was made off the
         GUI thread (it takes about a second for 300k triangles)."""
         if self.scene.get(pid) is None:
             return
         self.reports.pop(id(self.scene.get(pid).mesh), None)
-        self.undo.push(MeshCommand(self, pid, mesh, text, see_through=see_through))
+        self.undo.push(MeshCommand(self, pid, mesh, text, opacity=opacity))
         new = self.scene.get(pid).mesh
         self.reports[id(new)] = report if report is not None else meshmod.analyze(new)
         meshmod.slim(new)
@@ -788,7 +793,8 @@ class MainWindow(QMainWindow):
         if panel is None:
             panel = self.hollow_panel = HollowPanel(self.settings, self.viewport)
             panel.fields.changed.connect(panel.fields.save)
-            panel.hollow.connect(lambda: self.hollow_selected(self.hollow_panel.fields.value()))
+            panel.hollow.connect(lambda: self.hollow_selected(self.hollow_panel.fields.value(),
+                                                              self.hollow_panel.fields.view_opacity()))
             panel.finished.connect(self.end_hollow_mode)
             self.viewport.escapePressed.connect(self.end_hollow_mode)
         self.viewport.stop_hole_mode()
@@ -814,15 +820,17 @@ class MainWindow(QMainWindow):
             panel.set_state(len([i for i in self.selected_ids() if self.scene.get(i)]),
                             len(self._hollowing))
 
-    def hollow_selected(self, hs):
+    def hollow_selected(self, hs, opacity: float | None = None):
         """Hollow every selected part in the background; each becomes an undo step and is
-        drawn see-through afterwards."""
+        drawn at `opacity` afterwards (default: the Hollow panel's setting; 1 = solid)."""
+        if opacity is None:
+            opacity = self.see_through_opacity()
         for pid in self.selected_ids():
             p = self.scene.get(pid)
             if p is not None and pid not in self._hollowing:
-                self._hollow_part(p, hs)
+                self._hollow_part(p, hs, opacity)
 
-    def _hollow_part(self, p, hs):
+    def _hollow_part(self, p, hs, opacity: float):
         pid, name = p.id, p.name
         self._hollowing.add(pid)
         self._update_hollow_panel()
@@ -837,7 +845,7 @@ class MainWindow(QMainWindow):
             mesh, r = res
             if self.scene.get(pid) is None:
                 return
-            self._replace_mesh(pid, mesh, "Hollow", see_through=True)
+            self._replace_mesh(pid, mesh, "Hollow", opacity=opacity)
             self.log_msg(f"Hollowed {name}: {r.cavities} cavit{'y' if r.cavities == 1 else 'ies'}, "
                          f"volume {r.original_volume:.1f} → {mesh.volume * float(np.prod(np.abs(self.scene.get(pid).scale))):.1f} mm³. "
                          + (f"{r.pillars} pillar{'' if r.pillars == 1 else 's'} hold up the cavity's ceilings. "

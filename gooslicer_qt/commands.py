@@ -66,24 +66,24 @@ class RemovePartsCommand(QUndoCommand):
 
 
 class MeshCommand(QUndoCommand):
-    """Replace a part's mesh (e.g. repair), keeping placement; optionally set its see-through
-    view too (Hollow turns it on), which undo puts back."""
+    """Replace a part's mesh (e.g. repair), keeping placement; optionally set its 3D-view
+    opacity too (Hollow makes it see-through), which undo puts back."""
 
-    def __init__(self, win, pid: int, new_mesh, text="Repair mesh", see_through: bool | None = None):
+    def __init__(self, win, pid: int, new_mesh, text="Repair mesh", opacity: float | None = None):
         super().__init__(text)
         p = win.scene.get(pid)
         self.win, self.pid = win, pid
-        self.old = (p.mesh, p.state(), p.see_through)
+        self.old = (p.mesh, p.state(), p.opacity)
         p.set_mesh(new_mesh)
-        self.new = (p.mesh, p.state(), p.see_through if see_through is None else see_through)
+        self.new = (p.mesh, p.state(), p.opacity if opacity is None else float(opacity))
         p.mesh, _, _ = self.old
         p.set_state(self.old[1])
 
-    def _apply(self, mesh, state, see_through):
+    def _apply(self, mesh, state, opacity):
         p = self.win.scene.get(self.pid)
         p.mesh = mesh
         p.set_state(state)
-        p.see_through = see_through
+        p.opacity = opacity
         self.win.scene_changed(mesh_changed=self.pid)
 
     def redo(self):
@@ -93,23 +93,23 @@ class MeshCommand(QUndoCommand):
         self._apply(*self.old)
 
 
-class SeeThroughCommand(QUndoCommand):
-    """Draw parts see-through, or solid again."""
+class OpacityCommand(QUndoCommand):
+    """Draw parts see-through at an opacity, or solid again (1.0)."""
 
-    def __init__(self, win, ids, on: bool):
-        super().__init__("See-through" if on else "Solid view")
-        self.win, self.on = win, on
-        self.before = {i: win.scene.get(i).see_through for i in ids if win.scene.get(i)}
+    def __init__(self, win, ids, opacity: float):
+        super().__init__("See-through" if opacity < 1.0 else "Solid view")
+        self.win, self.opacity = win, float(opacity)
+        self.before = {i: win.scene.get(i).opacity for i in ids if win.scene.get(i)}
 
     def _set(self, vals: dict):
         for i, v in vals.items():
             p = self.win.scene.get(i)
             if p is not None:
-                p.see_through = v
+                p.opacity = v
         self.win.viewport.update()
 
     def redo(self):
-        self._set({i: self.on for i in self.before})
+        self._set({i: self.opacity for i in self.before})
 
     def undo(self):
         self._set(self.before)

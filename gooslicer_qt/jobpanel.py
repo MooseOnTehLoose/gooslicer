@@ -34,7 +34,8 @@ class JobPanel(QWidget):
         hol = QGroupBox("Hollowing")
         hl = QVBoxLayout(hol)
         self.hollow_btn = QPushButton("Hollow…")
-        self.hollow_btn.setToolTip("Hollow the selected part (Ctrl+Shift+H)")
+        self.hollow_btn.setToolTip("Open the Hollow settings over the 3D view, then hollow the parts "
+                                   "you select (Ctrl+Shift+H)")
         self.drain_btn = QPushButton("Add drain holes…")
         self.drain_btn.setToolTip("Click on a part to drill drain holes so resin can escape "
                                   "(Ctrl+Shift+D)")
@@ -240,7 +241,7 @@ class JobPanel(QWidget):
         self.support_note.setText(f"{note} Supports go on {target}." if target else note)
         tips = self.tips()
         self.tips_label.setText(tip_summary(self.params()[0], bool(tips)))
-        self.hollow_btn.setEnabled(bool(self.win.selected_ids()))
+        self.hollow_btn.setEnabled(n > 0)          # opens the Hollow panel; parts are picked there
         self.drain_btn.setEnabled(n > 0)
         self.trapped_btn.setEnabled(n > 0 and not self._trapped_busy)
         self.seal_btn.setEnabled(n > 0 and not self._trapped_busy)

@@ -89,7 +89,8 @@ class Part:
     elevation: float = 0.0                   # height of the part's bottom above the plate: the supports'
                                              # lift, or a bare part raised with the Z arrow
     supports: object = None                  # gooslicer.supports.SupportPlan | None
-    see_through: bool = False                # drawn see-through in the 3D view (hollowed parts start so)
+    opacity: float = 1.0                     # 3D view only: below 1 the part is drawn see-through
+                                             # (hollowed parts start at the Hollow panel's value)
     _cache: tuple | None = field(default=None, repr=False)
     _bcache: tuple | None = field(default=None, repr=False)
 
@@ -99,6 +100,10 @@ class Part:
         centre = m.bounds.mean(axis=0)
         m.apply_translation(-centre)
         return cls(name, m, position=centre.astype(float))
+
+    @property
+    def see_through(self) -> bool:
+        return self.opacity < 1.0
 
     # ------------------------------------------------------------ transform
     def matrix(self) -> np.ndarray:
@@ -199,7 +204,7 @@ class Scene:
     def duplicate(self, part_id: int, offset=None) -> Part:
         src = self.get(part_id)
         dup = Part(f"{src.name} copy", src.mesh, src.position.copy(), src.rotation.copy(), src.scale.copy(),
-                   elevation=src.elevation, supports=src.supports, see_through=src.see_through)
+                   elevation=src.elevation, supports=src.supports, opacity=src.opacity)
         dup.position += np.asarray(offset if offset is not None else (src.size()[0] + 2.0, 0, 0))
         return self.add(dup, place=False)
 

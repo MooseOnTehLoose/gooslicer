@@ -59,7 +59,6 @@ GUIDE_DIM = 0.35                       # island guide lines where something is i
 COL_HOLE = (0.15, 0.45, 1.0)           # drain-hole preview (blue)
 HOLE_ALPHA = 0.75                      # its visible part (less and orange parts turn it grey)
 HOLE_ALPHA_HIDDEN = 0.4                # its part inside the model, through the surface
-SEE_THROUGH = 0.35                     # opacity of parts drawn see-through (hollowed ones start so)
 CAVITY_XRAY = 0.45                     # sealed cavities are inside the model: shown through it
 LABEL_ISLAND = "Unsupported island"    # text at the outer end of each guide line
 LABEL_CAVITY = "Sealed cavity"
@@ -415,8 +414,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             *col, a = colormod.rgba(self.colors["selected" if p.id in self.selected else "model"])
             if not self.scene.in_volume(p):
                 col = COL_OUTSIDE
-            if p.see_through:
-                a = min(a, SEE_THROUGH)
+            if p.opacity < 1.0:                   # see-through (hollowed parts start so)
+                a = min(a, max(p.opacity, 0.05))
             (solid if a >= OPAQUE else clear).append((self._buffers[id(p.mesh)][1], p.matrix(), col, a))
         self._draw_meshes(solid, vp, u_mvp, u_n, u_c, u_alpha)
         if self.island_meshes or self.cavity_meshes:

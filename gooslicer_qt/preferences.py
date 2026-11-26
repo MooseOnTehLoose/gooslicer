@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDialog, Q
 from gooslicer.support_defaults import DrainHoleSettings, HollowSettings
 
 from . import colors as colormod
-from .hollowing import DrainHoleFields, HollowFields
+from .hollowing import DEFAULT_OPACITY, DrainHoleFields, HollowFields
 from .supporting import support_choices
 from .theme import THEMES
 
@@ -381,10 +381,11 @@ class PreferencesDialog(QDialog):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.hollow)
-        lay.addWidget(_note("The values the Hollow dialog starts with. Defaults are SatelLite's."))
+        lay.addWidget(_note("The values the Hollow panel starts with. Defaults are SatelLite's."))
 
         def reset():
             self.hollow.set_value(HollowSettings())
+            self.hollow.set_view_opacity(DEFAULT_OPACITY)
             self.hollow.save()
         return _Page("Hollowing", w, reset=reset, refresh=self.hollow.load)
 

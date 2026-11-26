@@ -224,7 +224,9 @@ def test_hollow_drill_and_trapped_resin(app, tmp_path, monkeypatch):
     w.hollowFinished.connect(done.append)
     # Hollow opens its settings over the 3D view's top-left and stays until Done or Esc
     w.viewport.set_selection([])
-    w.hollow_dialog()
+    app.processEvents()
+    assert w.job_panel.hollow_btn.isEnabled()                  # opens the panel; no selection needed
+    w.job_panel.hollow_btn.click()
     hp = w.hollow_panel
     app.processEvents()
     assert (not hp.isHidden()) and hp.parentWidget() is w.viewport and hp.pos().x() == 12
@@ -233,24 +235,29 @@ def test_hollow_drill_and_trapped_resin(app, tmp_path, monkeypatch):
     app.processEvents()
     assert hp.hollow_btn.isEnabled() and hp.hollow_btn.text() == "Hollow"
     hp.fields.set_value(HollowSettings(thickness=1.5, accuracy=0.5))
-    assert not part.see_through
+    assert not part.see_through and hp.fields.opacity.value() == 50     # 50 % by default
     hp.hollow_btn.click()
     assert (not hp.status.isHidden()) and "Hollowing 1 part" in hp.status.text()
     assert _wait(app, lambda: done, 60) and done == [True]
     app.processEvents()
     assert (not hp.isHidden()) and not (not hp.status.isHidden())       # still open for the next part
-    assert part.see_through                                    # hollowed parts are drawn see-through
+    assert part.opacity == 0.5                                 # hollowed parts are drawn see-through
     w.undo.undo()
-    assert not part.see_through
+    assert part.opacity == 1.0
     w.undo.redo()
-    assert part.see_through
+    assert part.opacity == 0.5
     # the right-click menu and View → See-through switch it; undoable
     sm = next(a for a in w.part_menu(part.id).actions() if a.text() == "See-through")
     assert sm.isCheckable() and sm.isChecked()
     w.toggle_see_through()
-    assert not part.see_through
+    assert part.opacity == 1.0
+    hp.fields.opacity.setValue(30)                             # saved at once; used from now on
+    assert int(s.value("hollow/opacity")) == 30
+    w.toggle_see_through()
+    assert part.opacity == 0.3
     w.undo.undo()
-    assert part.see_through
+    w.undo.undo()
+    assert part.opacity == 0.5
     # opening the drain-hole tool closes the Hollow panel; Esc closes it too
     w.drain_hole_mode()
     assert not (not hp.isHidden()) and (not w.hole_panel.isHidden())
@@ -1644,7 +1651,7 @@ def test_preferences_window(app, tmp_path, monkeypatch):
     from gooslicer_qt.hollowing import HollowFields
     assert HollowFields(s).value().thickness == 3.5               # the Hollow panel starts there
     d.reset_page()
-    assert HollowFields(s).value() == HollowSettings()
+    assert HollowFields(s).value() == HollowSettings() and HollowFields(s).view_opacity() == 0.5
     d.show_page("Drain holes")
     d.drain.r1.setValue(2.25)
     assert float(s.value("drain/radius1")) == 2.25
