@@ -44,6 +44,15 @@ void main(){
   frag = vec4(color * d, alpha);
 }
 """
+# Select by Picture (11): each face's index written into the colour (24 bits), back faces none
+ID_FS = """#version 330 core
+out vec4 frag;
+void main(){
+  if (!gl_FrontFacing) { frag = vec4(0.0); return; }
+  int i = gl_PrimitiveID;
+  frag = vec4(float(i & 255), float((i >> 8) & 255), float((i >> 16) & 255), 255.0) / 255.0;
+}
+"""
 LINE_VS = """#version 330 core
 layout(location=0) in vec3 pos; uniform mat4 mvp; uniform float clipZ;
 void main(){ gl_Position = mvp * vec4(pos, 1.0); gl_ClipDistance[0] = clipZ - pos.z; }  // world pos
@@ -374,6 +383,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     def initializeGL(self):
         self._mesh_prog = _compile(MESH_VS, MESH_FS)
         self._line_prog = _compile(LINE_VS, LINE_FS)
+        self._id_prog = _compile(MESH_VS, ID_FS)
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glEnable(GL.GL_MULTISAMPLE)
         self._gl_ready = True
@@ -991,6 +1001,75 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         t = np.linspace(0, 2 * np.pi, n + 1)
         u, w = RING_BASIS[axis]
         return centre + radius * (np.cos(t)[:, None] * u + np.sin(t)[:, None] * w)
+
+    def capture(self, part: Part, id_scale: int = 2) -> dict:
+        """The part alone as it's seen now (opaque, model colour, the view's background, no
+        overlays) and a face-index render of it at `id_scale`× the size (11, Select by
+        Picture): {"rgb": (H, W, 3) uint8, "ids": (sH, sW) int64 (-1: none), "vp", "w", "h"
+        (widget pixels), "dpr"}."""
+        from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat
+        w, h = max(self.width(), 1), max(self.height(), 1)
+        dpr = self.devicePixelRatioF()
+        W, H = int(round(w * dpr)), int(round(h * dpr))
+        vp = self.camera.projection(w / h) @ self.camera.view()
+        fmt = QOpenGLFramebufferObjectFormat()
+        fmt.setAttachment(QOpenGLFramebufferObject.Depth)
+        self.makeCurrent()
+        try:
+            self._sync_buffers()
+            buf = self._buffers[id(part.mesh)][1]
+            M = part.matrix()
+            clip = 1e9 if self.clip_z is None else float(self.clip_z) + 1e-4
+            out = {"vp": vp, "w": w, "h": h, "dpr": dpr}
+            for prog, size in ((self._mesh_prog, (W, H)), (self._id_prog, (W * id_scale, H * id_scale))):
+                fbo = QOpenGLFramebufferObject(size[0], size[1], fmt)
+                fbo.bind()
+                try:
+                    GL.glViewport(0, 0, *size)
+                    GL.glDisable(GL.GL_SCISSOR_TEST)
+                    GL.glDisable(GL.GL_BLEND)
+                    GL.glDisable(GL.GL_CULL_FACE)
+                    GL.glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)
+                    GL.glEnable(GL.GL_DEPTH_TEST)
+                    GL.glDepthMask(GL.GL_TRUE)
+                    GL.glDepthFunc(GL.GL_LESS)
+                    if prog == self._mesh_prog:
+                        GL.glClearColor(0.16, 0.17, 0.19, 1.0)
+                    else:
+                        GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+                    GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+                    GL.glUseProgram(prog)
+                    loc = lambda n: GL.glGetUniformLocation(prog, n)  # noqa: E731
+                    GL.glUniformMatrix4fv(loc("mvp"), 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
+                    GL.glUniformMatrix4fv(loc("model"), 1, GL.GL_TRUE, M.astype(np.float32))
+                    GL.glUniform1f(loc("clipZ"), clip)
+                    GL.glEnable(GL.GL_CLIP_DISTANCE0)
+                    if prog == self._mesh_prog:
+                        eye = self.camera.eye() - self.camera.target
+                        eye /= np.linalg.norm(eye)
+                        GL.glUniform3f(loc("lightA"), *eye)
+                        GL.glUniform3f(loc("lightB"), 0.0, 0.0, 1.0)
+                        GL.glUniform3f(loc("color"), *colormod.rgba(self.colors["model"])[:3])
+                        GL.glUniform1f(loc("alpha"), 1.0)
+                        back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
+                        GL.glUniform3f(loc("backColor"), *back)
+                    buf.draw()
+                    GL.glDisable(GL.GL_CLIP_DISTANCE0)
+                    px = GL.glReadPixels(0, 0, size[0], size[1], GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
+                    a = np.frombuffer(px, np.uint8).reshape(size[1], size[0], 4)[::-1]
+                finally:
+                    fbo.release()
+                    GL.glBindVertexArray(0)
+                    GL.glUseProgram(0)
+                if prog == self._mesh_prog:
+                    out["rgb"] = np.ascontiguousarray(a[:, :, :3])
+                else:
+                    ids = a[:, :, 0].astype(np.int64) | (a[:, :, 1].astype(np.int64) << 8) \
+                        | (a[:, :, 2].astype(np.int64) << 16)
+                    out["ids"] = np.where(a[:, :, 3] > 0, ids, -1)
+        finally:
+            self.doneCurrent()
+        return out
 
     def _screen(self, pts, vp=None):
         """Screen positions (N, 2) of world points, and which are in front of the camera."""

@@ -10,6 +10,9 @@ build/
 dist/
 .flatpak-builder/
 
+# MobileSAM model files (scripts/fetch-models.sh; the Flatpak downloads its own)
+models/
+
 # Kept local, not published:
 # captures/  runtime captures from the owner's printer (mainboard ID, LAN IP, name)
 # evidence/  reverse-engineering evidence bundles (decompiled ELEGOO code)

@@ -364,6 +364,20 @@ class PropertiesPanel(QWidget):
         fl.addRow(row)                      # attached before it gets widgets (PySide ownership)
         row.addWidget(self.select_btn, 1)
         row.addWidget(self.clear_region_btn)
+        self._modify_form = fl
+        self.select_by = QComboBox()
+        self.select_by.setToolTip("What a click selects: the surface round it (spread and contours), "
+                                  "the whole part of the model it's on, or what an image model sees "
+                                  "there in the 3D view")
+        for text, key in (("Surface", "surface"), ("Parts", "parts"), ("Picture (AI)", "picture")):
+            self.select_by.addItem(text, key)
+        from gooslicer import picture
+        ok, why = picture.available()
+        if not ok:
+            item = self.select_by.model().item(2)
+            item.setEnabled(False)
+            item.setToolTip("Not available: " + why)
+        fl.addRow("Select by", self.select_by)
         self.spread = QSlider(Qt.Horizontal)
         self.spread.setRange(5, 90)
         self.spread.setValue(35)
@@ -391,6 +405,30 @@ class PropertiesPanel(QWidget):
         crow.addWidget(self.stop_contours)
         crow.addWidget(self.contour_angle, 1)
         crow.addWidget(self.contour_label)
+        self.part_edges = QSlider(Qt.Horizontal)
+        self.part_edges.setRange(2, 30)
+        self.part_edges.setValue(10)
+        self.part_edges.setToolTip("How deep a valley must run along a border for it to stay a part "
+                                   "edge: lower gives more, smaller parts")
+        self.part_edges_label = QLabel("10°")
+        self.part_edges_label.setMinimumWidth(32)
+        prow = QHBoxLayout()
+        fl.addRow("Part edges", prow)
+        prow.addWidget(self.part_edges, 1)
+        prow.addWidget(self.part_edges_label)
+        self.outline_size = QSlider(Qt.Horizontal)
+        self.outline_size.setRange(0, 2)
+        self.outline_size.setValue(1)
+        self.outline_size.setPageStep(1)
+        self.outline_size.setToolTip("Which of the image model's outlines to use, from the smallest "
+                                     "thing round the click to the largest")
+        self.outline_label = QLabel("Medium")
+        self.outline_label.setMinimumWidth(52)
+        orow = QHBoxLayout()
+        fl.addRow("Outline", orow)
+        orow.addWidget(self.outline_size, 1)
+        orow.addWidget(self.outline_label)
+        self._mode_rows = {"surface": (srow, crow), "parts": (prow,), "picture": (orow,)}
         self.region_info = QLabel("Nothing selected")
         self.region_info.setWordWrap(True)
         fl.addRow(self.region_info)
@@ -450,10 +488,16 @@ class PropertiesPanel(QWidget):
         self.stop_contours.toggled.connect(lambda _on: win.region_settings_changed())
         self.contour_angle.valueChanged.connect(
             lambda v: (self.contour_label.setText(f"{v}°"), win.region_settings_changed()))
+        self.select_by.currentIndexChanged.connect(lambda _i: (self.show_select_by(), win.select_by_changed()))
+        self.part_edges.valueChanged.connect(
+            lambda v: (self.part_edges_label.setText(f"{v}°"), win.region_settings_changed()))
+        self.outline_size.valueChanged.connect(lambda v: (self.outline_label.setText(
+            ("Small", "Medium", "Large")[v]), win.region_settings_changed()))
         self.grow_btn.clicked.connect(win.grow_selection)
         self.grow_mm.valueChanged.connect(lambda v: win.settings.setValue("modify/grow", float(v)))
         self.lay_cut.toggled.connect(lambda on: win.settings.setValue("modify/layFlat", bool(on)))
         self.cut_btn.clicked.connect(win.cut_selection)
+        self.show_select_by()
         self.btn_auto.clicked.connect(win.auto_position)
         self.btn_arrange.clicked.connect(win.arrange_all)
         self.set_part(None, None)
@@ -471,6 +515,13 @@ class PropertiesPanel(QWidget):
             self.transform_btn.setChecked(on)
 
     # ---------------------------------------------------------------- view
+    def show_select_by(self) -> None:
+        """Show the controls of the Select by mode only."""
+        key = self.select_by.currentData()
+        for mode, rows in self._mode_rows.items():
+            for r in rows:
+                self._modify_form.setRowVisible(r, mode == key)
+
     def set_part(self, part, report: MeshReport | None):
         self.part = part
         enabled = part is not None

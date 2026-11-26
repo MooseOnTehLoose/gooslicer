@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import numpy as np
 import trimesh
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from gooslicer import mesh as meshmod
-from gooslicer import modify
+from gooslicer import modify, picture
+from gooslicer import parts as partsmod
 from gooslicer.scene import Part, prepare
 
 from . import workers
@@ -53,9 +54,28 @@ def _cut_job(mesh, matrix, s, faces, mask, keep, depth, smooth, gap):
     return rest, piece, dropped, n, (meshmod.analyze(rest), meshmod.analyze(piece))
 
 
+class _Busy:
+    """A wait cursor and a status message while something slow runs on the GUI thread."""
+
+    def __init__(self, win, text):
+        self.win, self.text = win, text
+
+    def __enter__(self):
+        self.win.statusBar().showMessage(self.text)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+
+    def __exit__(self, *exc):
+        QApplication.restoreOverrideCursor()
+        self.win.statusBar().clearMessage()
+        return False
+
+
 class ModifyingMixin:
-    """State: `_region` = {"pid", "mesh": id(part.mesh), "seeds": [face, …], "mask",
-    "surface"} or None; `_adjacency` = (id(mesh), face adjacency) for the last mesh asked."""
+    """State: `_region` = {"pid", "mesh": id(part.mesh), "seeds": [seed, …], "grows", "mask",
+    "surface"} or None, where a seed is {"kind": "surface" | "part" | "picture", "face"} (a
+    picture seed also keeps its candidate face masks, "cands"); `_adjacency` = (id(mesh), face
+    adjacency) for the last mesh asked."""
 
     _region = None
     _adjacency = None
@@ -93,19 +113,83 @@ class ModifyingMixin:
         return {"depth": pp.cut_depth.value(), "smooth": pp.cut_smooth.value(), "gap": pp.cut_gap.value()}
 
     # ------------------------------------------------------------ picking
+    def select_by(self) -> str:
+        return self.props.select_by.currentData() or "surface"
+
+    def select_by_changed(self) -> None:
+        self.settings.setValue("modify/selectBy", self.select_by())
+        self._show_contours()
+
     def region_pick(self, pid: int, face: int, add: bool) -> None:
         p = self.scene.get(pid)
         if p is None:
             return
         if pid not in self.selected_ids():
             self.select([pid])
+        kind = {"surface": "surface", "parts": "part", "picture": "picture"}[self.select_by()]
+        seed = {"kind": kind, "face": int(face)}
+        if kind == "picture":
+            cands = self._picture_candidates(p, int(face))
+            if cands is None:
+                return
+            seed["cands"] = cands
         r = self._region
         if add and r is not None and r["pid"] == pid and r["mesh"] == id(p.mesh):
-            if face not in r["seeds"]:
-                r["seeds"].append(face)
+            if not any(q["kind"] == kind and q["face"] == seed["face"] for q in r["seeds"]):
+                r["seeds"].append(seed)
         else:
-            self._region = {"pid": pid, "mesh": id(p.mesh), "seeds": [face], "grows": [], "mask": None}
+            self._region = {"pid": pid, "mesh": id(p.mesh), "seeds": [seed], "grows": [], "mask": None}
         self._update_region()
+
+    # ------------------------------------------------------------ parts and picture
+    def _part_labels(self, p: Part, s: modify.Surface) -> np.ndarray:
+        """Part label per face at the current Part edges angle (11, Select by Parts); the slow
+        stages are cached per placement."""
+        place = (id(p.mesh), p.matrix().tobytes())
+        c = getattr(self, "_parts_cache", None)
+        if c is None or c[0] != place:
+            with _Busy(self, f"Finding the parts of {p.name}…"):
+                c = self._parts_cache = (place, partsmod.Parts(s, self._fold(p, s)), {})
+        deg = int(self.props.part_edges.value())
+        if deg not in c[2]:
+            c[2][deg] = c[1].labels(deg)
+        return c[2][deg]
+
+    def _picture_candidates(self, p: Part, face: int):
+        """Select by Picture: the image model's outlines round `face` in the current view, as
+        face masks, smallest first (None if it can't run)."""
+        ok, why = picture.available()
+        if not ok:
+            QMessageBox.warning(self, APP, "Select by Picture isn't available: " + why + ".")
+            return None
+        vp = self.viewport
+        key = (p.id, id(p.mesh), p.matrix().tobytes(), vp.camera.view().tobytes(), vp.width(), vp.height(),
+               vp.clip_z)
+        try:
+            with _Busy(self, "Looking at the picture…"):
+                if getattr(self, "_segmenter", None) is None:
+                    self._segmenter = picture.Segmenter()
+                if getattr(self, "_picture_key", None) != key:
+                    self._picture = vp.capture(p)
+                    self._segmenter.embed(self._picture["rgb"])
+                    self._picture_key = key
+                cap = self._picture
+                c = p.world_mesh().triangles_center[face]
+                xy, _ = vp._screen(np.asarray([c]))
+                x, y = xy[0] * cap["dpr"]
+                outs = self._segmenter.outlines(float(x), float(y))
+        except Exception as e:                 # a broken model file, an odd GPU: say so, carry on
+            self._picture_key = None
+            QMessageBox.warning(self, APP, f"Select by Picture failed: {e}")
+            return None
+        ids = cap["ids"]
+        s_y, s_x = ids.shape[0] // cap["rgb"].shape[0], ids.shape[1] // cap["rgb"].shape[1]
+        part_px = (ids[::s_y, ::s_x] >= 0)[:cap["rgb"].shape[0], :cap["rgb"].shape[1]]
+        n = len(p.mesh.faces)
+        cands = [picture.faces_in_outline(ids, m, n) for m in picture.candidates(outs, part_px)]
+        for m in cands:
+            m[face] = True
+        return cands or [np.eye(1, n, face, dtype=bool)[0]]
 
     def clear_region(self) -> None:
         self._region = None
@@ -127,29 +211,39 @@ class ModifyingMixin:
         r.setdefault("grows", []).append(mm)
         self._update_region()
 
-    def _contours(self, p: Part, s: modify.Surface):
-        """Contour edges (per adjacency row) of a part at the current angle; cached."""
+    def _fold(self, p: Part, s: modify.Surface) -> np.ndarray:
+        """modify.fold_angles of a part, cached per placement (the slow part of contours and
+        parts)."""
         place = (id(p.mesh), p.matrix().tobytes())
         f = getattr(self, "_fold_cache", None)
-        if f is None or f[0] != place:                       # the slow part: once per placement
+        if f is None or f[0] != place:
             f = self._fold_cache = (place, modify.fold_angles(s))
-        key = place + (int(self.props.contour_angle.value()),)
+        return f[1]
+
+    def _contours(self, p: Part, s: modify.Surface):
+        """Contour edges (per adjacency row) of a part at the current angle; cached."""
+        fold = self._fold(p, s)
+        key = (id(p.mesh), p.matrix().tobytes(), int(self.props.contour_angle.value()))
         c = getattr(self, "_contour_cache", None)
         if c is None or c[0] != key:
-            c = self._contour_cache = (key, modify.contours(s, float(key[2]), fold=f[1]))
+            c = self._contour_cache = (key, modify.contours(s, float(key[2]), fold=fold))
         return c[1]
 
     def _show_contours(self) -> None:
-        """Draw the contours of the part being selected on (or the selected one while picking),
-        when Stop at contours is on."""
+        """Draw the lines of the Select by mode on the part being selected on (or the selected
+        one while picking): its contours (Surface, with Stop at contours on) or its part edges
+        (Parts)."""
         vp = self.viewport
         r = self._region
         p = self.scene.get(r["pid"]) if r else (self.primary() if vp.region_mode else None)
-        if p is None or not self.props.stop_contours.isChecked() or not (vp.region_mode or r):
+        mode = self.select_by()
+        if p is None or not (vp.region_mode or r) or mode == "picture" \
+                or (mode == "surface" and not self.props.stop_contours.isChecked()):
             vp.contour_lines = None
         else:
             s = r["surface"] if r and r.get("surface") is not None else self._surface(p)
-            vp.contour_lines = s.vertices[s.edges[self._contours(p, s)]]
+            e = self._contours(p, s) if mode == "surface" else partsmod.edges(s, self._part_labels(p, s))
+            vp.contour_lines = s.vertices[s.edges[e]]
         vp.update()
 
     def region_settings_changed(self) -> None:
@@ -157,6 +251,8 @@ class ModifyingMixin:
         st.setValue("modify/spread", int(self.props.spread.value()))
         st.setValue("modify/contours", bool(self.props.stop_contours.isChecked()))
         st.setValue("modify/contourFold", int(self.props.contour_angle.value()))
+        st.setValue("modify/partEdges", int(self.props.part_edges.value()))
+        st.setValue("modify/outline", int(self.props.outline_size.value()))
         for k, v in self.cut_settings().items():
             st.setValue(f"modify/{k}", float(v))
         if self._region is not None:
@@ -186,6 +282,20 @@ class ModifyingMixin:
         pp.grow_mm.blockSignals(True)
         pp.grow_mm.setValue(float(st.value("modify/grow", 1.0)))
         pp.grow_mm.blockSignals(False)
+        for w, lab, key, default, text in (
+                (pp.part_edges, pp.part_edges_label, "partEdges", 10, lambda v: f"{v}°"),
+                (pp.outline_size, pp.outline_label, "outline", 1, lambda v: picture.SIZES[v])):
+            w.blockSignals(True)
+            w.setValue(int(st.value(f"modify/{key}", default)))
+            lab.setText(text(w.value()))
+            w.blockSignals(False)
+        i = pp.select_by.findData(str(st.value("modify/selectBy", "surface")))
+        if i < 0 or not pp.select_by.model().item(i).isEnabled():
+            i = 0
+        pp.select_by.blockSignals(True)
+        pp.select_by.setCurrentIndex(i)
+        pp.select_by.blockSignals(False)
+        pp.show_select_by()
 
     def _surface(self, p: Part) -> modify.Surface:
         if self._adjacency is None or self._adjacency[0] != id(p.mesh):
@@ -201,10 +311,17 @@ class ModifyingMixin:
             self.clear_region()
             return
         s = self._surface(p)
-        barrier = self._contours(p, s) if self.props.stop_contours.isChecked() else None
         mask = np.zeros(len(p.mesh.faces), bool)
-        for f in r["seeds"]:
-            mask |= modify.grow_region(s, f, float(self.props.spread.value()), barrier=barrier)
+        for q in r["seeds"]:
+            f = q["face"]
+            if q["kind"] == "part":
+                lab = self._part_labels(p, s)
+                mask |= lab == lab[f]
+            elif q["kind"] == "picture":
+                mask |= picture.pick(q["cands"], int(self.props.outline_size.value()))
+            else:
+                barrier = self._contours(p, s) if self.props.stop_contours.isChecked() else None
+                mask |= modify.grow_region(s, f, float(self.props.spread.value()), barrier=barrier)
         mask = modify.fill_holes(s, mask)
         for mm in r.get("grows", []):
             mask = modify.grow_by(s, mask, mm, p.mesh.faces)

@@ -8,7 +8,7 @@ GooSlicer is an independent project. It is not affiliated with or endorsed by EL
 
 ## Features
 - **Models:** STL, OBJ and 3MF import; mesh checks and one-click repair, with models that fail the check repaired on import (can be turned off in Preferences) and listed as "(repaired)"; move, rotate (rings around the selection in 5° steps, −45° buttons or any angle), scale, mirror, add instances (right-click a model), lay flat, Auto Position (turns a part to the angle that needs the fewest supports), auto-arrange; undo/redo.
-- **Cutting models apart:** Models tab → Modifying. Select surface picks part of a model's outer surface around a click, up to where it curves away (a Spread slider sets how far) or meets a contour such as a strap's edge or a hairline; Grow selection widens or narrows it by a set number of millimetres. Cut out selection cuts it off along that outline as its own part, so a hollowed model with nowhere to drill a drain hole can be printed in two pieces and glued. The cut opens the cavity, and the curved joint fits back only one way.
+- **Cutting models apart:** Models tab → Modifying. Select surface picks part of a model's outer surface around a click, up to where it curves away (a Spread slider sets how far) or meets a contour such as a strap's edge or a hairline. **Select by** can instead take a whole part of the model (an ear, a strap, the mask round the eyes, found from where shapes meet along valleys) or what an AI image model (MobileSAM, run on your computer, no network) outlines round the click in the 3D view. Grow selection widens or narrows it by a set number of millimetres. Cut out selection cuts it off along that outline as its own part, so a hollowed model with nowhere to drill a drain hole can be printed in two pieces and glued. The cut opens the cavity, and the curved joint fits back only one way.
 - **Hollowing:** inside, outside, centre and open-bottom shells; drain holes placed by clicking; a trapped-resin check before slicing (sealed cavities shown in red, with a labelled guide line), and one-click sealing of cavities back to solid.
 - **Supports:** automatic EVO-style supports (tips, pillars, bracing, raft with holes) and tree supports, using SatelLite's template parameters; manual add/remove; an unsupported-island check (islands shown in red) before slicing. Every island and sealed cavity found is numbered and listed in the Flaws tab, where a false positive can be dismissed.
 - **Slicing:** native-resolution rasterising (non-square pixels on the 16K), parallel across all cores, `.goo` output checked against SatelLite's (a 10 mm cube is byte-identical; curved models differ by a few edge pixels per layer), plus print time, volume and cost estimates. Slices are held in memory to export or send to the printer. Experimental GPU slicing (OpenGL) is several times faster.
@@ -36,6 +36,7 @@ python3 -m venv .venv
 .venv/bin/gooslicer                 # run the app
 .venv/bin/python -m pytest          # core tests
 scripts/test-gui.sh                 # everything, including OpenGL tests under Xvfb (needs xvfb-run)
+scripts/fetch-models.sh             # MobileSAM files for Select by Picture, into models/ (44 MB)
 ```
 Command-line tools: `elegoo-goo` (inspect, extract layers from and build `.goo` files) and `elegoo-lan` (discover, upload, print).
 
@@ -43,6 +44,7 @@ Some tests need data that is not in this repository, and skip without it:
 - `samples/`: SatelLite-sliced reference files.
 - `captures/`: runtime captures from a real printer.
 - `GOOSLICER_SATELLITE_DIR`: a SatelLite install folder, for the template tests.
+- `models/` (`scripts/fetch-models.sh`): the MobileSAM model files. Without them Select by Picture is disabled and its model test skips.
 
 ## Layout
 | Path | Contents |
@@ -71,3 +73,5 @@ The specs cite evidence bundles (`evidence/`) and captures (`captures/`) that ar
 
 ## License
 [MIT](LICENSE). Printer, resin and support profiles stay ELEGOO's: GooSlicer copies them from your own SatelLite install onto your machine only, and never redistributes them. The exception is a small test fixture in `tests/test_profiles.py`: one printer's dimensions and settings.
+
+Select by Picture uses [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) as exported to ONNX by [Acly](https://huggingface.co/Acly/MobileSAM) (MIT), run with [ONNX Runtime](https://onnxruntime.ai) (MIT). The model files aren't in this repository: the Flatpak downloads them at build time, pinned by sha256.

@@ -1060,3 +1060,91 @@ def test_cut_refuses_open_mesh(app, win, tmp_path, monkeypatch):
     said = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *a: said.append(a[2]))
     assert not win.cut_selection() and "Repair it first" in said[0] and len(win.scene.parts) == 1
+
+
+def test_select_by_parts_takes_the_post(app, win, tmp_path):
+    """Select by Parts (11): a click on a post standing on a slab selects the post (its sides
+    and top), not the slab; part edges are drawn while picking; the mode is remembered."""
+    from test_modify import _step
+    f = tmp_path / "step.stl"
+    _step(0.6).export(f)
+    assert wait_import(app, win, [f]) == 1
+    p = win.scene.parts[0]
+    win.select([p.id])
+    pp = win.props
+    assert pp.select_by.currentData() == "surface" and not pp.part_edges.isVisibleTo(pp)
+    pp.select_by.setCurrentIndex(pp.select_by.findData("parts"))
+    assert pp.part_edges.isVisibleTo(pp) and not pp.spread.isVisibleTo(pp)
+    assert win.settings.value("modify/selectBy") == "parts"
+    pp.select_btn.click()
+    vp = win.viewport
+    assert vp.contour_lines is not None and len(vp.contour_lines)          # part edges shown
+    wm = p.world_mesh()
+    c = wm.triangles_center
+    top = int(np.argmax(c[:, 2]))
+    win.region_pick(p.id, top, False)
+    mask = win._region["mask"]
+    zb = p.bounds()[0][2]
+    post = c[:, 2] > zb + 4.05
+    assert mask[post].all() and not mask[c[:, 2] < zb + 3.95].any()
+    pp.select_btn.click()
+
+
+def test_select_by_picture(app, win, tmp_path, monkeypatch):
+    """Select by Picture (11) with a stand-in image model outlining the left half of the view:
+    only faces seen, on that side, are selected. The face-index render matches the view's own
+    pick, and the Outline slider picks among the candidates."""
+    from gooslicer import picture
+    v, f = trimesh.remesh.subdivide_to_size(*(lambda b: (b.vertices, b.faces))(trimesh.creation.box((20, 20, 20))),
+                                            max_edge=1.0)
+    fine = tmp_path / "fine.stl"
+    trimesh.Trimesh(v, f).export(fine)
+    wait_import(app, win, [fine])
+    p = win.scene.parts[0]
+    win.select([p.id])
+    vp = win.viewport
+    vp.set_view(-60, 30)
+    vp.frame_selection()
+    pump(app)
+    cap = vp.capture(p)
+    ids = cap["ids"]
+    assert cap["rgb"].shape[:2] == (ids.shape[0] // 2, ids.shape[1] // 2)
+    wm = p.world_mesh()
+    for fx, fy in ((0.5, 0.5), (0.45, 0.55), (0.55, 0.45)):            # the GPU and the pick agree
+        x, y = cap["w"] * fx, cap["h"] * fy
+        o, d = vp._ray(QPointF(x, y))
+        part, face, _hit = win.scene.pick(o, d)
+        if part is not None:
+            got = ids[int(y * cap["dpr"] * 2), int(x * cap["dpr"] * 2)]
+            assert got == face, (fx, fy)
+
+    class Stub:
+        def embed(self, rgb):
+            self.shape = rgb.shape[:2]
+
+        def outlines(self, x, y):
+            h, w = self.shape
+            left = np.zeros((h, w), bool)
+            left[:, : w // 2] = True
+            small = np.zeros((h, w), bool)
+            small[int(y) - 3:int(y) + 4, int(x) - 3:int(x) + 4] = True
+            return [left, small, np.ones((h, w), bool)]
+    monkeypatch.setattr(picture, "available", lambda: (True, ""))
+    win._segmenter = Stub()
+    pp = win.props
+    pp.select_by.model().item(2).setEnabled(True)
+    pp.select_by.setCurrentIndex(pp.select_by.findData("picture"))
+    assert pp.outline_size.isVisibleTo(pp) and pp.outline_label.text() == "Medium"
+    c = wm.triangles_center
+    xy, _ = vp._screen(c)
+    eye = vp.camera.eye()
+    seen = np.einsum("ij,ij->i", wm.face_normals, eye - c) > 0
+    face = int(np.nonzero(seen & (xy[:, 0] < cap["w"] * 0.4))[0][0])
+    win.region_pick(p.id, face, False)
+    seed = win._region["seeds"][0]
+    assert seed["kind"] == "picture" and len(seed["cands"]) == 2       # the whole-part one dropped
+    mask = win._region["mask"]
+    assert mask[face] and mask.sum() > 1
+    assert (xy[mask, 0] < cap["w"] / 2 + 12).all() and seen[mask].all()       # faces ≤ 1 mm
+    pp.outline_size.setValue(0)                                          # Small: the 7 px square
+    assert win._region["mask"].sum() < mask.sum()
