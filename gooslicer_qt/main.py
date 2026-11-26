@@ -282,6 +282,7 @@ class MainWindow(QMainWindow):
         self.print_settings.favoritesChanged.connect(lambda keys: self.settings.setValue("resinFavorites", keys))
         self.print_settings.resinSelected.connect(self._remember_resin)
         self.print_settings.changed.connect(lambda: self._check_held())
+        self.print_settings.changed.connect(self.update_layer_slider)
         self.held = None                 # (SliceResult with .goo, plate fingerprint) of the last in-memory slice
         self._slicing_fp = None
         self.layer_preview = LayerPreview()
@@ -594,7 +595,14 @@ class MainWindow(QMainWindow):
         else:
             self.viewport.set_selection(self.selected_ids(), emit=False)
         self._sync_panels()
+        self.update_layer_slider()
         self.viewport.update()
+
+    def update_layer_slider(self) -> None:
+        """The layer slider spans the plate's parts in layer-height steps (09 §11)."""
+        top = max((float(p.bounds()[1][2]) for p in self.scene.parts), default=None)
+        h = self.print_settings.settings().layer_height if self.printer_panel.current() else 0.05
+        self.viewport.set_layer_range(top, max(h, 0.01))
 
     # ---------------------------------------------------------------- edits
     def edit_parts(self, ids: list[int], text: str, fn) -> None:

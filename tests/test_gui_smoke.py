@@ -235,17 +235,17 @@ def test_hollow_drill_and_trapped_resin(app, tmp_path, monkeypatch):
     app.processEvents()
     assert hp.hollow_btn.isEnabled() and hp.hollow_btn.text() == "Hollow"
     hp.fields.set_value(HollowSettings(thickness=1.5, accuracy=0.5))
-    assert not part.see_through and hp.fields.opacity.value() == 50     # 50 % by default
+    assert not part.see_through and hp.fields.opacity.value() == 85     # 85 % by default
     hp.hollow_btn.click()
     assert (not hp.status.isHidden()) and "Hollowing 1 part" in hp.status.text()
     assert _wait(app, lambda: done, 60) and done == [True]
     app.processEvents()
     assert (not hp.isHidden()) and not (not hp.status.isHidden())       # still open for the next part
-    assert part.opacity == 0.5                                 # hollowed parts are drawn see-through
+    assert part.opacity == 0.85                                 # hollowed parts are drawn see-through
     w.undo.undo()
     assert part.opacity == 1.0
     w.undo.redo()
-    assert part.opacity == 0.5
+    assert part.opacity == 0.85
     # the right-click menu and View → See-through switch it; undoable
     sm = next(a for a in w.part_menu(part.id).actions() if a.text() == "See-through")
     assert sm.isCheckable() and sm.isChecked()
@@ -257,7 +257,7 @@ def test_hollow_drill_and_trapped_resin(app, tmp_path, monkeypatch):
     assert part.opacity == 0.3
     w.undo.undo()
     w.undo.undo()
-    assert part.opacity == 0.5
+    assert part.opacity == 0.85
     # opening the drain-hole tool closes the Hollow panel; Esc closes it too
     w.drain_hole_mode()
     assert not (not hp.isHidden()) and (not w.hole_panel.isHidden())
@@ -1651,7 +1651,7 @@ def test_preferences_window(app, tmp_path, monkeypatch):
     from gooslicer_qt.hollowing import HollowFields
     assert HollowFields(s).value().thickness == 3.5               # the Hollow panel starts there
     d.reset_page()
-    assert HollowFields(s).value() == HollowSettings() and HollowFields(s).view_opacity() == 0.5
+    assert HollowFields(s).value() == HollowSettings() and HollowFields(s).view_opacity() == 0.85
     d.show_page("Drain holes")
     d.drain.r1.setValue(2.25)
     assert float(s.value("drain/radius1")) == 2.25

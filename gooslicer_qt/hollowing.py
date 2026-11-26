@@ -22,7 +22,7 @@ HOLE_FORM_LABELS = ("Hole (through the wall)", "Slot (fixed depth)")
 CLEARANCE_LABELS = ("Pin smaller", "Hole larger", "Both, half each")    # clearanceType 1, 2, 3
 
 
-DEFAULT_OPACITY = 0.5           # hollowed parts are drawn at 50 % opacity [GOOSLICER]
+DEFAULT_OPACITY = 0.85          # hollowed parts are drawn at 85 % opacity [GOOSLICER]
 
 
 def see_through_opacity(settings) -> float:

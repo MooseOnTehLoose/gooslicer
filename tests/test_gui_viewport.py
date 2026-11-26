@@ -878,3 +878,40 @@ def test_see_through_nearest_surface_on_top(app, win, tmp_path):
         px.append(win.viewport.grabFramebuffer().pixelColor(int(c.x()), int(c.y())))
     a, b = px
     assert max(abs(a.red() - b.red()), abs(a.green() - b.green()), abs(a.blue() - b.blue())) <= 3
+
+
+def test_layer_slider_hides_above_cut(app, win, tmp_path):
+    vp = win.viewport
+    assert vp.layer_slider.isHidden()                       # empty plate
+    assert wait_import(app, win, [box_file(tmp_path, size=(20, 20, 20))]) == 1
+    win.select([])
+    pump(app)
+    sl = vp.layer_slider
+    assert not sl.isHidden() and sl.cut() is None and sl.label_text() == "All"
+    assert abs(sl.top - 20) < 1e-6
+    assert sl.geometry().top() > vp.compass_rect().bottom()  # under the compass, right side
+    assert sl.geometry().right() > vp.width() - 30
+    vp.frame_selection()
+    pump(app)
+    hi, lo = project(vp, [0, -10, 16]), project(vp, [0, -10, 4])
+    def px(pt):
+        return vp.grabFramebuffer().pixelColor(int(pt.x()), int(pt.y()))
+    bg = vp.grabFramebuffer().pixelColor(5, vp.height() - 5)
+    before = px(hi)
+    assert before != bg and px(lo) != bg
+    sl.set_cut(10.0)
+    assert vp.clip_z == 10.0 and sl.label_text() == "10.00 mm"
+    pump(app)
+    a, b = px(hi), px(lo)
+    # the outer wall above the cut is gone: the box's inside (back-face colour) shows there
+    assert a != before and a.red() > a.green() + 80 and a.blue() > a.green() + 80
+    assert b != bg
+    win.scene_changed()                                     # keeps its height when parts change
+    assert sl.cut() == 10.0
+    sl.set_cut(None)
+    pump(app)
+    assert vp.clip_z is None and px(hi) == before
+    sl.set_cut(5.0)
+    win.undo.undo()                                         # plate empty again: slider hidden, all shown
+    pump(app)
+    assert sl.isHidden() and vp.clip_z is None

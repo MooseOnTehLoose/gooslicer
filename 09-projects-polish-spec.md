@@ -166,3 +166,12 @@ Moving was dragging on the plate plus number fields, and rotation already has ri
 - **SatelLite projects:** reading is done (10). Writing `.goo.3mf` for SatelLite to open is still open (10 §7).
 - **Translations:** dropped from P7 (decided 2026-11-24). Strings stay plain English; adding `tr()` later is a mechanical pass.
 - ~~Z placement~~: done (2026-11-25), the Z arrow (§8).
+
+## 11. Layer slider in the 3D view [GOOSLICER]
+For looking inside a print at a given height (internal flaws, hollow walls, infill), the 3D view has a vertical slider down its right side, under the compass.
+- **What it does:** everything above the slider's height is not drawn: parts, supports, island and cavity overlays, drain-hole preview and flaw guide lines. It cuts with a GPU clip plane (`gl_ClipDistance`, world Z), so it costs nothing per move and never changes the scene, the slice or the undo history. A solid part cut open shows its inside faces in the back-face colour, so the cut reads as a cross-section.
+- **Range and steps:** 0 mm to the top of the highest part, in steps of the current layer height (0.05 mm with no printer chosen). Top of the slider = nothing hidden; the slider starts there. When parts change, a slider at the top stays at the top, otherwise it keeps its height, clamped to the new range.
+- **Labels:** a scale of mm ticks down the left of the groove at a round interval (1, 2, 5, 10, 20 or 50 mm, so the labels are at least ~28 px apart), and the current height next to the handle, e.g. "12.35 mm" (hidden at the top position, which reads "All").
+- **Hidden** when the plate is empty. Not saved between sessions.
+- **Clicks** still pick parts by their full geometry; the cut is a view aid only.
+- **Tests:** at a cut halfway up a box, a pixel on the part's upper half shows background and one below still shows the part; the label reads the cut height; moving the slider back to the top draws everything.

@@ -20,6 +20,7 @@ from gooslicer.scene import Part, PartState, Scene, rotation_matrix
 
 from . import colors as colormod
 from .handles import HandlesMixin
+from .layerslider import LayerSlider
 
 # Meshes are drawn indexed (shared vertices, 12 bytes each, plus 12 bytes a face). Flat shading
 # needs a face normal: the fragment shader takes it from the screen-space derivatives of the
@@ -27,9 +28,10 @@ from .handles import HandlesMixin
 # is the outward normal; back faces are painted a fixed colour anyway.
 MESH_VS = """#version 330 core
 layout(location=0) in vec3 pos;
-uniform mat4 mvp; uniform mat4 model;
+uniform mat4 mvp; uniform mat4 model; uniform float clipZ;
 out vec3 vW;
-void main(){ vW = (model * vec4(pos, 1.0)).xyz; gl_Position = mvp * vec4(pos, 1.0); }
+void main(){ vW = (model * vec4(pos, 1.0)).xyz; gl_Position = mvp * vec4(pos, 1.0);
+             gl_ClipDistance[0] = clipZ - vW.z; }  // layer slider: nothing above clipZ
 """
 MESH_FS = """#version 330 core
 in vec3 vW; out vec4 frag;
@@ -42,8 +44,8 @@ void main(){
 }
 """
 LINE_VS = """#version 330 core
-layout(location=0) in vec3 pos; uniform mat4 mvp;
-void main(){ gl_Position = mvp * vec4(pos, 1.0); }
+layout(location=0) in vec3 pos; uniform mat4 mvp; uniform float clipZ;
+void main(){ gl_Position = mvp * vec4(pos, 1.0); gl_ClipDistance[0] = clipZ - pos.z; }  // world pos
 """
 LINE_FS = """#version 330 core
 out vec4 frag; uniform vec4 color;
@@ -297,6 +299,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self._drag = None
         self._last = QPointF()
         self._init_handles()
+        self.clip_z: float | None = None           # layer slider: hide everything above (mm)
+        self.layer_slider = LayerSlider(self)
+        self.layer_slider.cutChanged.connect(self._set_clip)
+        self.layer_slider.hide()
         self.reset_view()
 
     # ------------------------------------------------------------- public
@@ -326,6 +332,32 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             if emit:
                 self.selectionChanged.emit(list(ids))
         self.update()
+
+    # ------------------------------------------------------------ layer slider
+    def set_layer_range(self, top: float | None, step: float) -> None:
+        """The layer slider runs from 0 to `top` mm (the highest part) in `step` mm; no top
+        (an empty plate) hides it and shows everything."""
+        if top is None or top <= 0:
+            self.layer_slider.set_cut(None)
+            self.layer_slider.hide()
+            return
+        self.layer_slider.set_range(top, step)
+        self._place_layer_slider()
+        self.layer_slider.show()
+
+    def _place_layer_slider(self) -> None:
+        r = self.compass_rect()
+        y = int(r.bottom()) + 14
+        w = self.layer_slider.width()
+        self.layer_slider.setGeometry(int(r.right()) - w + 4, y, w, max(self.height() - y - 40, 60))
+
+    def _set_clip(self, z) -> None:
+        self.clip_z = z
+        self.update()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._place_layer_slider()
 
     # --------------------------------------------------------------- GL
     def initializeGL(self):
@@ -382,6 +414,11 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         # QPainter (the compass, drawn last) leaves its own GL state behind: reset ours
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glDisable(GL.GL_BLEND)
+        clip = 1e9 if self.clip_z is None else float(self.clip_z) + 1e-4
+        for prog in (self._mesh_prog, self._line_prog):
+            GL.glUseProgram(prog)
+            GL.glUniform1f(GL.glGetUniformLocation(prog, "clipZ"), clip)
+        GL.glEnable(GL.GL_CLIP_DISTANCE0)
         GL.glClearColor(0.16, 0.17, 0.19, 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         w, h = max(self.width(), 1), max(self.height(), 1)
@@ -463,6 +500,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             self._draw_hole_preview(vp)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
+        GL.glDisable(GL.GL_CLIP_DISTANCE0)          # QPainter draws next
         painter = QPainter(self)
         try:
             if self.show_front:
