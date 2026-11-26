@@ -300,6 +300,19 @@ def test_front_label(app, win):
     pump(app)
     assert white() == 0
     vp.show_front = True
+    # a model standing on the label hides it (the label was painted over everything)
+    import trimesh
+    from gooslicer.scene import Part
+    part = Part.from_mesh("block", trimesh.creation.box((200, 60, 5)))
+    part.position[:] = [0, -sy / 2 - 15, 2.5]
+    win.scene.add(part, place=False)
+    vp.update()
+    pump(app)
+    assert white() == 0
+    win.scene.remove(part.id)
+    vp.update()
+    pump(app)
+    assert white() > 40
     vp.set_view(90, 30)                        # from behind: beyond the far edge, mirrored
     pump(app)
     q = vp.front_label_quad()

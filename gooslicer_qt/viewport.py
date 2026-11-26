@@ -413,7 +413,28 @@ class Viewport(HandlesMixin, QOpenGLWidget):
 
     def paintGL(self):
         self._sync_buffers()
-        # QPainter (the compass, drawn last) leaves its own GL state behind: reset ours
+        GL.glClearColor(0.16, 0.17, 0.19, 1.0)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+        w, h = max(self.width(), 1), max(self.height(), 1)
+        vp = self.camera.projection(w / h) @ self.camera.view()
+        if self.show_front:
+            # the FRONT label lies on the floor: painted first, into colour only, so the models
+            # drawn after it hide it (painted last it showed through them)
+            painter = QPainter(self)
+            try:
+                self._draw_front(painter, vp, w, h)
+            finally:
+                painter.end()
+        # QPainter (the label, and the compass drawn last) leaves its own GL state behind:
+        # reset ours
+        dpr = self.devicePixelRatioF()
+        GL.glViewport(0, 0, int(round(w * dpr)), int(round(h * dpr)))
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+        GL.glDisable(GL.GL_STENCIL_TEST)
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glDepthFunc(GL.GL_LESS)
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glDisable(GL.GL_BLEND)
         clip = 1e9 if self.clip_z is None else float(self.clip_z) + 1e-4
@@ -425,10 +446,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
         GL.glUseProgram(self._mesh_prog)
         GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *back)
-        GL.glClearColor(0.16, 0.17, 0.19, 1.0)
-        GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
-        w, h = max(self.width(), 1), max(self.height(), 1)
-        vp = self.camera.projection(w / h) @ self.camera.view()
 
         GL.glUseProgram(self._line_prog)
         GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._line_prog, "mvp"), 1, GL.GL_TRUE,
@@ -509,8 +526,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         GL.glDisable(GL.GL_CLIP_DISTANCE0)          # QPainter draws next
         painter = QPainter(self)
         try:
-            if self.show_front:
-                self._draw_front(painter, vp, w, h)
             if self.show_compass:
                 self._draw_compass(painter)
             self._draw_guide_labels(painter, vp, w, h)
