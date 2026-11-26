@@ -1013,6 +1013,19 @@ def test_modifying_select_and_cut(app, win, tmp_path):
     pp.spread.setValue(60)
     assert int(win._region["mask"].sum()) > n35 and int(win.settings.value("modify/spread")) == 60
     pp.spread.setValue(40)
+    # contours: shown while selecting (a smooth ball has none); Grow selection by mm
+    assert pp.stop_contours.isChecked() and pp.contour_angle.value() == 10
+    assert vp.contour_lines is not None and len(vp.contour_lines) == 0
+    assert pp.grow_btn.isEnabled() and pp.grow_mm.value() == 1.0
+    n40 = int(win._region["mask"].sum())
+    pp.grow_btn.click()
+    assert int(win._region["mask"].sum()) > n40 and "(grown +1 mm)" in pp.region_info.text()
+    pp.spread.setValue(41)                                   # a grow is kept through changes
+    assert win._region["grows"] == [1.0]
+    pp.grow_mm.setValue(-1.0)
+    pp.grow_btn.click()
+    pp.spread.setValue(40)
+    assert abs(int(win._region["mask"].sum()) - n40) < 0.1 * n40 and float(win.settings.value("modify/grow")) == -1.0
     loop = QEventLoop()                                      # the cutter preview follows
     QTimer.singleShot(1500, loop.quit)
     loop.exec()

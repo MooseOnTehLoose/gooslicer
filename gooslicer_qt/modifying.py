@@ -69,12 +69,14 @@ class ModifyingMixin:
                 vp.stop_support_mode()
             vp.lay_flat_mode = False
             vp.start_region_mode()
+            self._show_contours()
             self.statusBar().showMessage("Select surface: click a part's surface; Ctrl+click adds an area "
                                          "(Esc to finish)")
         else:
             vp.stop_region_mode()
 
     def _region_mode_ended(self) -> None:
+        self._show_contours()
         self.props.select_btn.blockSignals(True)
         self.props.select_btn.setChecked(False)
         self.props.select_btn.blockSignals(False)
@@ -96,7 +98,7 @@ class ModifyingMixin:
             if face not in r["seeds"]:
                 r["seeds"].append(face)
         else:
-            self._region = {"pid": pid, "mesh": id(p.mesh), "seeds": [face], "mask": None}
+            self._region = {"pid": pid, "mesh": id(p.mesh), "seeds": [face], "grows": [], "mask": None}
         self._update_region()
 
     def clear_region(self) -> None:
@@ -105,16 +107,52 @@ class ModifyingMixin:
         self._preview_gen += 1
         self.viewport.region_mesh = None
         self.viewport.cut_preview = None
+        self._show_contours()
         self.update_region_panel()
         self.viewport.update()
+
+    def grow_selection(self) -> None:
+        """Grow (or shrink) the selection by the Grow selection distance along the surface; kept
+        through later spread or contour changes until the next plain click or Clear."""
+        r = self._region
+        mm = float(self.props.grow_mm.value())
+        if r is None or r.get("mask") is None or not mm:
+            return
+        r.setdefault("grows", []).append(mm)
+        self._update_region()
+
+    def _contours(self, p: Part, s: modify.Surface):
+        """Contour edges (per adjacency row) of a part at the current angle; cached."""
+        key = (id(p.mesh), p.matrix().tobytes(), int(self.props.contour_angle.value()))
+        c = getattr(self, "_contour_cache", None)
+        if c is None or c[0] != key:
+            c = self._contour_cache = (key, modify.contours(s, float(key[2])))
+        return c[1]
+
+    def _show_contours(self) -> None:
+        """Draw the contours of the part being selected on (or the selected one while picking),
+        when Stop at contours is on."""
+        vp = self.viewport
+        r = self._region
+        p = self.scene.get(r["pid"]) if r else (self.primary() if vp.region_mode else None)
+        if p is None or not self.props.stop_contours.isChecked() or not (vp.region_mode or r):
+            vp.contour_lines = None
+        else:
+            s = r["surface"] if r and r.get("surface") is not None else self._surface(p)
+            vp.contour_lines = s.vertices[s.edges[self._contours(p, s)]]
+        vp.update()
 
     def region_settings_changed(self) -> None:
         st = self.settings
         st.setValue("modify/spread", int(self.props.spread.value()))
+        st.setValue("modify/contours", bool(self.props.stop_contours.isChecked()))
+        st.setValue("modify/contourAngle", int(self.props.contour_angle.value()))
         for k, v in self.cut_settings().items():
             st.setValue(f"modify/{k}", float(v))
         if self._region is not None:
             self._update_region()
+        else:
+            self._show_contours()
 
     def load_modify_settings(self) -> None:
         pp, st = self.props, self.settings
@@ -128,6 +166,16 @@ class ModifyingMixin:
         pp.spread_label.setText(f"{pp.spread.value()}°")
         pp.spread.blockSignals(False)
         pp.lay_cut.setChecked(str(st.value("modify/layFlat", True)).lower() not in ("false", "0"))
+        pp.stop_contours.blockSignals(True)
+        pp.stop_contours.setChecked(str(st.value("modify/contours", True)).lower() not in ("false", "0"))
+        pp.stop_contours.blockSignals(False)
+        pp.contour_angle.blockSignals(True)
+        pp.contour_angle.setValue(int(st.value("modify/contourAngle", 10)))
+        pp.contour_label.setText(f"{pp.contour_angle.value()}°")
+        pp.contour_angle.blockSignals(False)
+        pp.grow_mm.blockSignals(True)
+        pp.grow_mm.setValue(float(st.value("modify/grow", 1.0)))
+        pp.grow_mm.blockSignals(False)
 
     def _surface(self, p: Part) -> modify.Surface:
         if self._adjacency is None or self._adjacency[0] != id(p.mesh):
@@ -143,11 +191,15 @@ class ModifyingMixin:
             self.clear_region()
             return
         s = self._surface(p)
+        barrier = self._contours(p, s) if self.props.stop_contours.isChecked() else None
         mask = np.zeros(len(p.mesh.faces), bool)
         for f in r["seeds"]:
-            mask |= modify.grow_region(s, f, float(self.props.spread.value()))
+            mask |= modify.grow_region(s, f, float(self.props.spread.value()), barrier=barrier)
         mask = modify.fill_holes(s, mask)
+        for mm in r.get("grows", []):
+            mask = modify.grow_by(s, mask, mm, p.mesh.faces)
         r["mask"], r["surface"] = mask, s
+        self._show_contours()
         self._region_key = (r["pid"], id(p.mesh), p.matrix().tobytes())
         self.viewport.region_mesh = trimesh.Trimesh(s.vertices, np.asarray(p.mesh.faces)[mask], process=False)
         self.viewport.cut_preview = None
@@ -206,6 +258,10 @@ class ModifyingMixin:
         else:
             pp.region_info.setText("Nothing selected")
         pp.clear_region_btn.setEnabled(r is not None)
+        pp.grow_btn.setEnabled(bool(has))
+        grows = sum(r.get("grows", [])) if r else 0
+        if has and grows:
+            pp.region_info.setText(pp.region_info.text() + f" (grown {grows:+g} mm)")
         pp.cut_btn.setEnabled(bool(has) and not self._cutting)
         pp.select_btn.setEnabled(bool(self.scene.parts))
 

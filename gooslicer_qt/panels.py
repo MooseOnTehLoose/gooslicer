@@ -375,6 +375,22 @@ class PropertiesPanel(QWidget):
         fl.addRow("Spread", srow)
         srow.addWidget(self.spread, 1)
         srow.addWidget(self.spread_label)
+        self.stop_contours = QCheckBox("Stop at contours")
+        self.stop_contours.setChecked(True)
+        self.stop_contours.setToolTip("Don't let the selection spread across a contour: a groove, a "
+                                      "strap's edge or a hairline (drawn on the part while selecting)")
+        self.contour_angle = QSlider(Qt.Horizontal)
+        self.contour_angle.setRange(3, 30)
+        self.contour_angle.setValue(10)
+        self.contour_angle.setToolTip("How sharp a crease must be to count as a contour: lower finds "
+                                      "more, fainter contours")
+        self.contour_label = QLabel("10°")
+        self.contour_label.setMinimumWidth(32)
+        crow = QHBoxLayout()
+        fl.addRow(crow)
+        crow.addWidget(self.stop_contours)
+        crow.addWidget(self.contour_angle, 1)
+        crow.addWidget(self.contour_label)
         self.region_info = QLabel("Nothing selected")
         self.region_info.setWordWrap(True)
         fl.addRow(self.region_info)
@@ -397,6 +413,16 @@ class PropertiesPanel(QWidget):
         self.lay_cut.setChecked(True)
         self.lay_cut.setToolTip("Turn the new piece so its cut side faces the plate, beside the part")
         fl.addRow(self.lay_cut)
+        self.grow_btn = QPushButton("Grow selection")
+        self.grow_btn.setToolTip("Grow the selection by this distance along the surface (negative "
+                                 "shrinks it)")
+        self.grow_mm = _spin(-20, 20, 2, " mm", 0.5)
+        self.grow_mm.setValue(1.0)
+        self.grow_mm.setToolTip("How far Grow selection grows the selection (negative shrinks)")
+        grow_row = QHBoxLayout()
+        fl.addRow(grow_row)
+        grow_row.addWidget(self.grow_btn, 1)
+        grow_row.addWidget(self.grow_mm)
         self.cut_btn = QPushButton("Cut out selection")
         self.cut_btn.setToolTip("Cut the selection off along its outline (shown in the 3D view) as a "
                                 "new part, to print separately and glue back on. The cut follows "
@@ -421,6 +447,11 @@ class PropertiesPanel(QWidget):
         self.spread.valueChanged.connect(lambda v: (self.spread_label.setText(f"{v}°"), win.region_settings_changed()))
         for w in (self.cut_depth, self.cut_smooth, self.cut_gap):
             w.valueChanged.connect(lambda _v: win.region_settings_changed())
+        self.stop_contours.toggled.connect(lambda _on: win.region_settings_changed())
+        self.contour_angle.valueChanged.connect(
+            lambda v: (self.contour_label.setText(f"{v}°"), win.region_settings_changed()))
+        self.grow_btn.clicked.connect(win.grow_selection)
+        self.grow_mm.valueChanged.connect(lambda v: win.settings.setValue("modify/grow", float(v)))
         self.lay_cut.toggled.connect(lambda on: win.settings.setValue("modify/layFlat", bool(on)))
         self.cut_btn.clicked.connect(win.cut_selection)
         self.btn_auto.clicked.connect(win.auto_position)

@@ -128,3 +128,54 @@ def test_lay_rotation():
         n = np.asarray(n, float) / np.linalg.norm(n)
         R = modify.lay_on_plane_rotation(n)
         assert np.allclose(R @ n, [0, 0, 1]) and np.isclose(np.linalg.det(R), 1)
+
+
+def _step(edge=0.4):
+    """A 20×14×4 slab with a 4×4×6 post standing in its middle, finely meshed. The slab's top
+    meets the post along four valley edges; every other edge is a ridge."""
+    base = _mf(trimesh.creation.box((20, 14, 4)).apply_translation([0, 0, 2]))
+    wall = _mf(trimesh.creation.box((4, 4, 6)).apply_translation([0, 0, 7]))
+    m = _tm(base + wall)
+    v, f = trimesh.remesh.subdivide_to_size(m.vertices, m.faces, max_edge=edge)
+    out = trimesh.Trimesh(v, f)
+    out.merge_vertices()
+    return out
+
+
+def test_contours_find_valleys_not_ridges():
+    m = _step()
+    s = modify.surface(m, np.eye(4))
+    c = modify.contours(s, 10)
+    mid = s.vertices[s.edges[c]].mean(axis=1)
+    assert c.any()
+    # every contour edge lies along a valley: round the post's foot (|x| or |y| = 2, z = 4)
+    assert np.allclose(np.maximum(abs(mid[:, 0]), abs(mid[:, 1])), 2, atol=0.6)
+    assert np.allclose(mid[:, 2], 4, atol=0.6)
+
+
+def test_selection_stops_at_contours():
+    m = _step()
+    s = modify.surface(m, np.eye(4))
+    seed = int(np.argmin(np.linalg.norm(s.centers - [-7, 0, 4], axis=1)))   # on the slab's top
+    free = modify.grow_region(s, seed, 91)                     # takes the 90° sides too
+    stopped = modify.grow_region(s, seed, 91, barrier=modify.contours(s, 10))
+    post = s.centers[:, 2] > 4.3
+    assert (free & post).any()                                 # 91° climbs the post…
+    top = np.abs(s.centers[:, 2] - 4) < 0.01
+    assert not (stopped & post).any()                          # …the contours stop it
+    assert (stopped & top).sum() == (top & (np.abs(s.normals[:, 2]) > 0.99)).sum()   # all of the slab's top
+
+
+def test_grow_by_mm_along_the_surface():
+    m = trimesh.creation.icosphere(subdivisions=5, radius=10)
+    s = modify.surface(m, np.eye(4))
+    cap = modify.grow_region(s, top_face(m), 30)
+
+    def reach(mask):                                           # arc length from the top, max
+        return float(np.max(10 * np.arccos(np.clip(s.centers[mask][:, 2] / np.linalg.norm(s.centers[mask], axis=1), -1, 1))))
+    r0 = reach(cap)
+    assert reach(modify.grow_by(s, cap, 2.0, m.faces)) == pytest.approx(r0 + 2.0, abs=0.35)
+    assert reach(modify.grow_by(s, cap, -2.0, m.faces)) == pytest.approx(r0 - 2.0, abs=0.35)
+    assert np.array_equal(modify.grow_by(s, cap, 0, m.faces), cap)
+    grown = modify.grow_by(s, cap, 2.0, m.faces)
+    assert np.all(grown[cap]) and not np.any(modify.grow_by(s, cap, -2.0, m.faces)[~cap])

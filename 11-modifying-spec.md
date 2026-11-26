@@ -15,7 +15,15 @@ Nothing here is from SatelLite (it has no such tool in the strings we have); eve
 ## 2. Select surface
 - **Select surface** (checkable button) starts picking: a cross cursor; a click on a part's surface selects the region around the click. That part becomes the selected part if it wasn't. **Ctrl+click** adds another region (same part). Esc or unchecking the button stops picking; the selection stays.
 - **How a region grows.** The seed normal is the area-weighted average normal of the faces within 2 mm of the clicked face, so a bumpy or noisy surface still has a sensible direction. A face belongs to the region when its normal is within the **Spread** angle of the seed normal and it's connected to the clicked face through such faces (shared edges). On a sphere it's a cap; on a head clicked on the crown, the top of the head, stopping where the surface turns away (the "outer curves").
-- **Spread:** a slider, 5°–90°, default 35°, with its value shown. Moving it recomputes every region from its seed, live. Remembered in `modify/spread`.
+- **Spread:** a slider, 5°–90°, default 35°, with its value shown. Moving it recomputes every region from its seed, live (with contours and grows). Remembered in `modify/spread`.
+- **Contours** (added 2026-11-25): with **Stop at contours** on (default, `modify/contours`), a region never spreads across a contour, so it follows the model's own outlines (a strap's edge, a groove, a hairline) as well as the spread angle. While picking, the contours of the part are drawn on it as dark lines in the Selected surface colour.
+  - **What's a contour:** an edge where the surface folds into a valley sharper than the **contour angle** (slider 3°–30°, default 10°, `modify/contourAngle`; lower finds more, fainter contours). It's measured between normals smoothed by 8 passes of neighbour averaging (about 0.5–1 mm on fine meshes), not per triangle. Ridges never count: valley or ridge is decided by the faces' own normals.
+  - **Only lines:** connected crease lines shorter than 3 mm in all are left out. Per-triangle creases didn't work: on `Lisa_head_D.stl` the hair gives 187k crease edges at 30° that join into one network. Smoothed and valley-only, at 10° the head shows its straps, ear, gag and parts of the hairline.
+  - Worked out per part placement and angle, and cached. On the hollowed head (618k triangles) a pick with contours takes about 0.2 s.
+- **Grow selection** (button, with a distance −20…20 mm beside it, default 1 mm, `modify/grow`; placed just above Cut out selection): grows the selection by that distance along the surface, or shrinks it when negative.
+  - Distances run along the mesh's edges (Dijkstra) from the selection's vertices. A face joins when all its corners are in reach. A shrink is the same grow applied to the rest, so +1 then −1 gives back about the same selection.
+  - It doesn't stop at contours or the spread, and stays on the shells it's on.
+  - Grows are kept, in order, through later spread, contour or placement changes, until a plain click starts a new selection or Clear. The info line shows the total, e.g. "(grown +1 mm)". About 0.3 s on the hollowed head.
 - Normals are taken in world space (the part's rotation, scale and mirror applied), so the result matches what's on screen.
 - **Shown** in the 3D view drawn over the part in the **Selected surface** colour (Preferences → 3D view colors, `colors/region`, default green). An info line under the slider reads e.g. "4,584 triangles · 20 mm²".
 - **Clear** empties the selection. The selection belongs to one part. It's dropped when that part's mesh changes (repair, hollow, cut, undo) or the part is deleted, and kept through moves, rotations and scaling (stored as face indices, recomputed for the view).
@@ -47,6 +55,8 @@ The cut follows the selection's outline, not a plane (changed 2026-11-25 after t
 - `modify.cutter` and `modify.cut` on a hollow ball, with a 40° cap: two watertight solids adding up to the ball. The piece is a curved cap of wall with no floor, as wide as the outline, its lowest points where the cutter's walls meet the inside of the wall. A fit gap shrinks the piece by the gap and leaves the hole as it was.
 - On a U shape cut across both arms with one arm selected, only that arm becomes the piece.
 - `mesh.repair` keeps a cavity facing in (and turns in one facing out), with a solid core inside it facing out.
+- `modify.contours` on a slab with a post standing in it: the contours are exactly the four valleys round the post's foot (no ridges). A region grown from the slab's top at 91° climbs the post without contours, and with them takes all of the slab's top and none of the post.
+- `modify.grow_by` on a ball's cap: ±2 mm moves its edge 2 mm along the surface (±0.35); a grow keeps the cap and a shrink stays inside it.
 - GUI: the Mesh pane starts folded with the status in its button; Select surface + click selects a region; the spread slider changes its size; Cut out selection gives two parts, a single undo restores one; refuses on an open mesh.
 
 ## 5. Open items

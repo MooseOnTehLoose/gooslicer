@@ -58,6 +58,7 @@ void main(){ frag = color; }
 COL_OUTSIDE = (0.90, 0.25, 0.22)
 COL_ISLAND = (0.92, 0.16, 0.14)       # unsupported islands, after the island check
 BACK_FACE = (0.85, 0.15, 0.55)         # inside / back faces (no layer cut)
+CONTOUR_PULL = 4e-4                    # NDC depth the contour lines are pulled forward
 CUT_PLANE_ALPHA = 0.35                 # the cut plane preview (11)
 OPAQUE = 0.999                         # an opacity at least this is drawn solid
 GUIDE_DIM = 0.35                       # island guide lines where something is in front of them
@@ -263,6 +264,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self.region_mode = False                   # Select surface (11): clicks pick regions
         self.region_mesh = None                    # world trimesh of the selected surface
         self.cut_preview = None                    # world trimesh: the cutter, drawn translucent
+        self.contour_lines = None                  # (k, 2, 3) world segments: Select surface contours
+        self._contour_buf = None
+        self._contour_src = None
         self.hole_mode = False
         self.support_mode = False
         self._spress = None             # support mode: a left press waiting to become a click or a drag
@@ -384,6 +388,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if self._guide_buf is not None:
             self._guide_buf.delete()
             self._guide_buf, self._guide_src = None, None
+        if self._contour_buf is not None:
+            self._contour_buf.delete()
+            self._contour_buf, self._contour_src = None, None
         if self._sel_buf is not None:
             self._sel_buf.delete()
             self._sel_buf, self._sel_src = None, None
@@ -527,6 +534,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self._draw_meshes(sup if sa >= OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha, cull=True)
         self._draw_meshes(clear, vp, u_mvp, u_n, u_c, u_alpha, layered=True)
         self._draw_region(vp, u_mvp, u_n, u_c, u_alpha)
+        self._draw_contours(vp)
+        GL.glUseProgram(self._mesh_prog)
         self._draw_meshes(sup if sa < OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha)
         self._draw_selected_guides(vp)
         if self.hole_preview is not None:
@@ -545,6 +554,30 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 self._draw_drag_marker(painter, vp)
         finally:
             painter.end()
+
+    def _draw_contours(self, vp) -> None:
+        """The contours Select surface stops at, as lines on the surface (pulled a little toward
+        the camera so the faces they lie on don't hide them)."""
+        src = self.contour_lines
+        if src is not self._contour_src:
+            if self._contour_buf is not None:
+                self._contour_buf.delete()
+            self._contour_buf = (_Buffer(np.asarray(src, float).reshape(-1, 3), False)
+                                 if src is not None and len(src) else None)
+            self._contour_src = src
+        if self._contour_buf is None:
+            return
+        GL.glUseProgram(self._line_prog)
+        T = np.eye(4)
+        T[2, 3] = -CONTOUR_PULL                      # clip z − pull·w: a constant NDC depth pull
+        GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._line_prog, "mvp"), 1, GL.GL_TRUE,
+                              (T @ vp).astype(np.float32))
+        rgb = np.asarray(colormod.rgba(self.colors["region"])[:3]) * 0.55
+        GL.glUniform4f(GL.glGetUniformLocation(self._line_prog, "color"), *rgb, 1.0)
+        GL.glDepthFunc(GL.GL_LEQUAL)
+        GL.glBindVertexArray(self._contour_buf.vao)
+        GL.glDrawArrays(GL.GL_LINES, 0, self._contour_buf.count)
+        GL.glDepthFunc(GL.GL_LESS)
 
     def _draw_region(self, vp, u_mvp, u_n, u_c, u_alpha) -> None:
         """The selected surface over its part (pulled forward, as the island overlay) and the
