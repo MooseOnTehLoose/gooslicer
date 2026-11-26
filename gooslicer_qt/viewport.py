@@ -456,7 +456,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         sup = [(self._buffers[id(m)][1], M, scol, sa) for m, M in self._extras]
         # supports first when solid (they hide what's behind them), last when see-through
         self._draw_meshes(sup if sa >= OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha, cull=True)
-        self._draw_meshes(clear + (sup if sa < OPAQUE else []), vp, u_mvp, u_n, u_c, u_alpha)
+        self._draw_meshes(clear, vp, u_mvp, u_n, u_c, u_alpha, layered=True)
+        self._draw_meshes(sup if sa < OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha)
         self._draw_selected_guides(vp)
         if self.hole_preview is not None:
             self._draw_hole_preview(vp)
@@ -476,10 +477,15 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         finally:
             painter.end()
 
-    def _draw_meshes(self, items, vp, u_mvp, u_n, u_c, u_alpha, cull: bool = False) -> None:
+    def _draw_meshes(self, items, vp, u_mvp, u_n, u_c, u_alpha, cull: bool = False,
+                     layered: bool = False) -> None:
         """Draw (buffer, 4x4 matrix, rgb, opacity) items with the mesh program. See-through ones
-        (opacity < 1) show front faces only (no inside faces showing through) and write no
-        depth, so what's behind them, including other see-through things, stays visible."""
+        (opacity < 1) show front faces only and blend. Unlayered (supports) they write no depth,
+        so everything behind them stays visible. `layered` (see-through parts) draws each part
+        back to front so its nearest surface is always on top at exactly its opacity: a depth
+        pre-pass finds that surface, the faces behind it (a hollow's inside walls) go first,
+        then the nearest surface over them. Without it, unsorted faces paint inner walls over
+        the outer skin and patches of the model look fully transparent."""
         if not items:
             return
         see_through = items[0][3] < OPAQUE
@@ -490,6 +496,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if see_through or cull:
             GL.glEnable(GL.GL_CULL_FACE)
             GL.glCullFace(GL.GL_BACK)
+        layered = layered and see_through
+        if layered:                                 # farthest part first
+            items = sorted(items, key=lambda it: -float((vp @ it[1][:, 3])[2] / max(abs((vp @ it[1][:, 3])[3]), 1e-9)))
         for buf, M, col, a in items:
             GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
             GL.glUniformMatrix4fv(u_n, 1, GL.GL_TRUE, M.astype(np.float32))
@@ -497,7 +506,19 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             GL.glUniform1f(u_alpha, min(a, 1.0) if see_through else 1.0)
             # mirrored transforms flip winding; keep front faces correct
             GL.glFrontFace(GL.GL_CW if np.linalg.det(M[:3, :3]) < 0 else GL.GL_CCW)
-            buf.draw()
+            if not layered:
+                buf.draw()
+                continue
+            GL.glColorMask(GL.GL_FALSE, GL.GL_FALSE, GL.GL_FALSE, GL.GL_FALSE)
+            GL.glDepthMask(GL.GL_TRUE)
+            buf.draw()                              # depth of the nearest surface
+            GL.glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)
+            GL.glDepthMask(GL.GL_FALSE)
+            GL.glDepthFunc(GL.GL_GREATER)
+            buf.draw()                              # what lies behind it (inside walls)
+            GL.glDepthFunc(GL.GL_LEQUAL)
+            buf.draw()                              # the nearest surface, on top
+            GL.glDepthFunc(GL.GL_LESS)
         GL.glFrontFace(GL.GL_CCW)
         GL.glUniform1f(u_alpha, 1.0)
         GL.glDepthMask(GL.GL_TRUE)

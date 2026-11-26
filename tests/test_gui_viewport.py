@@ -857,3 +857,24 @@ def test_tip_settings_overrides(app, tmp_path):
     # bad stored values are ignored
     qs.setValue("supportTips", '{"tip_shape": "star", "tip_length": 999, "bogus": 1}')
     assert load_tips(qs) == {"tip_length": 20.0}
+
+
+def test_see_through_nearest_surface_on_top(app, win, tmp_path):
+    """A see-through hollow part shows its outer skin on top at its opacity whatever order its
+    faces are stored in (unsorted blending painted inner walls over the skin)."""
+    from gooslicer_qt.commands import MeshCommand
+    assert wait_import(app, win, [box_file(tmp_path)]) == 1
+    p = win.scene.parts[0]
+    win.select([])
+    outer = trimesh.creation.icosphere(subdivisions=3, radius=15)
+    inner = trimesh.creation.icosphere(subdivisions=3, radius=12)
+    inner.invert()
+    px = []
+    for parts in ([outer, inner], [inner, outer]):
+        win.undo.push(MeshCommand(win, p.id, trimesh.util.concatenate(parts), "Hollow", opacity=0.75))
+        win.viewport.frame_selection()
+        pump(app)
+        c = project(win.viewport, p.bounds().mean(axis=0) + [0, 0, 9])   # skin faces up, inner wall down
+        px.append(win.viewport.grabFramebuffer().pixelColor(int(c.x()), int(c.y())))
+    a, b = px
+    assert max(abs(a.red() - b.red()), abs(a.green() - b.green()), abs(a.blue() - b.blue())) <= 3
