@@ -198,4 +198,5 @@ Off by default: Models → Slicing → "Use the GPU (experimental)" (setting `gp
 
   On the full plate, about 84 Mpx per layer are packed, read back and scanned. Drawing is under 1 ms a tile.
 - **Fallback:** with no context, an old GL or a framebuffer it can't make, the slice runs on the CPU, and the Log says why. The results show "Sliced on: GPU, 1.4 s" (or CPU); the (i) beside it pops up the device (the GL renderer, or the CPU model and thread count) and the time.
+- **Island checks** use the same setting and rasteriser, in a headless EGL context of their own (08 §5).
 - **Limits:** a non-watertight mesh has no consistent winding, so open areas can fill or empty wrongly. The CPU path closes open sections instead.

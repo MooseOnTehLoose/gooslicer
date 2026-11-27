@@ -383,3 +383,80 @@ def test_tip_shape_and_base_tip_in_supports():
     r1 = S.build_supports(shelf, sc, replace(q, bot_tip_shape="cube", bot_ball=True, bot_ball_diameter=0.8))
     assert r0.pillars[0].on_model and r1.pillars[0].on_model
     assert r1.mesh.volume > r0.mesh.volume
+
+
+def _bumpy():
+    a = trimesh.creation.icosphere(4, radius=8)
+    t = trimesh.creation.torus(6, 1.5)
+    t.apply_translation([0, 0, 9])
+    return _lifted(trimesh.util.concatenate([a, t]))
+
+
+def test_segment_check_shortcuts_change_no_answer(monkeypatch):
+    """The distance grid only decides what it can prove (08 §8 Speed): with its shortcuts off,
+    every segment gets the same answer from the exact tests alone."""
+    from gooslicer.raycast import Caster
+    m = _bumpy()
+    rng = np.random.default_rng(11)
+    A = rng.uniform(m.bounds[0] - 2, m.bounds[1] + 2, (600, 3))
+    B = A + rng.normal(0, 4, (600, 3))
+    A[:100] = m.vertices[rng.integers(0, len(m.vertices), 100)]    # tip ends on the surface
+    C = rng.choice([0.1, 0.4, 0.9], len(A))
+    fast = S._segments_clear(m, A, B, C)
+    monkeypatch.setattr(Caster, "far_outside", lambda self, P, need: np.zeros(len(np.atleast_2d(P)), bool))
+    monkeypatch.setattr(Caster, "maybe_inside", lambda self, P: np.zeros(len(np.atleast_2d(P)), bool))
+    exact = S._segments_clear(m, A, B, C)
+    assert (fast == exact).all()
+    assert fast.any() and (~fast).any()
+
+
+_GPU_ISLANDS = """
+import json, trimesh
+from gooslicer import supports as S
+from gooslicer.gl_headless import egl_context, HeadlessUnavailable
+try:
+    with egl_context():
+        pass
+except HeadlessUnavailable as e:
+    print(json.dumps({"skip": str(e)})); raise SystemExit
+base = trimesh.creation.box((4, 4, 2), trimesh.transformations.translation_matrix((0, 0, 1)))
+meshes = [base] + [trimesh.creation.box((s, s, s), trimesh.transformations.translation_matrix((8 * i, 6, 3 + s)))
+                   for i, s in enumerate((0.5, 1.0, 2.0, 3.0))]
+out = {}
+for gpu in (False, True):
+    out[str(gpu)] = [[i.z, i.area, i.height, list(i.point)] for i in S.unsupported_islands(meshes, 0.05, gpu=gpu)]
+print(json.dumps(out))
+"""
+
+
+def test_gpu_island_check_matches_cpu():
+    """The island check drawn on the GPU in a headless EGL context (08 §5) finds the same
+    islands as the CPU. In its own process, as in the app's workers."""
+    import json
+    import subprocess
+    import sys
+    r = subprocess.run([sys.executable, "-c", _GPU_ISLANDS], capture_output=True, text=True, timeout=300,
+                       cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    if "skip" in out:
+        pytest.skip("no headless OpenGL: " + out["skip"])
+    cpu, gpu = out["False"], out["True"]
+    assert len(cpu) == 4 and len(gpu) == len(cpu)
+    for c, g in zip(cpu, gpu):
+        assert g[0] == pytest.approx(c[0]) and g[2] == pytest.approx(c[2])
+        assert g[1] == pytest.approx(c[1], rel=0.05)
+        assert np.allclose(g[3], c[3], atol=0.2)
+
+
+def test_gpu_island_check_falls_back_to_the_cpu(monkeypatch):
+    from gooslicer import gl_headless
+
+    def broken():
+        raise gl_headless.HeadlessUnavailable("no GPU here")
+    monkeypatch.setattr(gl_headless, "egl_context", broken)
+    a = trimesh.creation.box((4, 4, 4), trimesh.transformations.translation_matrix((0, 0, 2)))
+    b = trimesh.creation.box((4, 4, 2), trimesh.transformations.translation_matrix((10, 0, 6)))
+    cpu = S.unsupported_islands([a, b])
+    gpu = S.unsupported_islands([a, b], gpu=True)
+    assert [(i.z, i.area, i.height) for i in gpu] == [(i.z, i.area, i.height) for i in cpu] and len(cpu) == 1

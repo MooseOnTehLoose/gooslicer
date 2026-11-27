@@ -102,7 +102,7 @@ class JobPanel(QWidget):
                                   "for Export and Send to printer")
         self.gpu_box = QCheckBox("Use the GPU (experimental)")
         self.gpu_box.setToolTip("Draw the layers on the graphics card instead of the CPU: several times "
-                                "faster. Edge pixels can differ slightly from the CPU slicer (which "
+                                "faster (island checks too). Edge pixels can differ slightly from the CPU slicer (which "
                                 "matches SatelLite), and models with holes in their mesh may slice "
                                 "wrongly. Falls back to the CPU if the GPU can't be used.")
         self.gpu_box.setChecked(win.gpu_slicing())

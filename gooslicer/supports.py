@@ -627,24 +627,118 @@ def _meet(a: np.ndarray, b: np.ndarray, tan_a: float) -> np.ndarray:
     return np.array([xy[0], xy[1], a[2] - da / tan_a])
 
 
-def _segment_clear(model, a: np.ndarray, b: np.ndarray, clearance: float) -> bool:
-    """The segment a→b does not pass through the model and keeps `clearance` from its
-    surface except right at a (a tip end may sit close to the surface)."""
-    v = b - a
-    L = float(np.linalg.norm(v))
-    if L < 1e-6:
-        return True
+def _samples(A: np.ndarray, B: np.ndarray, t0: float, t1: float, counts: np.ndarray):
+    """counts[i] points evenly from t0 to t1 along each segment A[i]→B[i]: (segment, point)."""
+    seg = np.repeat(np.arange(len(A)), counts)
+    first = np.cumsum(counts) - counts
+    k = np.arange(int(counts.sum())) - first[seg]
+    t = t0 + (t1 - t0) * k / np.maximum(counts[seg] - 1, 1)
+    return seg, A[seg] + t[:, None] * (B[seg] - A[seg])
+
+
+def _any_per(seg: np.ndarray, flags: np.ndarray, n: int) -> np.ndarray:
+    out = np.zeros(n, bool)
+    out[seg[flags]] = True
+    return out
+
+
+def _crosses_many(rc, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Per segment A[i]→B[i]: it passes through the surface (touching it at A[i] doesn't
+    count). Each in pieces of at most 1 mm: one long query would gather every face in a ball
+    around it. A piece the distance grid proves is in open air further than half its length
+    from the surface can't touch a face, so only the others are tested."""
+    n = len(A)
+    if not n:
+        return np.zeros(0, bool)
+    L = np.linalg.norm(B - A, axis=1)
+    k = np.where(L < 1e-9, 0, np.maximum(1, np.ceil(L / CROSS_PIECE))).astype(np.int64)
+    seg = np.repeat(np.arange(n), k)
+    first = np.cumsum(k) - k
+    j = np.arange(int(k.sum())) - first[seg]
+    s0 = A[seg] + (j / np.maximum(k[seg], 1))[:, None] * (B[seg] - A[seg])
+    s1 = A[seg] + ((j + 1) / np.maximum(k[seg], 1))[:, None] * (B[seg] - A[seg])
+    half = np.linalg.norm(s1 - s0, axis=1) / 2
+    test = np.flatnonzero(~rc.far_outside((s0 + s1) / 2, half + 1e-6))
+    fwd, back = np.zeros(len(seg), bool), np.zeros(len(seg), bool)
+    fwd[test], back[test] = rc.hits_both_ways(s0[test], s1[test])
+    return _any_per(seg, fwd, n) & _any_per(seg, back, n)
+
+
+def _segments_clear(model, A, B, clearance) -> np.ndarray:
+    """Per segment A[i]→B[i]: it does not pass through the model and keeps clearance[i] from
+    its surface except right at A[i] (a tip end may sit close to the surface).
+
+    The exact test: no crossing (`_crosses_many`), and points every 0.5 mm of the far three
+    quarters clear of the surface, the end not inside. Two shortcuts with the same answers:
+    - certainly clear: the far three quarters, every h (the distance grid's voxel), certainly
+      in open air and at least clearance + h/2 from the surface (`Caster.far_outside`). Every
+      point between is then clear and the surface can't be crossed there, so only the quarter
+      at A[i] needs the exact crossing test;
+    - certainly crossing: a point the grid hints is off the surface and out of the open air,
+      which the exact inside test finds inside the model while A[i] is outside."""
+    A = np.atleast_2d(np.asarray(A, np.float64))
+    B = np.atleast_2d(np.asarray(B, np.float64))
+    n = len(A)
+    c = np.broadcast_to(np.asarray(clearance, np.float64), (n,))
+    ok = np.ones(n, bool)
+    L = np.linalg.norm(B - A, axis=1)
+    todo = L >= 1e-6
+    if not todo.any():
+        return ok
     rc = caster(model)
-    # in pieces of at most 1 mm: one long query would gather every face in a ball around it
-    k = max(1, int(math.ceil(L)))
-    ends = a + np.linspace(0.0, 1.0, k + 1)[:, None] * v
-    fwd, _ = rc.segments(ends[:-1], ends[1:])
-    back, _ = rc.segments(ends[1:][::-1], ends[:-1][::-1])
-    if np.isfinite(fwd).any() and np.isfinite(back).any():    # crosses the surface
-        return False
-    t = np.linspace(0.25, 1.0, max(2, int(L / 0.5)))
-    pts = a + t[:, None] * v
-    return bool(rc.clear_of(pts, clearance).all()) and not rc.contains(pts[-1:])[0]
+    h = rc.voxel
+    idx = np.flatnonzero(todo)
+    a, b, cc, LL = A[idx], B[idx], c[idx], L[idx]
+    seg, far = _samples(a, b, 0.25, 1.0, np.maximum(2, np.ceil(0.75 * LL / h).astype(np.int64) + 1))
+    sure = ~_any_per(seg, ~rc.far_outside(far, np.maximum(cc[seg] + h / 2, h)), len(idx))
+    # certainly clear: only the quarter at a for crossings
+    q = np.flatnonzero(sure)
+    ok[idx[q]] = ~_crosses_many(rc, a[q], a[q] + 0.25 * (b[q] - a[q]))
+    rest = np.flatnonzero(~sure)
+    if not len(rest):
+        return ok
+    # certainly crossing: the first, middle and last hinted point of each
+    keep = np.zeros(len(idx), bool)
+    keep[rest] = True
+    hint = keep[seg] & rc.maybe_inside(far)
+    hs = seg[hint]
+    hp = far[hint]
+    crossing = np.zeros(len(idx), bool)
+    if len(hs):
+        segs, start, cnt = np.unique(hs, return_index=True, return_counts=True)
+        pick = np.r_[start, start + cnt // 2, start + cnt - 1]
+        inside = rc.contains(np.vstack([a[segs], hp[pick]]))
+        a_in, x_in = inside[:len(segs)], inside[len(segs):].reshape(3, -1).any(axis=0)
+        crossing[segs[~a_in & x_in]] = True
+    ok[idx[crossing]] = False
+    rest = rest[~crossing[rest]]
+    # the exact test for the others
+    cross = _crosses_many(rc, a[rest], b[rest])
+    ok[idx[rest[cross]]] = False
+    rest = rest[~cross]
+    if not len(rest):
+        return ok
+    pseg, pts = _samples(a[rest], b[rest], 0.25, 1.0, np.maximum(2, (LL[rest] / 0.5).astype(np.int64)))
+    near = np.zeros(len(pts), bool)
+    pc = cc[rest][pseg]
+    check = ~rc.far_outside(pts, pc)              # the others are certainly clear
+    for cv in np.unique(pc[check]):
+        m = np.flatnonzero(check & (pc == cv))
+        near[m] = ~rc.clear_of(pts[m], float(cv))
+    bad = _any_per(pseg, near, len(rest))
+    last = np.cumsum(np.maximum(2, (LL[rest] / 0.5).astype(np.int64))) - 1
+    bad |= rc.contains(pts[last])
+    ok[idx[rest[bad]]] = False
+    return ok
+
+
+def _segment_clear(model, a: np.ndarray, b: np.ndarray, clearance: float) -> bool:
+    """`_segments_clear` for one segment."""
+    return bool(_segments_clear(model, a, b, clearance)[0])
+
+
+TREE_BATCH = 32                 # tree merges judged together
+CROSS_PIECE = 1.0               # mm: crossing tests go in pieces this long (see _crosses_many)
 
 
 def plan_tree(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams):
@@ -684,26 +778,53 @@ def plan_tree(model: trimesh.Trimesh, contacts: list[Contact], p: SupportParams)
         xy = np.array([nd.pos[:2] for nd in nodes])
         for i, j in cKDTree(xy).query_pairs(reach):
             push(i, j)
+    trunk_clear = p.pillar_bottom_width / 2 + 0.1
+    good: dict = {}                     # (i, j) → the merge is allowed (depends only on i, j)
+
+    def judge(batch):
+        """Whether each merge is allowed: no model under the joint, both branches clear of the
+        model, and the joint's trunk reaching the raft clear of it. All the batch's segments
+        go to `_segments_clear` together (that and not per merge is what makes it fast)."""
+        M = np.array([e[3] for e in batch])
+        _, hit = caster(model).vertical(M - [0, 0, 1e-3])
+        A, B, C, owner = [], [], [], []
+        for k, (_, i, j, m) in enumerate(batch):
+            for q in (nodes[i].pos, nodes[j].pos):
+                if np.linalg.norm(q - m) > 1e-6:
+                    A.append(q), B.append(m), C.append(clearance), owner.append(k)
+            A.append(m), B.append(np.array([m[0], m[1], base])), C.append(trunk_clear), owner.append(k)
+        clear = _segments_clear(model, np.array(A), np.array(B), np.array(C))
+        bad = np.zeros(len(batch), bool)
+        bad[np.array(owner)[~clear]] = True
+        for k, e in enumerate(batch):
+            good[(e[1], e[2])] = bool(hit[k] < 0 and not bad[k])
+
+    # merges in order of joint height, highest first, as one at a time; judged in batches. A
+    # merge adds candidates; if one outranks the rest of the batch they go back on the heap
+    # (judged already), so the order and the result are those of judging one at a time
     while heap:
-        _, i, j, m = heapq.heappop(heap)
-        if i not in active or j not in active:
-            continue
-        a, b = nodes[i].pos, nodes[j].pos
-        _, hit = caster(model).vertical(m[None] - [0, 0, 1e-3])   # cheap test first: model under the joint
-        ok = hit[0] < 0 and all(_segment_clear(model, q, m, clearance)
-                                for q in (a, b) if np.linalg.norm(q - m) > 1e-6)
-        if ok:              # the joint's trunk must reach the raft clear of the model
-            ok = _segment_clear(model, m, np.array([m[0], m[1], base]), p.pillar_bottom_width / 2 + 0.1)
-        if not ok:
-            continue
-        k = len(nodes)
-        nodes.append(_Node(m, [i, j], -1, nodes[i].weight + nodes[j].weight))
-        nodes[i].parent = nodes[j].parent = k
-        active -= {i, j}
-        for o in active:
-            if np.linalg.norm(nodes[o].pos[:2] - m[:2]) <= reach:
-                push(k, o)
-        active.add(k)
+        batch = []
+        while heap and len(batch) < TREE_BATCH:
+            e = heapq.heappop(heap)
+            if e[1] in active and e[2] in active:
+                batch.append(e)
+        judge([e for e in batch if (e[1], e[2]) not in good])
+        for n_done, (_, i, j, m) in enumerate(batch):
+            if i not in active or j not in active or not good[(i, j)]:
+                continue
+            k = len(nodes)
+            nodes.append(_Node(m, [i, j], -1, nodes[i].weight + nodes[j].weight))
+            nodes[i].parent = nodes[j].parent = k
+            active -= {i, j}
+            for o in active:
+                if np.linalg.norm(nodes[o].pos[:2] - m[:2]) <= reach:
+                    push(k, o)
+            active.add(k)
+            later = batch[n_done + 1:]
+            if later and heap and heap[0] < later[0]:
+                for e in later:
+                    heapq.heappush(heap, e)
+                break
     roots = sorted(active)
     # each contact's path down to its root's foot
     for leaf, pi in enumerate(ground):
@@ -892,21 +1013,54 @@ ISLAND_MAX_AREA = 5.0       # mm²
 def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.05,
                         first_layer: float | None = None, min_area: float = 0.01,
                         pixel: float = 0.1, max_hang: float = ISLAND_MAX_HANG,
-                        max_area: float = ISLAND_MAX_AREA) -> list[Island]:
+                        max_area: float = ISLAND_MAX_AREA, gpu: bool = False) -> list[Island]:
     """Regions that print in mid-air. The union of all meshes is rasterised at `pixel` mm per
     layer. The first layer rests on the plate and is grounded; a connected region of a later
     layer is grounded when it shares a pixel with grounded material of the layer below.
     Ungrounded regions are followed upward (they keep their identity while they overlap) and
-    reported when they stay ungrounded for more than `max_hang` mm or reach `max_area` mm²."""
-    from scipy import ndimage
+    reported when they stay ungrounded for more than `max_hang` mm or reach `max_area` mm².
+    gpu: draw the layers on the GPU (gpu_raster, in a headless EGL context: worker processes
+    only), several times faster; on the CPU if that can't start. A few edge pixels per layer can
+    differ, as when slicing on the GPU."""
+    if gpu:
+        from .gl_headless import HeadlessUnavailable, egl_context
+        try:
+            with egl_context():
+                from .gpu_raster import GpuRasterizer
+                return _islands(meshes, layer_height, first_layer, min_area, pixel, max_hang,
+                                max_area, lambda ms, spec: GpuRasterizer(ms, spec))
+        except HeadlessUnavailable:
+            pass
+        except Exception:  # noqa: BLE001 (drivers fail in many ways: the CPU always works)
+            pass
+    return _islands(meshes, layer_height, first_layer, min_area, pixel, max_hang, max_area, None)
 
-    from .raster import RasterSpec, rasterize_bitmap
-    from .slicer import _Body
-    # each mesh is sliced on its own and the outlines filled together (non-zero winding), which
-    # is their union without a boolean; meshes that aren't closed are sectioned as the slicer does
+
+class _CpuLayers:
+    """Layer bitmaps on the CPU: each mesh sectioned and the outlines filled together
+    (non-zero winding), which is their union without a boolean; meshes that aren't closed are
+    sectioned as the slicer does. Same interface as gpu_raster.GpuRasterizer."""
+
+    def __init__(self, meshes, spec):
+        from .slicer import _Body
+        self.spec = spec
+        self.bodies = [_Body(np.asarray(m.vertices), np.asarray(m.faces)) for m in meshes]
+
+    def bitmap(self, z: float) -> np.ndarray:
+        from .raster import rasterize_bitmap
+        polys = [q for b in self.bodies for q in b.section(z)]
+        if not polys:
+            return np.zeros((self.spec.res_y, self.spec.res_x), np.uint8)
+        return rasterize_bitmap(polys, self.spec)
+
+    def close(self) -> None:
+        pass
+
+
+def _islands(meshes, layer_height, first_layer, min_area, pixel, max_hang, max_area, make_layers):
+    from .raster import RasterSpec
     meshes = [m for m in meshes if len(m.faces)]
-    bodies = [_Body(np.asarray(m.vertices), np.asarray(m.faces)) for m in meshes]
-    if not bodies:
+    if not meshes:
         return []
     lo = np.min([m.bounds[0] for m in meshes if len(m.faces)], axis=0)
     hi = np.max([m.bounds[1] for m in meshes if len(m.faces)], axis=0)
@@ -921,10 +1075,6 @@ def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.0
     z = first_layer if first_layer is not None else h / 2
     px2 = pixel ** 2
     min_px = max(1, int(min_area / px2))
-    ground = None                   # grounded pixels of the previous layer
-    ids = None                      # island id per ungrounded pixel of the previous layer (0 = none)
-    found: list[Island] = []        # every ungrounded region, indexed by id - 1
-    cells: list[list[np.ndarray]] = []   # flat pixel indices per island, every layer
     zs = []
     while z < zmax:
         zs.append(z)
@@ -932,9 +1082,34 @@ def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.0
         if z < zmin - h:            # skip empty air below the body (nothing to ground or track)
             n_skip = int((zmin - h - z) / h)
             z += n_skip * h
+    layers = (make_layers or _CpuLayers)(meshes, spec)
+    try:
+        found, cells = _track_islands(layers, zs, spec, h, pixel, min_px)
+    finally:
+        layers.close()
+    out = []
+    for isl, cl in zip(found, cells):
+        if not (isl.height > max_hang + 1e-9 or isl.area >= max_area):
+            continue
+        rr, cc = np.divmod(np.unique(np.concatenate(cl)), spec.res_x)
+        mask = np.zeros((rr.max() - rr.min() + 1, cc.max() - cc.min() + 1), bool)
+        mask[rr - rr.min(), cc - cc.min()] = True
+        isl.footprint = (spec.ox + cc.min() * pixel, spec.oy + rr.min() * pixel, pixel, mask)
+        out.append(isl)
+    return out
+
+
+def _track_islands(layers, zs, spec, h, pixel, min_px):
+    """Follow ungrounded regions up the layers (see unsupported_islands): (islands, flat pixel
+    indices of each, per layer)."""
+    from scipy import ndimage
+    px2 = pixel ** 2
+    ground = None                   # grounded pixels of the previous layer
+    ids = None                      # island id per ungrounded pixel of the previous layer (0 = none)
+    found: list[Island] = []        # every ungrounded region, indexed by id - 1
+    cells: list[list[np.ndarray]] = []   # flat pixel indices per island, every layer
     for z in zs:
-        polys = [q for b in bodies for q in b.section(z)]
-        cur = rasterize_bitmap(polys, spec) > 0 if polys else np.zeros((spec.res_y, spec.res_x), bool)
+        cur = layers.bitmap(z) > 0
         if ground is None:
             ground, ids = cur, np.zeros(cur.shape, np.int32)
         else:
@@ -968,16 +1143,7 @@ def unsupported_islands(meshes: list[trimesh.Trimesh], layer_height: float = 0.0
                     cells[i - 1].append(np.flatnonzero(m))
                     new_ids[m] = i
             ground, ids = np.isin(lab, g), new_ids
-    out = []
-    for isl, cl in zip(found, cells):
-        if not (isl.height > max_hang + 1e-9 or isl.area >= max_area):
-            continue
-        rr, cc = np.divmod(np.unique(np.concatenate(cl)), spec.res_x)
-        mask = np.zeros((rr.max() - rr.min() + 1, cc.max() - cc.min() + 1), bool)
-        mask[rr - rr.min(), cc - cc.min()] = True
-        isl.footprint = (spec.ox + cc.min() * pixel, spec.oy + rr.min() * pixel, pixel, mask)
-        out.append(isl)
-    return out
+    return found, cells
 
 
 def island_faces(meshes: list[trimesh.Trimesh], islands: list[Island],
@@ -1027,14 +1193,15 @@ def island_faces_each(meshes: list[trimesh.Trimesh], islands: list[Island],
 
 # ------------------------------------------------------------------------- auto support
 def auto_support(model: trimesh.Trimesh, p: SupportParams, extra: list[Contact] | None = None,
-                 max_passes: int = 3) -> tuple[list[Contact], SupportResult, list[Island]]:
-    """Detect contacts, build, then add a contact under every remaining floating island."""
+                 max_passes: int = 3, gpu: bool = False) -> tuple[list[Contact], SupportResult, list[Island]]:
+    """Detect contacts, build, then add a contact under every remaining floating island (the
+    island check on the GPU with gpu=True: see unsupported_islands)."""
     contacts = detect_contacts(model, p) + list(extra or [])
     res = build_supports(model, contacts, p)
     islands = []
     for _ in range(max_passes):
         meshes = [model] + ([res.mesh] if res.mesh is not None else [])
-        islands = unsupported_islands(meshes, layer_height=0.1)
+        islands = unsupported_islands(meshes, layer_height=0.1, gpu=gpu)
         if not islands:
             break
         added = []

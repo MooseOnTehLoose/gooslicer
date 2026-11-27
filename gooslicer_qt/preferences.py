@@ -365,9 +365,10 @@ class PreferencesDialog(QDialog):
         self.gpu.setToolTip(jp.gpu_box.toolTip())
         self.gpu.toggled.connect(jp.gpu_box.setChecked)
         f.addRow("Slicing", self.gpu)
-        f.addRow(_note("Draws the layers with OpenGL: several times faster. A few edge pixels per layer "
-                       "can differ from the CPU, and a mesh with holes can slice wrongly (repair it "
-                       "first). Falls back to the CPU if the GPU can't be used."))
+        f.addRow(_note("Draws the layers with OpenGL: several times faster. Island checks (and the "
+                       "ones auto-support runs) use it too. A few edge pixels per layer can differ "
+                       "from the CPU, and a mesh with holes can slice wrongly (repair it first). "
+                       "Falls back to the CPU if the GPU can't be used."))
 
         def refresh():
             self.gpu.blockSignals(True)
@@ -502,6 +503,11 @@ class PreferencesDialog(QDialog):
         f.addRow("Import", self.auto_repair)
         f.addRow(_note("A model that checks clean is left as it is. With this off, Repair mesh (Mesh "
                        "pane) still fixes a model on request."))
+        self.repair_edits = QCheckBox("Repair after edits")
+        self.repair_edits.setToolTip("Repair a model that hollowing, a drain hole or sealing a cavity "
+                                     "leaves broken, in the same undo step; it's listed as \"(repaired)\"")
+        self.repair_edits.toggled.connect(lambda on: s.setValue("mesh/autoRepairEdits", bool(on)))
+        f.addRow("Edits", self.repair_edits)
 
         def refresh():
             for key, lab in self.folder_labels.items():
@@ -513,6 +519,9 @@ class PreferencesDialog(QDialog):
             self.auto_repair.blockSignals(True)
             self.auto_repair.setChecked(self.win.auto_repair())
             self.auto_repair.blockSignals(False)
+            self.repair_edits.blockSignals(True)
+            self.repair_edits.setChecked(self.win.repair_after_edits())
+            self.repair_edits.blockSignals(False)
 
         def reset():
             for key, *_ in FOLDERS:
@@ -520,6 +529,7 @@ class PreferencesDialog(QDialog):
             proj.set_autosave_minutes(5)
             s.remove("recent/max")
             s.remove("import/autoRepair")
+            s.remove("mesh/autoRepairEdits")
             proj.update_recent_menu()
         refresh()
         return _Page("Files and folders", w, reset=reset, refresh=refresh)

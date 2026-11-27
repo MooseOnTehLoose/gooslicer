@@ -78,6 +78,18 @@ void main() {
 """
 
 
+def _gl_string(name: int) -> str:
+    """glGetString as text. PyOpenGL's wrapper gives bytes or, for a context it didn't make
+    (a headless EGL one), a pointer: read that as a C string."""
+    import ctypes
+    v = GL.glGetString(name)
+    if not v:
+        return ""
+    if not isinstance(v, (bytes, bytearray)):
+        v = ctypes.cast(v, ctypes.c_char_p).value or b""
+    return bytes(v).decode(errors="replace")
+
+
 class GpuUnavailable(RuntimeError):
     """No usable OpenGL (no context, too old, or the image doesn't fit). Slice on the CPU."""
 
@@ -183,7 +195,7 @@ class GpuRasterizer:
             raise GpuUnavailable(f"no OpenGL context: {e}") from e
         if not ver:
             raise GpuUnavailable("no OpenGL context")
-        self.renderer = (GL.glGetString(GL.GL_RENDERER) or b"").decode(errors="replace")
+        self.renderer = _gl_string(GL.GL_RENDERER)
         self.spec = spec
         limit = min(int(GL.glGetIntegerv(GL.GL_MAX_RENDERBUFFER_SIZE)),
                     int(np.min(GL.glGetIntegerv(GL.GL_MAX_VIEWPORT_DIMS))))

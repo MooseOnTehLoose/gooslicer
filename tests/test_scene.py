@@ -315,3 +315,17 @@ def test_slim_drops_caches_but_keeps_normals():
     fresh = trimesh.Trimesh(trimesh.creation.box().vertices, trimesh.creation.box().faces)
     M.slim(fresh)
     assert "face_normals" in fresh._cache.cache and "triangles" not in fresh._cache.cache
+
+
+def test_checked_repairs_only_when_asked_and_broken():
+    """04, repair after edits: jobs.checked repairs a broken mesh when asked, and leaves a clean
+    one (or any, when off) as it is."""
+    from gooslicer import jobs
+    box = trimesh.creation.box((10, 10, 10))
+    holey = trimesh.Trimesh(box.vertices, box.faces[:-1], process=False)
+    out, rep, fixed = jobs.checked(holey, True)
+    assert rep.ok and fixed and out.volume == pytest.approx(1000)
+    out, rep, fixed = jobs.checked(holey, False)
+    assert out is holey and not rep.ok and fixed is None
+    out, rep, fixed = jobs.checked(box, True)
+    assert out is box and rep.ok and fixed is None

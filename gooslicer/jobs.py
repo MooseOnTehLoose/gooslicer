@@ -14,10 +14,10 @@ def _red(meshes, masks) -> list:
     return [m.submesh([np.flatnonzero(sel)], append=True) for m, sel in zip(meshes, masks) if sel.any()]
 
 
-def islands_and_faces(meshes, layer_height):
-    """The island check, plus each island's unsupported surface as red meshes for the 3D view:
-    (islands, [[meshes] per island])."""
-    isl = S.unsupported_islands(meshes, layer_height=layer_height)
+def islands_and_faces(meshes, layer_height, gpu: bool = False):
+    """The island check (on the GPU with gpu=True), plus each island's unsupported surface as
+    red meshes for the 3D view: (islands, [[meshes] per island])."""
+    isl = S.unsupported_islands(meshes, layer_height=layer_height, gpu=gpu)
     reds = [_red(meshes, masks) for masks in S.island_faces_each(meshes, isl, layer_height)] if isl else []
     return isl, reds
 
@@ -55,3 +55,21 @@ def hollow_mesh(mesh: trimesh.Trimesh, scale, s) -> tuple[trimesh.Trimesh, H.Hol
     m, flipped = scaled(SimpleNamespace(mesh=mesh, scale=np.asarray(scale, float)))
     res = H.hollow(m, s)
     return unscaled(res.mesh, scale, flipped), res
+
+
+def checked(mesh: trimesh.Trimesh, repair: bool):
+    """(mesh, its check, what repair fixed or None): the mesh repaired when `repair` is on and
+    it fails its check (04: repair after edits)."""
+    from . import mesh as M
+    rep = M.analyze(mesh)
+    if not repair or rep.ok:
+        return mesh, rep, None
+    fixed = M.repair(mesh)
+    return fixed, M.analyze(fixed), rep.problems()
+
+
+def hollow_checked(mesh: trimesh.Trimesh, scale, s, repair: bool):
+    """hollow_mesh, then `checked`: (mesh, result, check, what repair fixed or None)."""
+    out, res = hollow_mesh(mesh, scale, s)
+    out, rep, fixed = checked(out, repair)
+    return out, res, rep, fixed

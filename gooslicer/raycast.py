@@ -16,6 +16,14 @@ size levels: grids whose cells are LEVEL_STEP times wider than the level below (
 the level where it spans at most 2 x 2 cells), and one k-d tree per doubling of face radius.
 Queries run in chunks of CHUNK so memory stays bounded however many rays there are.
 
+Tree supports ask thousands of small clearance questions, one merge at a time. For those a
+distance grid (`far_outside`, built on first use) answers "certainly clear" without touching a
+face: voxels of at most DIST_VOXELS over the model, the distance from each to the surface
+(Euclidean distance transform of the voxels holding surface samples), and which are open air
+(reachable from outside the model). Its answer is a proven lower bound, so a point it can't
+clear just goes to the exact test: results are the same, only faster. (A k-d tree of fine
+surface samples gave a closer bound but cost more than the exact tests it saved.)
+
 A Caster is built once per mesh (under a second for 650k faces) and cached while the mesh lives.
 """
 from __future__ import annotations
@@ -31,6 +39,7 @@ EPS = 1e-9
 MAX_CELLS = 1 << 20           # finest grid size limit
 LEVEL_STEP = 4                # grid cell growth per level
 CHUNK = 512                   # queries per batch
+DIST_VOXELS = 8_000_000       # distance grid size limit (0.2 s to build at this size)
 _CACHE: dict = {}
 
 
@@ -93,9 +102,11 @@ class Caster:
         self.normals = np.asarray(mesh.face_normals) if self.n else np.zeros((0, 3))
         self.grids: list[_Grid] = []
         self.trees: list[_Tree] = []
+        self._dist = None
         if not self.n:
             return
         lo, hi = self.tri.min(axis=1), self.tri.max(axis=1)
+        self._box = (lo.min(axis=0), hi.max(axis=0))
         # ---- XY grids for vertical rays
         self.g0 = lo.min(axis=0)[:2]
         span = np.maximum(hi.max(axis=0)[:2] - self.g0, 1e-6)
@@ -223,6 +234,35 @@ class Caster:
                 & (t > EPS) & (t <= 1.0)
         return _first_per_query(q[ok], t[ok], face[ok], len(A))
 
+    def hits_both_ways(self, a, b):
+        """Per segment: (some face is hit going a→b, some face is hit going b→a), as `segments`
+        both ways, but with one candidate search for both."""
+        A = np.atleast_2d(np.asarray(a, np.float64))
+        B = np.atleast_2d(np.asarray(b, np.float64))
+        n = len(A)
+        fwd, back = np.zeros(n, bool), np.zeros(n, bool)
+        if not self.n:
+            return fwd, back
+        for s in range(0, n, CHUNK):
+            A1, B1 = A[s:s + CHUNK], B[s:s + CHUNK]
+            q, face = self._near((A1 + B1) / 2, np.linalg.norm(B1 - A1, axis=1) / 2)
+            T = self.tri[face]
+            for o, dd, out in ((A1[q], (B1 - A1)[q], fwd), (B1[q], (A1 - B1)[q], back)):
+                e1, e2 = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]
+                p = np.cross(dd, e2)
+                det = np.einsum("ij,ij->i", e1, p)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    inv = 1.0 / det
+                    sv = o - T[:, 0]
+                    u = np.einsum("ij,ij->i", sv, p) * inv
+                    qv = np.cross(sv, e1)
+                    v = np.einsum("ij,ij->i", dd, qv) * inv
+                    t = np.einsum("ij,ij->i", e2, qv) * inv
+                    ok = (np.abs(det) > 1e-14) & (u >= -1e-7) & (v >= -1e-7) & (u + v <= 1 + 1e-7) \
+                        & (t > EPS) & (t <= 1.0)
+                out[s + q[ok]] = True
+        return fwd, back
+
     def rays(self, origins, directions, max_dist: float):
         """First hit within max_dist along unit directions: (distance, face), inf / -1 if none.
         Vertical directions use the grids; others are tested as segments."""
@@ -258,3 +298,90 @@ class Caster:
                 close = np.linalg.norm(cp - c[q], axis=1) < clearance
                 ok[s + q[close]] = False
         return ok
+
+    # ------------------------------------------------------------------ distance grid
+    @staticmethod
+    def _surface_samples(tri: np.ndarray, step: float):
+        """Points on the triangles at most `step` apart along their edges (each face's
+        barycentric grid), so every surface point is within step/sqrt 3 of one; in chunks."""
+        e = np.linalg.norm(tri - np.roll(tri, 1, axis=1), axis=2).max(axis=1)
+        ks = np.maximum(np.ceil(e / step), 1).astype(np.int64)
+        for k in np.unique(ks):
+            ids = np.flatnonzero(ks == k)
+            i, j = np.meshgrid(np.arange(k + 1), np.arange(k + 1), indexing="ij")
+            keep = i + j <= k
+            w = np.c_[i[keep], j[keep]] / k                     # (m, 2) barycentric u, v
+            per = max(1, 2_000_000 // len(w))
+            for s0 in range(0, len(ids), per):
+                T = tri[ids[s0:s0 + per]]
+                P = T[:, None, 0] + w[None, :, :1] * (T[:, None, 1] - T[:, None, 0]) \
+                    + w[None, :, 1:] * (T[:, None, 2] - T[:, None, 0])
+                yield P.reshape(-1, 3)
+
+    def _distance_grid(self):
+        """(origin, voxel size h, distance lower bound per voxel in mm, open air per voxel)."""
+        from scipy import ndimage
+        lo, hi = self.tri.reshape(-1, 3).min(axis=0), self.tri.reshape(-1, 3).max(axis=0)
+        ext = np.maximum(hi - lo, 1e-3)
+        h = max(float(np.cbrt(np.prod(ext + 1.0) / DIST_VOXELS)), 1e-3)
+        org = lo - 2 * h                                       # two voxels of air all round
+        shape = tuple(int(x) for x in np.floor((hi - org) / h).astype(np.int64) + 3)
+        occ = np.zeros(shape, bool)
+        step = h / 2                                           # surface samples for the grid
+        for P in self._surface_samples(self.tri, step):
+            v = np.floor((P - org) / h).astype(np.int64)
+            occ[v[:, 0], v[:, 1], v[:, 2]] = True
+        dist = ndimage.distance_transform_edt(~occ).astype(np.float32) * h
+        # any point of the voxel to the nearest surface: centre to centre, less half a voxel's
+        # diagonal at each end and the sample spacing (step/sqrt 3)
+        dist -= np.float32(h * np.sqrt(3) + step / np.sqrt(3))
+        # open air: grown by one voxel, the surface voxels leave no gap from inside to outside
+        wall = ndimage.binary_dilation(occ, np.ones((3, 3, 3), bool))
+        lab, _ = ndimage.label(~wall)
+        air = lab == lab[0, 0, 0]
+        return org, h, dist, air
+
+    def far_outside(self, points, need) -> np.ndarray:
+        """Points certainly in the open air outside the model and at least `need` (one value,
+        or one per point) from its surface (False means: not certain; ask the exact test)."""
+        P = np.atleast_2d(np.asarray(points, np.float64))
+        need = np.broadcast_to(np.asarray(need, np.float64), (len(P),))
+        if not self.n:
+            return np.ones(len(P), bool)
+        if self._dist is None:
+            self._dist = self._distance_grid()
+        org, h, dist, air = self._dist
+        v = np.floor((P - org) / h).astype(np.int64)
+        inside = np.all((v >= 0) & (v < np.array(dist.shape)), axis=1)
+        out = np.zeros(len(P), bool)
+        vi = v[inside]
+        out[inside] = air[vi[:, 0], vi[:, 1], vi[:, 2]] & (dist[vi[:, 0], vi[:, 1], vi[:, 2]] >= need[inside])
+        # beyond the grid: at least the distance to the model's box (and air)
+        lo, hi = self._box
+        gap = np.linalg.norm(np.maximum(np.maximum(lo - P, P - hi), 0.0), axis=1)
+        out[~inside] = gap[~inside] >= need[~inside]
+        return out
+
+    def maybe_inside(self, points) -> np.ndarray:
+        """Points off the surface (by the grid's bound) and not in the open air: inside the
+        model, in a sealed cavity, or in a pocket the grid closed off. A hint for which points
+        to give the exact inside test, never an answer."""
+        P = np.atleast_2d(np.asarray(points, np.float64))
+        if not self.n:
+            return np.zeros(len(P), bool)
+        if self._dist is None:
+            self._dist = self._distance_grid()
+        org, h, dist, air = self._dist
+        v = np.floor((P - org) / h).astype(np.int64)
+        ok = np.all((v >= 0) & (v < np.array(dist.shape)), axis=1)
+        out = np.zeros(len(P), bool)
+        vi = v[ok]
+        out[ok] = ~air[vi[:, 0], vi[:, 1], vi[:, 2]] & (dist[vi[:, 0], vi[:, 1], vi[:, 2]] > 0)
+        return out
+
+    @property
+    def voxel(self) -> float:
+        """The distance grid's voxel size (builds it)."""
+        if self._dist is None:
+            self._dist = self._distance_grid()
+        return self._dist[1]

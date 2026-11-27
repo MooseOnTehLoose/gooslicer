@@ -192,6 +192,37 @@ def test_repair_on_import(app, win, tmp_path):
     d.close()
 
 
+@pytest.mark.parametrize("on", [True, False])
+def test_repair_after_an_edit(app, win, tmp_path, monkeypatch, on):
+    """04: a drain hole that leaves the part broken is repaired in the same undo step and the
+    part is listed "(repaired)", unless Preferences → Repair after edits is off."""
+    import gooslicer_qt.main as mainmod
+    from gooslicer_qt.preferences import PreferencesDialog
+    wait_import(app, win, [box_file(tmp_path)])
+    p = win.scene.parts[0]
+    d = PreferencesDialog(win)
+    assert d.repair_edits.isChecked()                        # on by default
+    d.repair_edits.setChecked(on)
+    d.close()
+
+    def broken_drill(part, hit, axis, s):                    # a hole leaving a hole in the mesh
+        m = part.mesh
+        return trimesh.Trimesh(m.vertices, np.asarray(m.faces)[:-1], process=False), None
+    monkeypatch.setattr(mainmod, "drill_part_keep", broken_drill)
+    n0 = win.undo.index()
+    loop = QEventLoop()
+    win.undo.indexChanged.connect(loop.quit)
+    QTimer.singleShot(30000, loop.quit)
+    win._hole_picked(p.id, 0, p.position)
+    loop.exec()
+    win.undo.indexChanged.disconnect(loop.quit)
+    assert win.undo.index() == n0 + 1
+    p = win.scene.parts[0]
+    assert p.repaired == on and win.reports[id(p.mesh)].ok == on
+    assert (win.parts.item(0).text() == "box (repaired)") == on
+    win.settings.remove("mesh/autoRepairEdits")
+
+
 def test_repair_broken_mesh(app, win, tmp_path):
     win.settings.setValue("import/autoRepair", False)      # import it broken, repair by hand
     wait_import(app, win, [box_file(tmp_path, broken=True, name="holey.stl")])

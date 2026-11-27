@@ -786,13 +786,22 @@ class MainWindow(QMainWindow):
         self.statusBar().clearMessage()
 
     # ------------------------------------------------------- hollow / drain holes
-    def _replace_mesh(self, pid, mesh, text, report=None, opacity=None):
+    def repair_after_edits(self) -> bool:
+        """Repair a part an edit (hollow, drain hole, sealed cavity) leaves broken (04; Preferences
+        → Files and folders)."""
+        return str(self.settings.value("mesh/autoRepairEdits", True)).lower() not in ("false", "0")
+
+    def _replace_mesh(self, pid, mesh, text, report=None, opacity=None, fixed=None):
         """Swap in a new mesh as an undo step. Pass the mesh's analysis if it was made off the
-        GUI thread (it takes about a second for 300k triangles)."""
+        GUI thread (it takes about a second for 300k triangles), and `fixed` (what repair fixed)
+        if it was repaired after the edit: the part is then listed "(repaired)"."""
         if self.scene.get(pid) is None:
             return
+        if report is None:
+            mesh, report, fixed = jobs.checked(mesh, self.repair_after_edits())
         self.reports.pop(id(self.scene.get(pid).mesh), None)
-        self.undo.push(MeshCommand(self, pid, mesh, text, opacity=opacity))
+        self.undo.push(MeshCommand(self, pid, mesh, text, opacity=opacity,
+                                   repaired=True if fixed else None))
         new = self.scene.get(pid).mesh
         self.reports[id(new)] = report if report is not None else meshmod.analyze(new)
         meshmod.slim(new)
@@ -857,16 +866,17 @@ class MainWindow(QMainWindow):
         def done(res):
             self._hollowing.discard(pid)
             self._update_hollow_panel()
-            mesh, r = res
+            mesh, r, rep, fixed = res
             if self.scene.get(pid) is None:
                 return
-            self._replace_mesh(pid, mesh, "Hollow", opacity=opacity)
+            self._replace_mesh(pid, mesh, "Hollow", report=rep, opacity=opacity, fixed=fixed)
             self.log_msg(f"Hollowed {name}: {r.cavities} cavit{'y' if r.cavities == 1 else 'ies'}, "
                          f"volume {r.original_volume:.1f} → {mesh.volume * float(np.prod(np.abs(self.scene.get(pid).scale))):.1f} mm³. "
                          + (f"{r.pillars} pillar{'' if r.pillars == 1 else 's'} hold up the cavity's ceilings. "
                             if r.pillars else "")
                          + ("The floor is open. " if hs.hollow_type == "open_bottom" else
-                            "Add drain holes (Ctrl+Shift+D) so resin can escape."))
+                            "Add drain holes (Ctrl+Shift+D) so resin can escape.")
+                         + self._repair_note(fixed, rep))
             self.statusBar().showMessage("Hollowed — add drain holes", 8000)
             self.hollowFinished.emit(True)
 
@@ -877,7 +887,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP, "Hollow failed: " + msg.splitlines()[0])
             self.statusBar().clearMessage()
             self.hollowFinished.emit(False)
-        workers.submit_process(jobs.hollow_mesh, p.mesh, p.scale.copy(), hs, on_done=done, on_failed=failed)
+        workers.submit_process(jobs.hollow_checked, p.mesh, p.scale.copy(), hs, self.repair_after_edits(),
+                               on_done=done, on_failed=failed)
+
+    @staticmethod
+    def _repair_note(fixed, rep) -> str:
+        """For the log: what repair after an edit fixed, and anything left."""
+        return ((f" Repaired: {'; '.join(fixed)}." if fixed else "")
+                + ("" if rep.ok else f" ⚠ {'; '.join(rep.problems())}"))
 
     def drain_hole_mode(self):
         """Show the drain-hole settings over the top-left of the 3D view and drill where the
@@ -942,24 +959,30 @@ class MainWindow(QMainWindow):
         left = len(self._hole_queue)
         self.statusBar().showMessage(f"Drilling a drain hole in {name}…" + (f" ({left} more waiting)" if left else ""))
 
+        repair = self.repair_after_edits()
+
         def work():
             mesh, pin = drill_part_keep(snap, hit, axis, s)
-            return mesh, meshmod.analyze(mesh), pin
+            mesh, rep, fixed = jobs.checked(mesh, repair)
+            if pin is not None:
+                pin = jobs.checked(pin, repair)
+            return mesh, rep, fixed, pin
 
         def done(res):
             self._drilling = False
-            mesh, rep, pin = res
+            mesh, rep, fixed, pin = res
             now = self.scene.get(pid)
             if now is not None and now.mesh is src:         # not undone or changed meanwhile
                 kind = "Slot" if s.hole_form == "slot" else "Drain hole"
                 if pin is not None:
                     self.undo.beginMacro(kind)
-                self._replace_mesh(pid, mesh, kind, report=rep)
+                self._replace_mesh(pid, mesh, kind, report=rep, fixed=fixed)
                 if pin is not None:
                     self._add_pin(name, pin)
                     self.undo.endMacro()
                 self.log_msg(f"{kind} in {name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
-                             f"Ø{2 * s.radius1:.1f} mm" + (", pin kept as a new part" if pin is not None else ""))
+                             f"Ø{2 * s.radius1:.1f} mm" + (", pin kept as a new part" if pin is not None else "")
+                             + "." + self._repair_note(fixed, rep))
                 self.viewport.repick_hole()                 # the surface under the cursor changed
             self._drill_finished()
 
@@ -970,12 +993,14 @@ class MainWindow(QMainWindow):
         workers.submit(work, on_done=done, on_failed=failed)
 
     def _add_pin(self, name: str, pin) -> None:
-        """A drain hole's kept plug as a new part, set down on the plate beside the others (an
-        undoable add)."""
+        """A drain hole's kept plug, (mesh, check, what repair fixed), as a new part, set down
+        on the plate beside the others (an undoable add)."""
+        pin, rep, fixed = pin
         part = Part.from_mesh(f"{name} pin", pin)
+        part.repaired = bool(fixed)
         self.scene.drop_to_plate(part)
         self.scene.place_free(part)
-        self.reports[id(part.mesh)] = meshmod.analyze(part.mesh)
+        self.reports[id(part.mesh)] = rep                # the check doesn't depend on position
         self.undo.push(AddPartsCommand(self, [part], "Add hole pin"))
 
     def _drill_finished(self) -> None:
@@ -1255,7 +1280,8 @@ class MainWindow(QMainWindow):
             self.log_msg("Auto-support failed: " + msg.splitlines()[0])
             self.statusBar().clearMessage()
             self.supportsFinished.emit(-1)
-        workers.submit_process(supportmod.auto_support, model, params, then=_auto_supported,
+        workers.submit_process(supportmod.auto_support, model, params, None, 3, self.gpu_slicing(),
+                               then=_auto_supported,
                                on_done=done, on_failed=failed)
 
     def clear_supports(self):
@@ -1436,7 +1462,8 @@ class MainWindow(QMainWindow):
         def failed(msg):
             self.log_msg("Island check failed: " + msg.splitlines()[0])
             on_done(None)
-        workers.submit_process(jobs.islands_and_faces, meshes, max(h, 0.05), then=_reds_ready,
+        workers.submit_process(jobs.islands_and_faces, meshes, max(h, 0.05), self.gpu_slicing(),
+                               then=_reds_ready,
                                on_done=done, on_failed=failed)
 
     def fix_islands(self, params, template: str, on_done) -> None:
@@ -1842,7 +1869,7 @@ class MainWindow(QMainWindow):
             self._set_slicing_enabled(True)
             self.log_msg("Island check failed (slicing anyway): " + msg.splitlines()[0])
             proceed()
-        workers.submit_process(jobs.islands_and_faces, job.meshes, h, then=_reds_ready,
+        workers.submit_process(jobs.islands_and_faces, job.meshes, h, self.gpu_slicing(), then=_reds_ready,
                                on_done=done, on_failed=failed)
 
     def _set_slicing_enabled(self, on: bool) -> None:

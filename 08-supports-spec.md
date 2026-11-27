@@ -52,6 +52,7 @@ Per contact:
 - **Reported** only when an island hangs more than 0.15 mm **or** reaches 5 mm² (`ISLAND_MAX_HANG`, `ISLAND_MAX_AREA`).
   - Why: the rasteriser splits a nearly flat underside between support tips into specks that join the supported area one or two layers later. On the auto-supported arc at 0.05 mm layers the old "touches the layer below" rule found 34 such specks, all hanging ≤ 0.1 mm and ≤ 0.4 mm². At 0.03 mm layers one strip of 1.05 mm² hangs a single layer.
   - Every real island of the unsupported arc hangs ≥ 0.3 mm (up to 53 mm, 8–255 mm²), so it is still reported. `test_island_thresholds` pins both limits.
+- **On the GPU** [GOOSLICER]: with "Use the GPU (experimental)" on (§12, `gpuSlicing`), the checks that run in a worker process (Detect islands, before slicing, Fix islands and `auto_support`'s passes) draw their layers with `gpu_raster` instead of sectioning the meshes; the tracking that follows is the same code. The worker makes its own headless OpenGL 3.3 context (`gooslicer/gl_headless.py`: EGL on Mesa's surfaceless platform, called through ctypes so it works whatever platform PyOpenGL loaded for). If that fails, the check runs on the CPU. On Lisa_head_D with its EVO supports, a check takes 0.7 s instead of 2.7 s, and linear auto-support 4.3 s instead of 8.2 s. The islands found match; their areas can differ by an edge pixel (0.01 mm² at 0.1 mm), as GPU slicing's do. `test_gpu_island_check_matches_cpu` runs it in its own process, as the app does.
 - `auto_support` checks at 0.1 mm and runs up to 3 passes: cast down from each island to find its underside, add an `island` contact, rebuild. The auto-supported arc is clean at 0.1, 0.05 and 0.03 mm layers.
 - **Before slicing** ("Slice…" and "Slice and send"), after the trapped-resin check, the check runs in the background at the print layer height (≈ 5 s for arc; the slice actions are disabled meanwhile). Islands bring up a warning listing height, area and hang; the user can slice anyway. A failed check is logged and does not block slicing.
 - Supports → Detect islands runs it on demand.
@@ -117,6 +118,20 @@ Unused, roles **[UNKNOWN]**: `tree.brunch.maxBrunchNum` (1), `tree.ribsNum` (2),
 4. **Cross braces:** an X of `barWidth` rods at `barAngle` between neighbouring trunks (MST of Delaunay neighbours up to 10 mm apart, GooSlicer), the first at `startHeight` above the raft, then every `crossInterval`, up to 0.3 mm under the lower trunk top.
 5. **Raft:** as §4, from the trunk feet, with the template's `platOffset`.
 6. Each contact's `Pillar.path` (tip end → joints → foot) is kept for picking, so Ctrl+click works on branches.
+
+### Speed [GOOSLICER]
+Merging spends its time testing branch and trunk segments against the model (`_segments_clear`: no crossing, clearance kept except at the tip end). Three shortcuts that give the same answers:
+- **Distance grid** (`Caster.far_outside`): at most 8M voxels over the model; for each, a lower bound on its distance to the surface (Euclidean distance transform of the voxels holding surface samples at most h/2 apart, less h√3 + h/(2√3)) and whether it is open air (connected to the grid's corner around a one-voxel-thicker surface). Beyond the grid, the distance to the model's box. A point it can't clear goes to the exact test. Segments whose far three quarters it clears need the exact crossing test only on the quarter at the tip; crossing tests skip 1 mm pieces it proves are more than half their length from the surface; clearance points it clears skip `clear_of`. A point it hints is inside (`maybe_inside`, off the surface and out of the open air) is tested exactly: inside while the tip end is outside means the segment crosses.
+- **Batches:** merge candidates are judged 32 at a time in queue order and the answers kept per pair. When a merge makes a new candidate that outranks the rest of the batch, the rest go back on the queue, so the order of merges, and so the tree, is the same as judging one at a time.
+- **One candidate search** per crossing piece serves both directions (`hits_both_ways`).
+
+| | before | after |
+|---|---|---|
+| Lisa_head_D, plan (30 trunks) | 13.2 s | 5.8 s |
+| Lisa_head_D hollowed, plan (27 trunks) | 13.0 s | 5.8 s |
+| Lisa_torso, plan (2754 contacts, 267 trunks) | 257 s | 107 s |
+
+The plans are identical to the original code's on all three (every path, rejection and trunk); `test_segment_check_shortcuts_change_no_answer` checks the answers with the shortcuts off, and `test_far_outside_is_a_proven_lower_bound` the bound against exact distances.
 
 ### Results (Tree Medium values)
 | | tee (12 × 4 mm slab on a post) | arc |
