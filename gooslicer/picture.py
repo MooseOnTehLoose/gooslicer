@@ -127,9 +127,9 @@ def model_dirs() -> list[Path]:
     return out
 
 
-def model_dir(key: str = DEFAULT_MODEL) -> Path | None:
-    """The folder holding all of a model's files, or None."""
-    m = MODELS[key]
+def model_dir(key="mobilesam") -> Path | None:
+    """The folder holding all of a model's files, or None. `key`: a key of MODELS, or a Model."""
+    m = key if isinstance(key, Model) else MODELS[key]
     for d in model_dirs():
         d = d / m.folder if m.folder else d
         if all((d / f.name).is_file() for f in m.files):
@@ -166,10 +166,10 @@ def any_available() -> tuple[bool, str]:
     return available(DEFAULT_MODEL)
 
 
-def download(key: str, progress=None, dest: Path | None = None) -> Path:
+def download(key, progress=None, dest: Path | None = None) -> Path:
     """Download a model's files into the user model folder, each checked against its sha256
     (a bad or partial file is never left under its real name). progress(done, total) bytes."""
-    m = MODELS[key]
+    m = key if isinstance(key, Model) else MODELS[key]
     if not all(f.url for f in m.files):
         raise ValueError(f"{m.title} can't be downloaded")
     d = (dest or user_dir()) / m.folder

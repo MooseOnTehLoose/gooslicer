@@ -29,6 +29,7 @@ Nothing here is from SatelLite (it has no such tool in the strings we have); eve
   - **Surface** (default): the spread and contours above.
   - **Parts**: the click selects the whole part of the model it lands on (see *Parts* below). Part edges are drawn on the model while picking, in place of contours. **Part edges** slider (2°–30°, default 10°, `modify/partEdges`): how deep a valley must run along a border for it to stay a part edge. Lower gives more, smaller parts.
   - **Picture (AI)**: an image model outlines the thing you clicked in the 3D view, the way you see it (see *Picture* below). **Outline** slider, Small / Medium / Large (default Medium, `modify/outline`): which of the model's candidate outlines to use, from smallest to largest. Changing it re-applies the stored candidates; nothing is recomputed. Shown only when the model is installed; otherwise the entry is disabled, with a tooltip saying so.
+  - **Parts (AI)** (added 2026-11-26): a click takes the part round it as found in 3D by PartField (see *Parts (AI)* below). The first click on a model works out its part features behind a modal window with Stop (about 10 s for 600k faces; kept for the model while it's the last one used). **Part size** slider: the nested parts round the last click, from the smallest to most of the model; the click picks the clearest, and the label says which of how many. Disabled, with a tooltip, unless PartField is installed (Preferences → Picture selection says how).
   - **Drawing**: drag on the model to paint a rough line round a part; the part inside is selected, with its edge found along the creases near the line (see *Drawing* below). **Brush** slider (0.5–10 mm, default 2 mm, `modify/brush`; Ctrl+scroll over the model also changes it), shown on the model as a ring round the cursor. **Use the AI for the edge** (`modify/drawAI`, default off; disabled without an image model): the image model's outline of the drawn region helps place the edge (see *Drawing: does the AI help?*). Each drag adds to the drawing until Clear; strokes needn't join up perfectly.
 - **Drawing** (`gooslicer/drawsel.py`) [GOOSLICER]:
   - **Painting:** while dragging, the view picks the model every few pixels along the mouse's path, so a fast stroke stays continuous. Each picked face paints the faces within the brush radius of it along the surface (Dijkstra over face centres), so a brush never reaches through a thin part to its far side. The painted line shows on the model as it's drawn.
@@ -66,6 +67,55 @@ Nothing here is from SatelLite (it has no such tool in the strings we have); eve
     - ONNX: the encoder and the SAM 2.1 decoder are vietanhdev's samexporter export, as republished unchanged by latolukasz (`huggingface.co/latolukasz/sam2.1-hiera-large-onnx`, commit `ccbb4af9`). The HQ decoder is latolukasz's export of SysCV's checkpoint (`…/sam2.1-hq-hiera-large-onnx`, commit `5d5e61bc`). [INFERRED from their model cards] that they're faithful exports: a single person's uploads, pinned by sha256 and checked here on test pictures, not against the original PyTorch models.
     - samexporter's form: the picture stretched to 1024×1024, ImageNet-normalised (`image`), giving `image_embed` and `high_res_feats_0/1`. The decoder takes points in 1024² pixels with float labels (a padding point, label −1, as for SAM 1), and returns 3 candidate outlines as 256² logits, which are scaled up to the picture.
   - Not added: EfficientSAM and EdgeSAM (faster, not more precise; EdgeSAM's licence is non-commercial) and Semantic-SAM (no ONNX export).
+  - Tried, not added (2026-11-26): **Point-SAM** (zyc00/Point-SAM@25f4fd96, MIT; ViT-L weights yuchen0187/Point-SAM@fb2cd5cd, Apache-2.0, 1.24 GB, 311 M parameters), a SAM for point clouds that works on the model itself rather than pictures.
+    - *Running it:* its CUDA add-ons were replaced by plain PyTorch (point gather, farthest-point sampling, LayerNorm). On the CPU it loads in 3 s, encodes in 2 s (at 10k–60k points sampled from the surface), and answers a click in 0.1–0.5 s.
+    - *On the test shapes:* points coloured by surface direction (better than plain grey). The IoU of its best outline from one click:
+
+      | Shape | Point-SAM | GooSlicer's best |
+      |---|---|---|
+      | Band round a cylinder | 0.84–0.87 | about 0.88 (all the way round, 9 s or more) |
+      | Boss, sharp foot | ≤ 0.46 | 0.999 (Drawing or Parts) |
+      | Smooth dome | ≤ 0.84 | 0.96 (Drawing + AI) |
+
+      With 4–5 corrective clicks the boss reaches 0.94.
+    - *On `Lisa_head_D.stl`:* a click on the ear cup selected a patch of it, or scattered bits over the head; one on a spike, bits of many spikes. Its 1,024 patches are too coarse for a miniature's details. It was trained on PartNet and ScanNet objects.
+    - So it isn't added. It could only help with large wrap-round parts, and *All the way round* already handles those.
+  - **PartField**: see *Parts (AI)*, the next entry. Point-SAM and PartField were both tried (2026-11-26); PartField was the better.
+- **Parts (AI)** (`gooslicer/partfeat.py`, `scripts/convert-partfield.py`) [GOOSLICER]:
+  - **The model:** PartField (nv-tlabs/PartField@373025db), with the Objaverse weights (mikaelaangel/partfield-ckpt@90b9b1e0, sha256 463efc8a…7ee4). It is under the NVIDIA License (non-commercial research and education only), so GooSlicer neither ships nor downloads it. `scripts/convert-partfield.sh [--flatpak]` makes it on the user's machine and installs it in the user model folder as `partfield/partfield.onnx` (505 MB), with NVIDIA's LICENSE and a NOTICE:
+    - it fetches NVIDIA's code and checkpoint, pinned by commit and sha256;
+    - it makes a throwaway Python environment with PyTorch (CPU);
+    - it exports the network and checks the export against PyTorch before installing it.
+  - **Changes made for the CPU and ONNX** (the weights and network are unchanged):
+    - `device='cuda'` → `'cpu'`;
+    - `torch_scatter.scatter_mean` → sum ÷ count with `scatter_add`;
+    - the voxelisation's `scatter_(reduce='add')` → `scatter_add`;
+    - the 3D `grid_sample` in `trilinear_devoxelize` → eight gathers, the same arithmetic (within 1e-6);
+    - the exported planes match PyTorch's to cosine 1.000000.
+  - **Features:**
+    - The model's own vertices are turned from Z-up to Y-up (PartField was trained on Y-up Objaverse; Y-up was better on every test shape), centred, and scaled to a longest side of 1.8.
+    - 100k points are sampled by area and run through the network: 4.4 s on the CPU, whatever the model's size.
+    - Each face's feature is the mean, over 3 random points in it, of the bilinear lookups in the three part planes (`read_planes`, as `grid_sample(align_corners=True, padding_mode='border')`). It is cut to 64 numbers (the top singular directions of 20k faces' features, uncentred, so cosines are kept) and stored at half precision, unit length.
+    - Lisa: 618k faces in 10.6 s, 75 MB, peak memory 2.8 GB. Kept per mesh: moving or turning the part doesn't redo them.
+  - **The parts round a click:**
+    - At similarity τ, the part is the faces reachable from the clicked one through faces whose feature has cosine ≥ τ with its feature.
+    - For all τ at once (`reach`): each face's τ is the best, over paths from the click, of the lowest similarity along the path. That is the path through a maximum spanning tree, worked out by pointer jumping.
+    - The parts offered are the τ (0.10–0.95, steps of 0.01) where the part's area changes least within ±0.06 (local minima of that change), between 0.05 % and 60 % of the surface, one per distinct size, smallest first.
+    - The click takes the one that changes least; of equals, the one that keeps its size over the widest range of τ.
+    - 0.03–0.24 s a click.
+  - **Measured** (IoU of the click's own choice; the IoU of the best of its parts in brackets):
+
+    | Shape | Parts (AI) | Before |
+    |---|---|---|
+    | Band round a cylinder | 0.93 (0.95) | about 0.88 (all the way round) |
+    | Boss, sharp foot | 0.99 | 0.999 (Drawing or Parts) |
+    | Boss, rough surface | 0.95 | 0.86 at best |
+    | Smooth dome | 0.90 (0.92) | 0.96 (Drawing + AI) |
+    | Boss inside a groove | 0.94 | 0.52 |
+
+  - **On `Lisa_head_D.stl`:**
+    - Good: a spike of the crown gives that spike (the row of spikes is a size up); the side flap of the hood comes out cleanly.
+    - Not good: the ear cup gives only part of the ring round it; a click on top of the head picks the whole hood shell (smaller parts are on the slider).
   - The downloadable models are downloaded from Preferences into `$XDG_DATA_HOME/gooslicer/models/<name>/`. Each file is checked against its sha256, and a bad or partial download is never left under its real name. Until one is downloaded, MobileSAM is used.
 - **Clicks** while picking in Picture mode:
   - A click outlines the thing under it.
@@ -184,6 +234,8 @@ The cut follows the selection's outline, not a plane (changed 2026-11-25 after t
 - GUI: all the way round, with a stand-in that outlines everything, reaches all four sides of a hollow box and never its cavity wall, behind a modal window that closes after; Stop keeps the clicked view's outline.
 - GUI: Select by Parts selects the post of a slab-and-post part; Select by Picture, with a stand-in segmenter outlining the left half of the view, selects only visible faces on that side; a right-click leaves a patch out without looking at the picture again. The face-index render matches the faces the view's own pick finds.
 - Drawing: two rough loops round a band on a cylinder select the band (≥ 97 %, under 10 % else); a gap in one loop is closed; an open line selects nothing; the brush paints along the surface, never through a thin plate; the AI's answer moves the edge only within the drawing and never drops the core. `Segmenter.outlines` takes a box prompt.
+- Parts (AI): reading the planes is the bilinear, border-clamped lookup; Z-up becomes Y-up; `reach` ≥ τ is exactly the τ-component holding the click (against a brute-force check); the parts are nested, smallest first, each step offered. With PartField installed, a boss on a block is found (IoU > 0.95).
+- GUI: Select by Parts (AI), with a stand-in network: the first click works out the features behind a modal window, then selects the boss; Part size steps to a larger part; a second click needs no window; Ctrl+click adds.
 - GUI: Select by Drawing: a rough loop dragged round a boss on a block selects the boss, cut at its foot; the brush ring follows the cursor; the Brush slider and Ctrl+scroll change it; an open line selects nothing and says so; Clear clears the drawing.
 - GUI: the Mesh pane starts folded with the status in its button; Select surface + click selects a region; the spread slider changes its size; Cut out selection gives two parts, a single undo restores one; refuses on an open mesh.
 

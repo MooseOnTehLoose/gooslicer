@@ -1417,3 +1417,85 @@ def test_select_by_drawing(app, win, tmp_path):
     assert not win._region["mask"].any() and "all the way round" in win.statusBar().currentMessage()
     vp.stop_region_mode()
     assert vp.brush_ring is None
+
+
+def test_select_by_parts_ai(app, win, tmp_path, monkeypatch):
+    """Select by Parts (AI) (11) with a stand-in for PartField that gives the boss's faces one
+    feature, a ring round it another a little like it, and the block a third: a click on the boss
+    works out the features once behind a modal window, then selects the boss; Part size steps
+    to boss + ring; a second click needs no window; Ctrl+click adds."""
+    import manifold3d as m3
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QProgressDialog
+    from gooslicer import partfeat
+    block = trimesh.creation.box((40, 40, 10))
+    boss = trimesh.creation.cylinder(radius=5, height=6, sections=48)
+    boss.apply_translation((-8, 0, 8))
+
+    def M(t):
+        return m3.Manifold(m3.Mesh(t.vertices.astype(np.float32), t.faces.astype(np.uint32)))
+    u = (M(block) + M(boss)).to_mesh()
+    v, f = trimesh.remesh.subdivide_to_size(u.vert_properties[:, :3], u.tri_verts, max_edge=1.5)
+    path = tmp_path / "boss.stl"
+    trimesh.Trimesh(v, f).export(path)
+    wait_import(app, win, [path])
+    p = win.scene.parts[0]
+    win.select([p.id])
+    calls = []
+
+    class Net:
+        def __init__(self, *a):
+            calls.append("net")
+
+    def features(net, verts, faces, **k):
+        calls.append("features")
+        c = np.asarray(verts)[np.asarray(faces)].mean(axis=1)
+        lo = np.asarray(verts).min(axis=0)
+        r = np.hypot(c[:, 0] - (lo[0] + 12), c[:, 1] - (lo[1] + 20))
+        on_boss = (r < 5.05) & (c[:, 2] > lo[2] + 10.01)
+        ring = ~on_boss & (r < 9) & (c[:, 2] > lo[2] + 9.99)
+        out = np.zeros((len(c), partfeat.DIM), np.float32)
+        out[:, 0] = 1
+        out[ring] = 0
+        out[ring, 0], out[ring, 1] = np.sqrt(1 - 0.3 ** 2), 0.3   # 0.3 like the boss, 0.95 like the block
+        out[on_boss] = 0
+        out[on_boss, 1] = 1
+        time.sleep(0.3)
+        return out.astype(np.float16)
+    monkeypatch.setattr(partfeat, "FieldNet", Net)
+    monkeypatch.setattr(partfeat, "face_features", features)
+    pp = win.props
+    pp.select_by.model().item(4).setEnabled(True)
+    pp.select_by.setCurrentIndex(pp.select_by.findData("partsai"))
+    assert pp.part_size.isVisibleTo(pp) and not pp.outline_size.isVisibleTo(pp)
+    wm = p.world_mesh()
+    c = wm.triangles_center
+    lo = wm.bounds[0]
+    r = np.hypot(c[:, 0] - (lo[0] + 12), c[:, 1] - (lo[1] + 20))
+    on_boss = (r < 5.05) & (c[:, 2] > lo[2] + 10.01)
+    top = int(np.nonzero(on_boss)[0][np.argmax(c[on_boss, 2])])
+    win.region_pick(p.id, top, False)
+    assert isinstance(QApplication.activeModalWidget(), QProgressDialog)          # wait, it's working
+    for _ in range(500):
+        pump(app)
+        if not getattr(win, "_partsai_busy", False):
+            break
+        QTest.qWait(10)
+    pump(app)
+    assert QApplication.activeModalWidget() is None and calls == ["net", "features"]
+    assert win._region is not None, win.log.toPlainText()[-600:] + " | " + win.statusBar().currentMessage()
+    mask = win._region["mask"]
+    A = wm.area_faces
+    assert A[mask & on_boss].sum() / A[mask | on_boss].sum() > 0.97
+    n = pp.part_size.maximum() + 1
+    assert n >= 2 and pp.part_size_label.text() == f"{pp.part_size.value() + 1} of {n}"
+    pp.part_size.setValue(pp.part_size.value() + 1)                              # the next size up
+    bigger = win._region["mask"]
+    assert bigger[on_boss].all() and bigger.sum() > mask.sum()
+    # another click on the same model: no window, the features are kept
+    win.region_pick(p.id, top, False)
+    assert QApplication.activeModalWidget() is None and calls == ["net", "features"]
+    block_face = int(np.nonzero((c[:, 2] > lo[2] + 9.99) & (r > 15))[0][0])
+    win.region_pick(p.id, block_face, True)                                      # Ctrl+click adds
+    both = win._region["mask"]
+    assert both[on_boss].all() and both[block_face] and len(win._region["seeds"]) == 2

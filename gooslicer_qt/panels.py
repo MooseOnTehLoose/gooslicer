@@ -370,14 +370,22 @@ class PropertiesPanel(QWidget):
                                   "the whole part of the model it's on, or what an image model sees "
                                   "there in the 3D view; or draw round a part on the model")
         for text, key in (("Surface", "surface"), ("Parts", "parts"), ("Picture (AI)", "picture"),
-                          ("Drawing", "draw")):
+                          ("Drawing", "draw"), ("Parts (AI)", "partsai")):
             self.select_by.addItem(text, key)
-        from gooslicer import picture
+        from gooslicer import partfeat, picture
         ok, why = picture.any_available()
         if not ok:
             item = self.select_by.model().item(2)
             item.setEnabled(False)
             item.setToolTip("Not available: " + why)
+        pf_ok, pf_why = partfeat.available()
+        item = self.select_by.model().item(4)
+        if pf_ok:
+            item.setToolTip("PartField (NVIDIA, non-commercial use only) finds the model's parts from "
+                            "its 3D shape; a click takes the part round it")
+        else:
+            item.setEnabled(False)
+            item.setToolTip("Not available: " + pf_why)
         fl.addRow("Select by", self.select_by)
         self.spread = QSlider(Qt.Horizontal)
         self.spread.setRange(5, 90)
@@ -458,8 +466,19 @@ class PropertiesPanel(QWidget):
         hrow = QHBoxLayout()
         fl.addRow(hrow)
         hrow.addWidget(self.draw_hint)
+        self.part_size = QSlider(Qt.Horizontal)
+        self.part_size.setRange(0, 0)
+        self.part_size.setPageStep(1)
+        self.part_size.setToolTip("Smaller or larger parts round the last click, from the smallest piece "
+                                  "to most of the model; the click picks the clearest one")
+        self.part_size_label = QLabel("–")
+        self.part_size_label.setMinimumWidth(52)
+        zrow = QHBoxLayout()
+        fl.addRow("Part size", zrow)
+        zrow.addWidget(self.part_size, 1)
+        zrow.addWidget(self.part_size_label)
         self._mode_rows = {"surface": (srow, crow), "parts": (prow,), "picture": (orow,),
-                           "draw": (brow, arow, hrow)}
+                           "draw": (brow, arow, hrow), "partsai": (zrow,)}
         self.region_info = QLabel("Nothing selected")
         self.region_info.setWordWrap(True)
         fl.addRow(self.region_info)
@@ -525,6 +544,7 @@ class PropertiesPanel(QWidget):
         self.brush.valueChanged.connect(lambda v: (self.brush_label.setText(f"{v / 2:g} mm"),
                                                    win.brush_changed()))
         self.draw_ai.toggled.connect(lambda _on: win.region_settings_changed())
+        self.part_size.valueChanged.connect(lambda _v: win.part_size_changed())
         self.outline_size.valueChanged.connect(lambda v: (self.outline_label.setText(
             ("Small", "Medium", "Large")[v]), win.region_settings_changed()))
         self.grow_btn.clicked.connect(win.grow_selection)

@@ -478,11 +478,19 @@ class PreferencesDialog(QDialog):
                                      "from the view you clicked in.")
         fl.addRow(self.picture_turn)
         lay.addWidget(g)
+        g2 = QGroupBox("3D part model (Select by Parts (AI))")
+        f2 = QFormLayout(g2)
+        self.partfield_status = QLabel()
+        self.partfield_status.setWordWrap(True)
+        self.partfield_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        f2.addRow(self.partfield_status)
+        lay.addWidget(g2)
         lay.addWidget(_note("MobileSAM: ONNX export by Acly (MIT). SAM 2.1: Meta (Apache-2.0), ONNX export by "
                             "onnx-community; Large by vietanhdev (samexporter). HQ-SAM 2: SysCV (Apache-2.0), "
                             "ONNX export by latolukasz. They run on this computer; nothing is sent anywhere."))
 
         def refresh():
+            self._refresh_partfield_status()
             key = str(st.value("picture/model", picture.DEFAULT_MODEL))
             i = self.picture_model.findData(key)
             self.picture_model.blockSignals(True)
@@ -537,6 +545,22 @@ class PreferencesDialog(QDialog):
         self.picture_turn.toggled.connect(turn_changed)
         self.picture_download.clicked.connect(self._download_picture_model)
         return _Page("Picture selection", w, reset=reset, refresh=refresh)
+
+    def _refresh_partfield_status(self) -> None:
+        from gooslicer import partfeat
+        path = partfeat.model_path()
+        if path is not None:
+            self.partfield_status.setText(
+                f"PartField is installed ({path.parent}). It finds a model's parts from its shape in 3D, "
+                "on the CPU. PartField is NVIDIA's, under the NVIDIA License: for non-commercial research "
+                "and education only (LICENSE in that folder).")
+        else:
+            self.partfield_status.setText(
+                "PartField isn't installed. It finds a model's parts from its shape in 3D (Select by "
+                "Parts (AI)). It is NVIDIA's, for non-commercial research and education only, so "
+                "GooSlicer doesn't download it: run scripts/convert-partfield.sh from GooSlicer's source "
+                "(add --flatpak for the Flatpak). It fetches NVIDIA's own files and converts them on this "
+                "computer: about 2.5 GB to download and 500 MB installed.")
 
     def _refresh_picture_status(self) -> None:
         from gooslicer import picture

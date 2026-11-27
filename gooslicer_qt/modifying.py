@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from gooslicer import mesh as meshmod
 from gooslicer import modify, picture
-from gooslicer import drawsel
+from gooslicer import drawsel, partfeat
 from gooslicer import parts as partsmod
 from gooslicer.camera import OrbitCamera
 from gooslicer.scene import Part, prepare
@@ -136,6 +136,95 @@ class ModifyingMixin:
         self.settings.setValue("modify/brush", float(mm))
         self.viewport.brush_mm = mm
         self.viewport.update()
+
+    # ------------------------------------------------------------ Select by Parts (AI) (11)
+    def _partsai_click(self, p: Part, face: int, add: bool) -> None:
+        """A click in Select by Parts (AI): the clearest part round it, from PartField's features
+        (worked out first, once per model, in the background behind a window)."""
+        feat = self._partsai_cache.get(id(p.mesh)) if hasattr(self, "_partsai_cache") else None
+        if feat is not None:
+            self._partsai_apply(p, face, add, feat)
+            return
+        if getattr(self, "_partsai_busy", False):
+            return
+        self._partsai_busy = True                  # before the window shows (it lets events through)
+        dlg = QProgressDialog(self)
+        dlg.setWindowTitle("Select by Parts (AI)")
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setCancelButtonText("Stop")
+        dlg.setRange(0, 0)
+        dlg.setLabelText(f"Finding the parts of {p.name} in 3D…\nPlease wait: this is done once per "
+                         "model and takes about 10 to 30 seconds.")
+        dlg.show()
+        QApplication.processEvents()
+        state = {"stopped": False}
+        dlg.canceled.connect(lambda: state.update(stopped=True))
+        pid, mesh = p.id, p.mesh
+        verts, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
+        t0 = time.monotonic()
+
+        def job():
+            net = getattr(self, "_partsai_net", None) or partfeat.FieldNet()
+            return net, partfeat.face_features(net, verts, faces)
+
+        def finish():
+            self._partsai_busy = False
+            dlg.close()
+            dlg.deleteLater()
+
+        def done(res):
+            stopped = state["stopped"]              # before closing: closing the window cancels it
+            finish()
+            self._partsai_net, feat = res
+            self._partsai_cache = {id(mesh): feat}             # one model's features at a time
+            if stopped:
+                self.statusBar().showMessage("Stopped.", 4000)
+                return
+            self.log_msg(f"Select by Parts (AI): found the parts of {p.name} in "
+                         f"{time.monotonic() - t0:.0f} s.")
+            q = self.scene.get(pid)
+            if q is not None and q.mesh is mesh:
+                self._partsai_apply(q, face, add, feat)
+
+        def failed(msg):
+            finish()
+            self.log_msg("Select by Parts (AI) failed: " + msg.splitlines()[0])
+            self.statusBar().showMessage("Select by Parts (AI) failed (see the log).", 8000)
+        workers.submit(job, on_done=done, on_failed=failed)
+
+    def _partsai_apply(self, p: Part, face: int, add: bool, feat) -> None:
+        s = self._surface(p)
+        b = partfeat.reach(s.adjacency, feat, face)
+        found, k = partfeat.parts(s.areas, b)
+        seed = {"kind": "partsai", "face": face, "parts": found, "pick": k}
+        r = self._region
+        if add and r is not None and r["pid"] == p.id and r["mesh"] == id(p.mesh):
+            r["seeds"].append(seed)
+        else:
+            self._region = {"pid": p.id, "mesh": id(p.mesh), "seeds": [seed], "grows": [], "mask": None}
+        self._show_part_size(seed)
+        self._update_region()
+
+    def _show_part_size(self, seed) -> None:
+        pp = self.props
+        pp.part_size.blockSignals(True)
+        pp.part_size.setRange(0, max(len(seed["parts"]) - 1, 0))
+        pp.part_size.setValue(seed["pick"])
+        pp.part_size.blockSignals(False)
+        pp.part_size_label.setText(f"{seed['pick'] + 1} of {len(seed['parts'])}")
+
+    def part_size_changed(self) -> None:
+        """The Part size slider: a smaller or larger part round the last Parts (AI) click."""
+        r = self._region
+        seeds = [q for q in (r["seeds"] if r else []) if q["kind"] == "partsai"]
+        if not seeds:
+            return
+        seeds[-1]["pick"] = int(self.props.part_size.value())
+        self._show_part_size(seeds[-1])
+        self._update_region()
 
     # ------------------------------------------------------------ Select by Drawing (11)
     def region_stroke(self, pid: int, faces, path) -> None:
@@ -276,9 +365,15 @@ class ModifyingMixin:
             return
         if pid not in self.selected_ids():
             self.select([pid])
-        kind = {"surface": "surface", "parts": "part", "picture": "picture"}[self.select_by()]
+        kind = {"surface": "surface", "parts": "part", "picture": "picture", "partsai": "partsai",
+                "draw": None}[self.select_by()]
+        if kind is None:
+            return
         if kind == "picture":
             self._picture_click(p, int(face), "add" if add else "new")
+            return
+        if kind == "partsai":
+            self._partsai_click(p, int(face), add)
             return
         seed = {"kind": kind, "face": int(face)}
         r = self._region
@@ -790,6 +885,8 @@ class ModifyingMixin:
                 mask |= lab == lab[f]
             elif q["kind"] == "picture":
                 mask |= picture.pick(q["cands"], int(self.props.outline_size.value()))
+            elif q["kind"] == "partsai":
+                mask |= q["parts"][min(q["pick"], len(q["parts"]) - 1)]
             elif q["kind"] == "draw":
                 if q.get("mask") is not None:
                     mask |= q["mask"]
