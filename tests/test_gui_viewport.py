@@ -718,8 +718,7 @@ def test_drain_hole_keeps_its_pin(app, win, tmp_path):
     vp.reset_view()
     win.drain_hole_mode()
     f = win.hole_panel.fields
-    f.more_btn.setChecked(True)
-    assert f.more.isVisible() and not f.clearance.isEnabled()
+    assert f.keep.isVisibleTo(f) and f.clearance.isVisibleTo(f) and not f.clearance.isEnabled()
     f.keep.setChecked(True)
     assert f.clearance.isEnabled()
     f.clearance.setValue(0.2)
@@ -755,16 +754,29 @@ def test_drain_hole_fields_round_trip(app, tmp_path):
     qs = QSettings(str(tmp_path / "s.ini"), QSettings.IniFormat)
     f = DrainHoleFields(qs)
     assert f.value() == (DrainHoleSettings(), "normal")                       # SatelLite's defaults
-    s = DrainHoleSettings(hole_form="slot", depth=3.5, edges=12, use_angle_slot=True, angle_slot=8,
+    assert f.shape.isVisibleTo(f) and f.notch_a.isVisibleTo(f) and not f.edges.isEnabled()   # all shown
+    s = DrainHoleSettings(hole_form="slot", depth=3.5, shape="polygon", edges=12, use_angle_slot=True, angle_slot=8,
                           use_notch=True, notch_width=0.8, notch_height=0.6, notch_angle=45,
                           keep_subtracted=True, use_clearance=True, clearance=0.15, clearance_type=3,
                           direction_id=1, direction=(0.0, 1.0, 0.0))
     f.set_value(s, "custom")
     assert all(w.isEnabled() for w in f.dir_xyz) and f.depth.isEnabled() and not f.e2.isEnabled()
     assert not f.use_angle.isEnabled()                                         # slots don't taper by angle
+    assert f.edges.isEnabled()                                                # a polygon's sides
     f.save()
     g = DrainHoleFields(qs)
     assert g.value() == (s, "custom")
+
+
+@pytest.mark.parametrize("edges, shape, sides", [(8, "polygon", 8), (50, "cylinder", 6)])
+def test_drain_hole_old_settings_get_a_shape(app, tmp_path, edges, shape, sides):
+    """Settings saved before there was a shape: under 50 edges was a polygon, 50 was round."""
+    from PySide6.QtCore import QSettings
+    from gooslicer_qt.hollowing import DrainHoleFields
+    qs = QSettings(str(tmp_path / "s.ini"), QSettings.IniFormat)
+    qs.setValue("drain/edges", edges)
+    s, _ = DrainHoleFields(qs).value()
+    assert (s.shape, s.edges) == (shape, sides)
 
 
 def test_support_mode_click_and_drag(app, win, tmp_path):
@@ -917,6 +929,38 @@ def test_see_through_nearest_surface_on_top(app, win, tmp_path):
         px.append(win.viewport.grabFramebuffer().pixelColor(int(c.x()), int(c.y())))
     a, b = px
     assert max(abs(a.red() - b.red()), abs(a.green() - b.green()), abs(a.blue() - b.blue())) <= 3
+
+
+def test_solid_part_in_front_of_a_see_through_one(app, win, tmp_path):
+    """07: a solid part (a kept hole pin) in front of a see-through hollow part is drawn as it
+    is: the hollow's inside walls behind it don't paint over it."""
+    from gooslicer_qt.commands import MeshCommand
+    wait_import(app, win, [box_file(tmp_path, name="a.stl")])
+    wait_import(app, win, [box_file(tmp_path, size=(6, 6, 6), name="b.stl")])
+    assert len(win.scene.parts) == 2
+    hollow, pin = win.scene.parts
+    outer = trimesh.creation.icosphere(subdivisions=3, radius=15)
+    inner = trimesh.creation.icosphere(subdivisions=3, radius=12)
+    inner.invert()
+    win.undo.push(MeshCommand(win, hollow.id, trimesh.util.concatenate([outer, inner]), "Hollow", opacity=0.75))
+    win.select([])
+    vp = win.viewport
+    vp.set_view(0, 89)                                        # from above
+    top = np.array([*hollow.position[:2], hollow.bounds()[1][2]])
+
+    def px_at_pin():
+        vp.frame_selection()
+        pump(app)
+        c = project(vp, pin.bounds().mean(axis=0))
+        return vp.grabFramebuffer().pixelColor(int(c.x()), int(c.y()))
+    pin.position = np.array([top[0] + 45.0, top[1], 3.0])   # alone, beside it on the plate
+    win.scene_changed()
+    alone = px_at_pin()
+    pin.position = top + [0, 0, 5.0]                          # just above the hollow's top
+    win.scene_changed()
+    over = px_at_pin()
+    assert max(abs(alone.red() - over.red()), abs(alone.green() - over.green()),
+               abs(alone.blue() - over.blue())) <= 6, (alone.name(), over.name())
 
 
 def test_layer_slider_hides_above_cut(app, win, tmp_path):

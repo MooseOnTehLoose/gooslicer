@@ -110,6 +110,7 @@ def default_format() -> QSurfaceFormat:
     f.setVersion(3, 3)
     f.setProfile(QSurfaceFormat.CoreProfile)
     f.setDepthBufferSize(24)
+    f.setStencilBufferSize(8)            # see-through parts: where their own surface is nearest
     f.setSamples(4)
     return f
 
@@ -544,7 +545,10 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         back to front so its nearest surface is always on top at exactly its opacity: a depth
         pre-pass finds that surface, the faces behind it (a hollow's inside walls) go first,
         then the nearest surface over them. Without it, unsorted faces paint inner walls over
-        the outer skin and patches of the model look fully transparent."""
+        the outer skin and patches of the model look fully transparent. The pre-pass also marks
+        (stencil) where the part's surface is in front of everything drawn so far; the faces
+        behind are drawn only there, or they'd paint over a solid part in front of it (a kept
+        hole pin looked as if it were behind its model)."""
         if not items:
             return
         see_through = items[0][3] < OPAQUE
@@ -568,13 +572,22 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             if not layered:
                 buf.draw()
                 continue
+            GL.glClearStencil(0)
+            GL.glClear(GL.GL_STENCIL_BUFFER_BIT)
+            GL.glEnable(GL.GL_STENCIL_TEST)
+            GL.glStencilMask(0xFF)
+            GL.glStencilFunc(GL.GL_ALWAYS, 1, 0xFF)
+            GL.glStencilOp(GL.GL_KEEP, GL.GL_KEEP, GL.GL_REPLACE)   # 1 where its surface is nearest
             GL.glColorMask(GL.GL_FALSE, GL.GL_FALSE, GL.GL_FALSE, GL.GL_FALSE)
             GL.glDepthMask(GL.GL_TRUE)
             buf.draw()                              # depth of the nearest surface
             GL.glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)
             GL.glDepthMask(GL.GL_FALSE)
+            GL.glStencilFunc(GL.GL_EQUAL, 1, 0xFF)
+            GL.glStencilOp(GL.GL_KEEP, GL.GL_KEEP, GL.GL_KEEP)
             GL.glDepthFunc(GL.GL_GREATER)
             buf.draw()                              # what lies behind it (inside walls)
+            GL.glDisable(GL.GL_STENCIL_TEST)
             GL.glDepthFunc(GL.GL_LEQUAL)
             buf.draw()                              # the nearest surface, on top
             GL.glDepthFunc(GL.GL_LESS)

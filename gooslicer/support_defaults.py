@@ -184,6 +184,8 @@ class HollowSettings:
 
 
 HOLE_FORMS = ("hole", "slot")          # /Perforation/holeType 1 = Hole, 0 = Slot [OBSERVED]
+HOLE_SHAPES = ("cylinder", "polygon")  # GooSlicer's: SatelLite only has the edge number (07 §3)
+CYLINDER_SIDES = 50                    # a Cylinder: SatelLite's default edge number
 CLEARANCE_SIDES = (1, 2, 3)            # /Perforation/clearanceType: 1 pin (inside), 2 hole (outside), 3 both
 
 
@@ -200,7 +202,8 @@ class DrainHoleSettings:
     extend2: float = 2.0
     hole_form: str = "hole"         # "hole": through the wall to the next surface; "slot": fixed depth
     depth: float = 2.0              # /Perforation/depth, the slot's depth
-    edges: int = 50                 # /Perforation/edgenumber, 3–50
+    shape: str = "cylinder"         # "cylinder" (CYLINDER_SIDES) or "polygon" (`edges` sides) [GOOSLICER]
+    edges: int = 6                  # a Polygon's sides, 3–50 (SatelLite's /Perforation/edgenumber)
     use_angle_slot: bool = False    # taper by angle instead of radius2 (Hole form only)
     angle_slot: float = 0.0         # degrees
     use_notch: bool = False         # a key tab on the hole's side, so a pin goes in one way
@@ -214,6 +217,10 @@ class DrainHoleSettings:
     direction_id: int = 0           # /Perforation/HoleDirID: perpendicular to the surface, or custom
     direction: tuple[float, float, float] = (1.0, 0.0, 0.0)   # HoleDirX/Y/Z defaults
 
+    def sides(self) -> int:
+        """The hole's number of sides: CYLINDER_SIDES for a Cylinder."""
+        return CYLINDER_SIDES if self.shape == "cylinder" else int(self.edges)
+
     def validate(self) -> list[str]:
         errs = []
         if min(self.radius1, self.radius2) <= 0:
@@ -224,8 +231,10 @@ class DrainHoleSettings:
             errs.append(f"unknown hole form {self.hole_form!r}")
         if self.hole_form == "slot" and self.depth <= 0:
             errs.append("slot depth must be positive")
+        if self.shape not in HOLE_SHAPES:
+            errs.append(f"unknown hole shape {self.shape!r}")
         if not 3 <= int(self.edges) <= 50:
-            errs.append("edge number must be 3–50")
+            errs.append("a polygon needs 3–50 sides")
         if self.use_angle_slot and not 0 <= self.angle_slot < 90:
             errs.append("taper angle must be 0–90°")
         if self.use_notch and min(self.notch_width, self.notch_height) <= 0:

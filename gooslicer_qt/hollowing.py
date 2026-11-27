@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDialog, Q
 
 from gooslicer import hollow as H
 from gooslicer import jobs
-from gooslicer.support_defaults import (CLEARANCE_SIDES, HOLE_FORMS, HOLLOW_TYPES, INFILL_TYPES, DrainHoleSettings,
+from gooslicer.support_defaults import (CLEARANCE_SIDES, HOLE_FORMS, HOLE_SHAPES, HOLLOW_TYPES, INFILL_TYPES, DrainHoleSettings,
                                         HollowSettings)
 
 TYPE_LABELS = ("Inside", "Outside", "Center (self-supporting)", "Open bottom")
@@ -19,6 +19,7 @@ INFILL_LABELS = ("BCC", "FCC")
 DIRECTIONS = (("Perpendicular to surface", "normal"), ("Vertical (from below)", "vertical"),
               ("Custom", "custom"))
 HOLE_FORM_LABELS = ("Hole (through the wall)", "Slot (fixed depth)")
+HOLE_SHAPE_LABELS = ("Cylinder", "Polygon")
 CLEARANCE_LABELS = ("Pin smaller", "Hole larger", "Both, half each")    # clearanceType 1, 2, 3
 
 
@@ -236,10 +237,9 @@ class LockButton(QAbstractButton):
 class DrainHoleFields(QWidget):
     """Drain-hole settings (SatelLite's Perforation tool, 06 §3 / 07 §3). A padlock beside each
     pair (outer/inner radius, extend outside/inside) links them: while it's closed, changing one
-    sets the other to the same value. The less used settings (edges, taper angle, notch, hole
-    pin) sit under "More options"."""
+    sets the other to the same value. Every setting is shown; those that don't apply are greyed
+    out."""
     changed = Signal()
-    resized = Signal()          # "More options" opened or closed
     LINKS = (("linkRadius", "Outer and inner radius"), ("linkDepth", "Extend outside and inside"))
 
     def __init__(self, settings, parent=None):
@@ -260,6 +260,12 @@ class DrainHoleFields(QWidget):
                              "Slot: a blind hole of a set depth.")
         self.depth = _dspin(0.1, 100, d.depth)
         self.depth.setToolTip("How deep a slot goes")
+        self.shape = QComboBox()
+        self.shape.addItems(HOLE_SHAPE_LABELS)
+        self.shape.setToolTip("Cylinder: a round hole. Polygon: a hole with flat sides.")
+        self.edges = QSpinBox()
+        self.edges.setRange(3, 50)
+        self.edges.setToolTip("How many sides the polygon has. The radii reach its corners.")
         self.r1 = _dspin(0.2, 20, d.radius1)
         self.r1.setToolTip("Radius at the clicked surface")
         self.r2 = _dspin(0.2, 20, d.radius2)
@@ -277,7 +283,8 @@ class DrainHoleFields(QWidget):
             w.setToolTip(f"Custom drill direction, {ax} (world). It is turned to point into the part.")
         self.radius_lock = LockButton(self.LINKS[0][1])
         self.depth_lock = LockButton(self.LINKS[1][1])
-        rows = (("Form", self.form), ("Slot depth", self.depth), ("Outer radius", self.r1),
+        rows = (("Form", self.form), ("Slot depth", self.depth), ("Shape", self.shape),
+                ("Sides", self.edges), ("Outer radius", self.r1),
                 ("Inner radius", self.r2), ("Extend outside", self.e1), ("Extend inside", self.e2),
                 ("Direction", self.direction))
         for row, (label, w) in enumerate(rows):
@@ -290,13 +297,9 @@ class DrainHoleFields(QWidget):
         for w in self.dir_xyz:
             xyz.addWidget(w)
         # each padlock to the right of its pair, centred between the two rows
-        g.addWidget(self.radius_lock, 2, 2, 2, 1, Qt.AlignCenter)
-        g.addWidget(self.depth_lock, 4, 2, 2, 1, Qt.AlignCenter)
+        g.addWidget(self.radius_lock, 4, 2, 2, 1, Qt.AlignCenter)
+        g.addWidget(self.depth_lock, 6, 2, 2, 1, Qt.AlignCenter)
 
-        # ---- more options
-        self.edges = QSpinBox()
-        self.edges.setRange(3, 50)
-        self.edges.setToolTip("Sides of the hole's polygon (SatelLite's edge number)")
         self.use_angle = QCheckBox("Taper by angle")
         self.use_angle.setToolTip("Narrow the hole going in by this angle instead of to the inner radius "
                                   "(holes only)")
@@ -317,25 +320,15 @@ class DrainHoleFields(QWidget):
         self.clear_side = QComboBox()
         self.clear_side.addItems(CLEARANCE_LABELS)
         self.clear_side.setToolTip("Make the gap by shrinking the pin, growing the hole, or both")
-        self.more_btn = QPushButton("More options")
-        self.more_btn.setCheckable(True)
-        self.more_btn.setFlat(True)
-        self.more_btn.toggled.connect(self._show_more)
-        lay.addWidget(self.more_btn, 0, Qt.AlignLeft)
-        self.more = QWidget()
-        lay.addWidget(self.more)
-        m = QGridLayout(self.more)
-        m.setContentsMargins(0, 0, 0, 0)
-        m.setColumnStretch(1, 1)
-        for row, (label, w) in enumerate((("Edges", self.edges), (self.use_angle, self.angle),
-                                          (self.notch, None), ("Width", self.notch_w),
-                                          ("Height", self.notch_h), ("Angle", self.notch_a),
+        top = len(rows) + 1
+        for row, (label, w) in enumerate(((self.use_angle, self.angle),
+                                          (self.notch, None), ("Notch width", self.notch_w),
+                                          ("Notch height", self.notch_h), ("Notch angle", self.notch_a),
                                           (self.keep, None), ("Clearance", self.clearance),
-                                          ("Gap on", self.clear_side))):
-            m.addWidget(QLabel(label) if isinstance(label, str) else label, row, 0, 1, 1 if w else 2)
+                                          ("Gap on", self.clear_side)), top):
+            g.addWidget(QLabel(label) if isinstance(label, str) else label, row, 0, 1, 1 if w else 2)
             if w is not None:
-                m.addWidget(w, row, 1)
-        self.more.setVisible(False)
+                g.addWidget(w, row, 1)
         self.load()
         for a, b, lock in ((self.r1, self.r2, self.radius_lock), (self.r2, self.r1, self.radius_lock),
                            (self.e1, self.e2, self.depth_lock), (self.e2, self.e1, self.depth_lock)):
@@ -343,7 +336,7 @@ class DrainHoleFields(QWidget):
         for lock, (key, _), a, b in ((self.radius_lock, self.LINKS[0], self.r1, self.r2),
                                      (self.depth_lock, self.LINKS[1], self.e1, self.e2)):
             lock.toggled.connect(lambda on, key=key, a=a, b=b: self._lock_toggled(on, key, a, b))
-        for w in (self.form, self.direction, self.clear_side):
+        for w in (self.form, self.shape, self.direction, self.clear_side):
             w.currentIndexChanged.connect(self._any_changed)
         for w in (self.depth, self.angle, self.notch_w, self.notch_h, self.notch_a, self.clearance,
                   self.edges, *self.dir_xyz):
@@ -352,16 +345,10 @@ class DrainHoleFields(QWidget):
             w.toggled.connect(self._any_changed)
         self._enable()
 
-    def _show_more(self, on: bool) -> None:
-        self.more.setVisible(on)
-        self.more_btn.setText("Fewer options" if on else "More options")
-        self.qs.setValue("drain/showMore", bool(on))
-        self.updateGeometry()
-        self.resized.emit()
-
     def _enable(self) -> None:
         slot = self.form.currentIndex() == 1
         self.depth.setEnabled(slot)
+        self.edges.setEnabled(self.shape.currentIndex() == 1)
         self.e2.setEnabled(not slot)
         self.use_angle.setEnabled(not slot)
         by_angle = self.use_angle.isChecked() and not slot
@@ -406,12 +393,17 @@ class DrainHoleFields(QWidget):
         v = lambda k, dflt, typ=float: typ(self.qs.value(f"drain/{k}", dflt))  # noqa: E731
         b = lambda k, dflt: str(self.qs.value(f"drain/{k}", dflt)).lower() in ("true", "1")  # noqa: E731
         form = str(self.qs.value("drain/holeForm", d.hole_form))
+        edges = v("edges", d.edges, int)
+        # saved before there was a shape: the edge number alone set it (50, the default, was round)
+        old = self.qs.contains("drain/edges") and not self.qs.contains("drain/shape")
+        shape = ("polygon" if edges < 50 else "cylinder") if old else str(self.qs.value("drain/shape", d.shape))
         ctype = v("clearanceType", d.clearance_type, int)
         self.set_value(DrainHoleSettings(
             radius1=v("radius1", d.radius1), radius2=v("radius2", d.radius2),
             extend1=v("extend1", d.extend1), extend2=v("extend2", d.extend2),
             hole_form=form if form in HOLE_FORMS else d.hole_form, depth=v("depth", d.depth),
-            edges=min(max(v("edges", d.edges, int), 3), 50),
+            shape=shape if shape in HOLE_SHAPES else d.shape,
+            edges=min(max(edges if edges < 50 or shape == "polygon" else d.edges, 3), 50),
             use_angle_slot=b("useAngle", d.use_angle_slot), angle_slot=v("angle", d.angle_slot),
             use_notch=b("useNotch", d.use_notch), notch_width=v("notchWidth", d.notch_width),
             notch_height=v("notchHeight", d.notch_height), notch_angle=v("notchAngle", d.notch_angle),
@@ -426,10 +418,9 @@ class DrainHoleFields(QWidget):
             lock.setChecked(b(key, "true") and abs(a.value() - b_.value()) < 1e-9)
             lock.blockSignals(False)
             lock._tip(lock.isChecked())
-        self.more_btn.setChecked(b("showMore", "false"))
 
     def _widgets(self):
-        return (self.form, self.depth, self.r1, self.r2, self.e1, self.e2, self.direction, *self.dir_xyz,
+        return (self.form, self.depth, self.shape, self.r1, self.r2, self.e1, self.e2, self.direction, *self.dir_xyz,
                 self.edges, self.use_angle, self.angle, self.notch, self.notch_w, self.notch_h,
                 self.notch_a, self.keep, self.clearance, self.clear_side)
 
@@ -440,6 +431,7 @@ class DrainHoleFields(QWidget):
             w.blockSignals(True)
         self.form.setCurrentIndex(HOLE_FORMS.index(s.hole_form))
         self.depth.setValue(s.depth)
+        self.shape.setCurrentIndex(HOLE_SHAPES.index(s.shape))
         self.r1.setValue(s.radius1)
         self.r2.setValue(s.radius2)
         self.e1.setValue(s.extend1)
@@ -465,7 +457,8 @@ class DrainHoleFields(QWidget):
         direction = self.direction.currentData()
         return (DrainHoleSettings(
             radius1=self.r1.value(), radius2=self.r2.value(), extend1=self.e1.value(), extend2=self.e2.value(),
-            hole_form=HOLE_FORMS[self.form.currentIndex()], depth=self.depth.value(), edges=self.edges.value(),
+            hole_form=HOLE_FORMS[self.form.currentIndex()], depth=self.depth.value(),
+            shape=HOLE_SHAPES[self.shape.currentIndex()], edges=self.edges.value(),
             use_angle_slot=self.use_angle.isChecked(), angle_slot=self.angle.value(),
             use_notch=self.notch.isChecked(), notch_width=self.notch_w.value(),
             notch_height=self.notch_h.value(), notch_angle=self.notch_a.value(),
@@ -478,7 +471,7 @@ class DrainHoleFields(QWidget):
         s, direction = self.value()
         for k, val in (("radius1", s.radius1), ("radius2", s.radius2), ("extend1", s.extend1),
                        ("extend2", s.extend2), ("direction", direction), ("holeForm", s.hole_form),
-                       ("depth", s.depth), ("edges", s.edges), ("useAngle", s.use_angle_slot),
+                       ("depth", s.depth), ("shape", s.shape), ("edges", s.edges), ("useAngle", s.use_angle_slot),
                        ("angle", s.angle_slot), ("useNotch", s.use_notch), ("notchWidth", s.notch_width),
                        ("notchHeight", s.notch_height), ("notchAngle", s.notch_angle),
                        ("keepPin", s.keep_subtracted), ("clearance", s.clearance),
@@ -543,7 +536,6 @@ class DrainHolePanel(FloatingPanel):
                          "Right-drag orbits, the wheel zooms.",
                          "Stop adding drain holes (Esc)", parent)
         self.setObjectName("drainHolePanel")
-        self.fields.resized.connect(self.place)
         self.fit_width()
 
 
@@ -605,7 +597,6 @@ class DrainHoleDialog(_FieldsDialog):
 
     def __init__(self, settings, parent=None):
         super().__init__(DrainHoleFields(settings), "Drain holes", parent)
-        self.fields.resized.connect(self.adjustSize)
 
 
 # ------------------------------------------------------------------ part-frame helpers

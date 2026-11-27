@@ -445,11 +445,11 @@ class DrainHole:
 
 
 def _profile(s: DrainHoleSettings, R: float, clearance: float) -> np.ndarray:
-    """The hole's cross-section at radius R (r1 + clearance) as SatelLite draws it: `edges`
-    steps around the circle, and with a notch, a key tab on the +X side, the notch width (plus
+    """The hole's cross-section at corner radius R as SatelLite draws it: `s.sides()` steps
+    around the circle (the first corner on +X), and with a notch, a key tab on the +X side, the notch width (plus
     twice the clearance) wide, its tip the notch height (plus the clearance) past the circle,
     turned by the notch angle [angle INFERRED]."""
-    n = int(s.edges)
+    n = s.sides()
     if not s.use_notch:
         ang = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
         return np.c_[np.cos(ang), np.sin(ang)] * R
@@ -473,6 +473,7 @@ def hole_mesh(s: DrainHoleSettings, depth: float, clearance: float = 0.0) -> tri
     slot), keeping its taper, and closes in a point if the taper meets the axis first."""
     slot = s.hole_form == "slot"
     L = max(float(s.depth if slot else depth), 0.0)
+    clearance = clearance / math.cos(math.pi / s.sides())    # measured across a polygon's flats
     e1, e2 = float(s.extend1), 0.0 if slot else float(s.extend2)
     r1, r2 = float(s.radius1), float(s.radius2)
     use_angle = s.use_angle_slot and not slot

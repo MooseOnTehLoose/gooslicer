@@ -181,7 +181,8 @@ def test_drain_hole_shapes():
     turned = H.hole_mesh(DrainHoleSettings(use_notch=True, notch_width=1.0, notch_height=0.5,
                                            notch_angle=90), L)
     assert np.isclose(turned.bounds[1][1], np.sqrt(4 - 0.25) + 0.5)
-    assert len(H.hole_mesh(DrainHoleSettings(edges=6), L).vertices) == 2 * 6 + 2
+    assert len(H.hole_mesh(DrainHoleSettings(shape="polygon", edges=6), L).vertices) == 2 * 6 + 2
+    assert len(H.hole_mesh(DrainHoleSettings(edges=6), L).vertices) == 2 * 50 + 2   # a cylinder
     assert DrainHoleSettings(edges=2).validate() and DrainHoleSettings(hole_form="x").validate()
 
 
@@ -320,3 +321,13 @@ def test_lattice_follows_satellite():
     assert 0.75 * bars < one.volume() < bars                # less overlap at the centre and clipped ends
     fcc = H._cell("fcc", 4.0, 0.5)
     assert fcc.volume() > one.volume()                      # 12 face diagonals, each half in the cell
+
+
+@pytest.mark.parametrize("sides", [3, 4, 6])
+def test_polygon_clearance_is_across_the_flats(sides):
+    """07 §3: a polygon hole's clearance is the gap between flats, not corners."""
+    s = DrainHoleSettings(shape="polygon", edges=sides, radius1=3.0, radius2=3.0, extend1=0, extend2=0)
+    xy = lambda c: H.hole_mesh(s, 5.0, c).vertices[:, :2]   # noqa: E731
+    u = np.array([np.cos(np.pi / sides), np.sin(np.pi / sides)])   # towards the middle of a flat
+    assert (xy(0.3) @ u).max() - (xy(0.0) @ u).max() == pytest.approx(0.3, abs=1e-9)
+    assert (xy(0.0) @ u).max() == pytest.approx(3.0 * np.cos(np.pi / sides), abs=1e-9)
