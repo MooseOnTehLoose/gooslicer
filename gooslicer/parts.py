@@ -98,7 +98,8 @@ def _best_split(W, idx):
         return None
     Dm = sp.diags(1 / np.sqrt(d))
     try:                               # the largest eigenvalue is 1 (constant); the next is Fiedler's
-        vals, vecs = eigsh(Dm @ sub @ Dm, k=2, which="LA", tol=1e-4, maxiter=5000)
+        v0 = np.random.default_rng(0).random(len(idx)) + 0.5          # fixed: same click, same parts
+        vals, vecs = eigsh(Dm @ sub @ Dm, k=2, which="LA", tol=1e-6, maxiter=5000, v0=v0)
     except Exception:
         return None
     v = vecs[:, np.argsort(vals)[0]] / np.sqrt(d)

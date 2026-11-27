@@ -26,6 +26,10 @@ CORE = 0.5                # inside faces at least this share of the greatest dis
 LEAK = 0.1                # an AI outline may reach outside the drawing by this share of its area
 CORE_COVER = 0.8          # …and must cover this share of the core
 CLOSE_STEPS = 3           # widen the paint up to this many times to close gaps
+SNAP_BAND = 3.0           # mm: a part's edge may move this far either way to meet a step (Parts)
+SNAP_FOLD = 0.2           # mm: steps measured on the surface smoothed over this (fine: a strap's edge)
+SNAP_PULL = 0.1           # per mm: a band face's pull toward its side of the old edge (> BALLOON)
+SNAP_MIN_INSIDE = 0.2     # the band narrows until this share of the part stays inside it
 SCALE = 1e4               # capacities to integers (maximum_flow wants them)
 
 
@@ -108,12 +112,14 @@ def core(s: modify.Surface, inn: np.ndarray, painted: np.ndarray) -> np.ndarray:
 
 
 def cut(s: modify.Surface, inn: np.ndarray, out: np.ndarray, painted: np.ndarray, fold: np.ndarray,
-        ai: np.ndarray | None = None, ai_seen: np.ndarray | None = None) -> np.ndarray:
+        ai: np.ndarray | None = None, ai_seen: np.ndarray | None = None,
+        pull: float = AI_PULL, keep: np.ndarray | None = None) -> np.ndarray:
     """The selection: the cheapest cut through the drawn region (inside and paint) between its
     core and the outside. Crossing costs `crossing_costs`; each inside face kept earns
     BALLOON × its area (so on a smooth surface the edge moves out to the line). `ai`/`ai_seen`:
     bool per face, an image model's outline and the faces its picture sees; faces of the drawn
-    region are pulled toward its answer by AI_PULL × their area."""
+    region are pulled toward its answer by `pull` × their area. `keep`: faces kept whatever the
+    cut (default: the core)."""
     a = s.adjacency
     w = crossing_costs(s, fold)
     dom = inn | painted
@@ -121,7 +127,7 @@ def cut(s: modify.Surface, inn: np.ndarray, out: np.ndarray, painted: np.ndarray
     m = len(idx)
     if m == 0:
         return inn.copy()
-    hard = core(s, inn, painted)
+    hard = core(s, inn, painted) if keep is None else keep
     node = np.full(len(dom), -1)
     node[idx] = np.arange(m)
     S, T = m, m + 1
@@ -144,11 +150,11 @@ def cut(s: modify.Surface, inn: np.ndarray, out: np.ndarray, painted: np.ndarray
     add(np.full(len(b), S), b, BALLOON * s.areas[idx[b]])
     if ai is not None:
         seen = np.ones(len(dom), bool) if ai_seen is None else ai_seen
-        pull = AI_PULL * s.areas[idx]
+        pa = pull * s.areas[idx]
         yes = np.nonzero(ai[idx] & seen[idx])[0]
         no = np.nonzero(~ai[idx] & seen[idx])[0]
-        add(np.full(len(yes), S), yes, pull[yes])
-        add(no, np.full(len(no), T), pull[no])
+        add(np.full(len(yes), S), yes, pa[yes])
+        add(no, np.full(len(no), T), pa[no])
     r, c, cap = np.concatenate(rows), np.concatenate(cols), np.concatenate(caps)
     G = sp.coo_matrix((cap * SCALE, (r, c)), shape=(m + 2, m + 2)).tocsr()   # sums duplicates
     G.data = np.clip(np.round(G.data), 1, 2 ** 31 - 1).astype(np.int32)
@@ -192,3 +198,38 @@ def select(s: modify.Surface, painted: np.ndarray, fold: np.ndarray, radius: flo
         return None
     inn, out, painted = r
     return cut(s, inn, out, painted, fold, ai, ai_seen)
+
+
+def snap(s: modify.Surface, mask: np.ndarray, fold: np.ndarray, faces: np.ndarray,
+         band: float = SNAP_BAND) -> np.ndarray:
+    """A part (Parts, Parts (AI)) with its edge moved onto the steps and creases near it: the
+    cheapest cut through a band `band` mm either side of the edge (`cut`, crossing costs from
+    `fold`, at SNAP_FOLD; the part inside the band is kept, so the edge moves at most `band`
+    and a larger part never falls back to a smaller one), with every face of the band pulled toward its side of the old edge
+    (SNAP_PULL, more than BALLOON), so on a smooth surface the edge stays put and it only moves
+    where a step makes it cheaper. The band narrows for small parts."""
+    if not mask.any() or mask.all():
+        return mask.copy()
+    A = s.areas
+    for _ in range(4):
+        inn = modify.grow_by(s, mask, -band, faces)
+        if A[inn].sum() >= SNAP_MIN_INSIDE * A[mask].sum():
+            break
+        band /= 2
+    else:
+        return mask.copy()
+    out = ~modify.grow_by(s, mask, band, faces)
+    painted = ~inn & ~out
+    return cut(s, inn, out, painted, fold, ai=mask, pull=SNAP_PULL, keep=inn)
+
+
+def snap_fold(s: modify.Surface) -> np.ndarray:
+    """The fold `snap` cuts along: `fold_angles` at SNAP_FOLD, or the raw angle between the two
+    faces where that's sharper. Fold is a turn per mm of face spacing, so a sharp corner next to
+    large faces (a boss's foot on a flat floor) reads low and its turn spreads one row up the
+    wall; the raw angle keeps the cut on the corner itself."""
+    fold = modify.fold_angles(s, SNAP_FOLD)
+    a = s.adjacency
+    raw = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", s.normals[a[:, 0]], s.normals[a[:, 1]]), -1, 1)))
+    raw = np.where(fold >= 0, raw, -raw)
+    return np.where(np.abs(raw) > np.abs(fold), raw, fold)

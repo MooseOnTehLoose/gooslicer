@@ -398,6 +398,20 @@ class ModifyingMixin:
             c[2][deg] = c[1].labels(deg)
         return c[2][deg]
 
+    def _snapped(self, p: Part, s: modify.Surface, seed: dict, key, raw) -> np.ndarray:
+        """A part (Parts, Parts (AI)) with its edge moved onto the steps near it
+        (drawsel.snap); cached on the seed per `key`, so moving a slider back is instant."""
+        c = seed.setdefault("snapped", {})
+        place = (id(p.mesh), p.matrix().tobytes())
+        key = (place, key)
+        if key not in c:
+            f = getattr(self, "_snap_fold_cache", None)
+            with _Busy(self, "Fitting the part's edge…"):
+                if f is None or f[0] != place:
+                    f = self._snap_fold_cache = (place, drawsel.snap_fold(s))
+                c[key] = drawsel.snap(s, raw(), f[1], np.asarray(p.mesh.faces))
+        return c[key]
+
     def region_exclude(self, pid: int, face: int) -> None:
         """Right-click in Select by Picture: leave that out of the last outline."""
         p = self.scene.get(pid)
@@ -882,11 +896,13 @@ class ModifyingMixin:
             f = q["face"]
             if q["kind"] == "part":
                 lab = self._part_labels(p, s)
-                mask |= lab == lab[f]
+                key = (int(self.props.part_edges.value()), int(lab[f]))
+                mask |= self._snapped(p, s, q, key, lambda: lab == lab[f])
             elif q["kind"] == "picture":
                 mask |= picture.pick(q["cands"], int(self.props.outline_size.value()))
             elif q["kind"] == "partsai":
-                mask |= q["parts"][min(q["pick"], len(q["parts"]) - 1)]
+                k = min(q["pick"], len(q["parts"]) - 1)
+                mask |= self._snapped(p, s, q, k, lambda: q["parts"][k])
             elif q["kind"] == "draw":
                 if q.get("mask") is not None:
                     mask |= q["mask"]

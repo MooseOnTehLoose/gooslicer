@@ -7,7 +7,7 @@ from gooslicer import drawsel, modify
 
 
 @pytest.fixture(scope="module")
-def banded():
+def banded_mesh():
     """A cylinder (r 15, z 0..50) with a raised band (a torus, tube r 1.6) round z = 25."""
     import manifold3d as m3
     cyl = trimesh.creation.cylinder(radius=15, height=50, sections=72)
@@ -19,8 +19,13 @@ def banded():
         return m3.Manifold(m3.Mesh(t.vertices.astype(np.float32), t.faces.astype(np.uint32)))
     u = (M(cyl) + M(band)).to_mesh()
     v, f = trimesh.remesh.subdivide_to_size(u.vert_properties[:, :3], u.tri_verts, max_edge=1.2)
-    m = trimesh.Trimesh(v, f)
-    s = modify.surface(m, np.eye(4))
+    return trimesh.Trimesh(v, f)
+
+
+@pytest.fixture(scope="module")
+def banded(banded_mesh):
+    """(surface, fold, the band's faces) of `banded_mesh`."""
+    s = modify.surface(banded_mesh, np.eye(4))
     r = np.hypot(s.centers[:, 0], s.centers[:, 1])
     band_faces = (r > 15.05) & (np.abs(s.centers[:, 2] - 25) < 2.5)
     return s, modify.fold_angles(s), band_faces
@@ -80,3 +85,28 @@ def test_the_ai_moves_the_edge_only_within_the_drawing(banded):
     none = drawsel.cut(s, inn, out, painted, fold, ai=np.zeros(len(inn), bool))
     core = drawsel.core(s, inn, painted)
     assert none[core].all() and none[inn | painted].mean() < allin[inn | painted].mean()
+
+
+def _iou(A, x, y):
+    return A[x & y].sum() / A[x | y].sum()
+
+
+def test_snap_moves_a_rough_part_onto_the_step(banded, banded_mesh):
+    """Parts' edge a millimetre or two off a raised band's foot lands on the foot."""
+    s, _, band = banded
+    fold = drawsel.snap_fold(s)
+    z = s.centers[:, 2]
+    t = np.arctan2(s.centers[:, 1], s.centers[:, 0])
+    rough = np.abs(z - 25 - 0.8 * np.sin(4 * t)) < 3.2                 # wavy, 0–1.5 mm out
+    snapped = drawsel.snap(s, rough, fold, np.asarray(banded_mesh.faces))
+    A = s.areas
+    assert _iou(A, snapped, band) > 0.9 > _iou(A, rough, band) + 0.1
+
+
+def test_snap_leaves_an_edge_on_a_smooth_surface(banded, banded_mesh):
+    s, _, band = banded
+    fold = drawsel.snap_fold(s)
+    z = s.centers[:, 2]
+    rough = (z > 34) & (z < 44) & (np.hypot(s.centers[:, 0], s.centers[:, 1]) > 14)
+    snapped = drawsel.snap(s, rough, fold, np.asarray(banded_mesh.faces))
+    assert _iou(s.areas, snapped, rough) > 0.97
