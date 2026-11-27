@@ -2,7 +2,7 @@
   "name": "python3-deps",
   "buildsystem": "simple",
   "build-commands": [
-    "pip3 install --verbose --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} --no-build-isolation --ignore-installed av==19.0.2 flatbuffers==25.12.19 lxml==6.1.3 manifold3d==3.5.5 networkx==3.7 numpy==2.5.5 onnxruntime-migraphx==1.27.1 packaging==26.4 pillow==13.0.0 protobuf==7.36.2 pyopengl==3.1.10 pyside6-essentials==6.12.0 rtree==1.4.1 scipy==1.18.1 shapely==2.2.0 shiboken6==6.12.0 trimesh==5.2.2"
+    "pip3 install --verbose --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} --no-build-isolation av==19.0.2 lxml==6.1.3 manifold3d==3.5.5 networkx==3.7 numpy==2.5.5 pillow==13.0.0 pyopengl==3.1.10 rtree==1.4.1 scipy==1.18.1 shapely==2.2.0 trimesh==5.2.2"
   ],
   "sources": [
     {
@@ -12,18 +12,13 @@
     },
     {
       "type": "file",
-      "url": "https://files.pythonhosted.org/packages/e8/2d/d2a548598be01649e2d46231d151a6c56d10b964d94043a335ae56ea2d92/flatbuffers-25.12.19-py2.py3-none-any.whl",
-      "sha256": "7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4"
+      "url": "https://files.pythonhosted.org/packages/ac/7d/8bf1fd8bae8247743968bb76d027a1ac5bd2c4b44495fba6a71b30d10706/lxml-6.1.3-cp313-cp313-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "d85dfab42dd672f87a7f76e9de7172962aee69fa12044f0d6e1a23cbd53fb80e"
     },
     {
       "type": "file",
-      "url": "https://files.pythonhosted.org/packages/e9/44/27e3cee3dcdb3b7bc09727b642bdbfcd098490ea77df04611db9060d7722/lxml-6.1.3-cp314-cp314-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "a7eb78ba28b187e1e9203a55c60fcf70df2d22cb205fe6d51b9383d6097419f0"
-    },
-    {
-      "type": "file",
-      "url": "https://files.pythonhosted.org/packages/ff/61/98ec11885362bc26222bcff40d300fc201c6aacf5419951b1f7b491db52e/manifold3d-3.5.5-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "f2825bc961d939ce15e27dca621656f9aaabf920ef43020c1fdf4fabcdc85a3e"
+      "url": "https://files.pythonhosted.org/packages/fb/cf/4a529b6e021eb5bba2332d3a161103c4e0f450f815c736ee5f5dacf1a983/manifold3d-3.5.5-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "332e0d5b9be52ee4649c898b25b8fd328a466767be39dcaa0d5a789189fc29d2"
     },
     {
       "type": "file",
@@ -32,28 +27,13 @@
     },
     {
       "type": "file",
-      "url": "https://files.pythonhosted.org/packages/a4/1f/fcdce1061fba2bfb2e9bfda01fbd8132d5f7522a4f7c8e2b2f629d54ee38/numpy-2.5.5-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "c48960d420e90cf305cb1fde0d4e6082cc90512cda87a9acf0b6e04e91cf4abe"
+      "url": "https://files.pythonhosted.org/packages/40/d6/68dd5a83914bbcaf32b3165993f7955979916708cb0156d1e28231e18803/numpy-2.5.5-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "824025655df929268bfe6b47ed91a00d14209a6f760847cf150be446829e1ce4"
     },
     {
       "type": "file",
-      "url": "https://files.pythonhosted.org/packages/80/53/6c9102d0d611bde225b510def4bbac95e960fd40de03ac2d2a4a45a3c62f/onnxruntime_migraphx-1.27.1-cp314-cp314-manylinux_2_34_x86_64.whl",
-      "sha256": "e7d6005b3dd17eff1f81d43318c740f4986548560339d08e8826456124e10b95"
-    },
-    {
-      "type": "file",
-      "url": "https://files.pythonhosted.org/packages/ba/7b/5504f91c9c2733f693d7759e50ede5d27119d4da7e5836c46d3b5ff81d56/packaging-26.4-py3-none-any.whl",
-      "sha256": "81383611a09c1bc0b08b76e0fd5829d7c6824c65b27a6aee339da133f4233ea2"
-    },
-    {
-      "type": "file",
-      "url": "https://files.pythonhosted.org/packages/1d/f2/1371707ce438ba9a43f9d24089828494ec6f9396e28cd7903aa704dd6306/pillow-13.0.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "e91c2b1cbeae768c98752e67e717e283d68dae45717b41f2d91eaee648e37b7d"
-    },
-    {
-      "type": "file",
-      "url": "https://files.pythonhosted.org/packages/db/f3/3996583dd2906297a637af12114deddf7658af6e683fedb83be061983fb5/protobuf-7.36.2-cp310-abi3-manylinux2014_x86_64.whl",
-      "sha256": "89f23aa53c24553a2416fd4fd1ec06f74fa42b14b546d8883128813f775bbfd2"
+      "url": "https://files.pythonhosted.org/packages/ef/fe/f5cdaa2d1c4086e757430f368c271a58ee29cfe7378e7ae7b9d964015c25/pillow-13.0.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "5f56499c1a74d2b862beb0c33b8016f99d095858455df9d21583bbbc1c15b582"
     },
     {
       "type": "file",
@@ -62,28 +42,18 @@
     },
     {
       "type": "file",
-      "url": "https://files.pythonhosted.org/packages/7b/3c/7597d8dcb36aa8315427635ec6ec9d850ffbad4ce78b9118ac854889f2d3/pyside6_essentials-6.12.0-cp310-abi3-manylinux_2_34_x86_64.whl",
-      "sha256": "16f4b5e41daf49235ae048458243da9efe5f3d8040f9cc5aa454ce69893d3bd9"
-    },
-    {
-      "type": "file",
       "url": "https://files.pythonhosted.org/packages/d1/75/e5d44be90525cd28503e7f836d077ae6663ec0687a13ba7810b4114b3668/rtree-1.4.1-py3-none-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
       "sha256": "12de4578f1b3381a93a655846900be4e3d5f4cd5e306b8b00aa77c1121dc7e8c"
     },
     {
       "type": "file",
-      "url": "https://files.pythonhosted.org/packages/6b/89/2a844506d49651e9aa1af6ef95b6bd8031cb1d5a4375edec6155037e04cf/scipy-1.18.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "ac0333bdf38309aa3dcbe7e3fa7ea29e7a2c37c6ea306a757b700ded8e4596ad"
+      "url": "https://files.pythonhosted.org/packages/41/48/6450ed9243315322bbc19ac57b9b70d66a20bf1d38d124c96bc4bf6af9ea/scipy-1.18.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "fdaf5ea890a6183d0565f51a61799d67081bd5b1cf03c5f4b3fd3732108625c9"
     },
     {
       "type": "file",
-      "url": "https://files.pythonhosted.org/packages/d2/54/8f3d60050a703dcab48f7991ec4fb111772731d20ce6a1bf649465033476/shapely-2.2.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "74f4313af38d6e49ea83532d6cedfb4fe5e6c5485d7c40202bd61b19d6ff09bf"
-    },
-    {
-      "type": "file",
-      "url": "https://files.pythonhosted.org/packages/49/c2/a04fa003b4360e99d8e3fc2829abacf37396ace63ea1cd616402209ec7c6/shiboken6-6.12.0-cp310-abi3-manylinux_2_34_x86_64.whl",
-      "sha256": "3bde565bb0890044b5c7f63808adddede5abc241e9395a2bfed61919884d6240"
+      "url": "https://files.pythonhosted.org/packages/5d/df/d67d5c56efddf9b8c2e6913c917c8eca78fdd9e7c6fb73b541dd56b1ce1d/shapely-2.2.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "f340e7f99aaee3df5acd6b247cddf723051a7c93d1e1ef09025b80d84e4c0ded"
     },
     {
       "type": "file",

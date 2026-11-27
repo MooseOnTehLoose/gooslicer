@@ -6,7 +6,7 @@ from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QPushButton, QSizePolicy, QSlider, QStyle, QStyledItemDelegate,
+                               QListWidgetItem, QPushButton, QSizePolicy, QStyle, QStyledItemDelegate,
                                QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget)
 
 from gooslicer.mesh import MeshReport
@@ -332,190 +332,13 @@ class PropertiesPanel(QWidget):
         lay.addLayout(auto_row)
 
         g = QGroupBox("Mesh")
-        gl = QVBoxLayout(g)
-        # folded away like Position, size and scale; the button carries the check's verdict
-        self.mesh_btn = disclosure_button("Mesh", "The mesh check (holes, flipped or stray triangles) and Repair")
-        self.mesh_btn.toggled.connect(self.set_mesh_visible)
-        gl.addWidget(self.mesh_btn)
-        self.mesh_box = QWidget()
-        gl.addWidget(self.mesh_box)
-        ml = QFormLayout(self.mesh_box)
-        ml.setContentsMargins(0, 0, 0, 0)
+        ml = QFormLayout(g)
         self.mesh_info = QLabel("–")
         self.mesh_info.setWordWrap(True)
         self.mesh_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.btn_repair = QPushButton("Repair")
         ml.addRow(self.mesh_info)
         ml.addRow(self.btn_repair)
-        self.mesh_box.setVisible(False)
-        lay.addWidget(g)
-
-        # Modifying (11): select part of the surface by curvature, cut it off as its own part
-        g = QGroupBox("Modifying")
-        g.setObjectName("modifyingBox")
-        fl = QFormLayout(g)
-        self.select_btn = QPushButton("Select surface")
-        self.select_btn.setCheckable(True)
-        self.select_btn.setToolTip("Click a part's surface to select the area around the click, up to "
-                                   "where it curves away; Ctrl+click adds another area. Esc stops.")
-        self.clear_region_btn = QPushButton("Clear")
-        self.clear_region_btn.setToolTip("Clear the selected surface")
-        row = QHBoxLayout()
-        fl.addRow(row)                      # attached before it gets widgets (PySide ownership)
-        row.addWidget(self.select_btn, 1)
-        row.addWidget(self.clear_region_btn)
-        self._modify_form = fl
-        self.select_by = QComboBox()
-        self.select_by.setToolTip("What a click selects: the surface round it (spread and contours), "
-                                  "the whole part of the model it's on, or what an image model sees "
-                                  "there in the 3D view; or draw round a part on the model")
-        for text, key in (("Surface", "surface"), ("Parts", "parts"), ("Picture (AI)", "picture"),
-                          ("Drawing", "draw"), ("Parts (AI)", "partsai")):
-            self.select_by.addItem(text, key)
-        from gooslicer import partfeat, picture
-        ok, why = picture.any_available()
-        if not ok:
-            item = self.select_by.model().item(2)
-            item.setEnabled(False)
-            item.setToolTip("Not available: " + why)
-        pf_ok, pf_why = partfeat.available()
-        item = self.select_by.model().item(4)
-        if pf_ok:
-            item.setToolTip("PartField (NVIDIA, non-commercial use only) finds the model's parts from "
-                            "its 3D shape; a click takes the part round it")
-        else:
-            item.setEnabled(False)
-            item.setToolTip("Not available: " + pf_why)
-        fl.addRow("Select by", self.select_by)
-        self.spread = QSlider(Qt.Horizontal)
-        self.spread.setRange(5, 90)
-        self.spread.setValue(35)
-        self.spread.setToolTip("How far the selection spreads: surface turned less than this from "
-                               "where you clicked is selected")
-        self.spread_label = QLabel("35°")
-        self.spread_label.setMinimumWidth(32)
-        srow = QHBoxLayout()
-        fl.addRow("Spread", srow)
-        srow.addWidget(self.spread, 1)
-        srow.addWidget(self.spread_label)
-        self.stop_contours = QCheckBox("Stop at contours")
-        self.stop_contours.setChecked(True)
-        self.stop_contours.setToolTip("Don't let the selection spread across a contour: a groove, a "
-                                      "strap's edge or a hairline (drawn on the part while selecting)")
-        self.contour_angle = QSlider(Qt.Horizontal)
-        self.contour_angle.setRange(10, 90)
-        self.contour_angle.setValue(35)
-        self.contour_angle.setToolTip("How sharply the surface must fold (within about a millimetre) "
-                                      "to count as a contour: lower finds more, fainter contours")
-        self.contour_label = QLabel("35°")
-        self.contour_label.setMinimumWidth(32)
-        crow = QHBoxLayout()
-        fl.addRow(crow)
-        crow.addWidget(self.stop_contours)
-        crow.addWidget(self.contour_angle, 1)
-        crow.addWidget(self.contour_label)
-        self.part_edges = QSlider(Qt.Horizontal)
-        self.part_edges.setRange(2, 30)
-        self.part_edges.setValue(10)
-        self.part_edges.setToolTip("How deep a valley must run along a border for it to stay a part "
-                                   "edge: lower gives more, smaller parts")
-        self.part_edges_label = QLabel("10°")
-        self.part_edges_label.setMinimumWidth(32)
-        prow = QHBoxLayout()
-        fl.addRow("Part edges", prow)
-        prow.addWidget(self.part_edges, 1)
-        prow.addWidget(self.part_edges_label)
-        self.outline_size = QSlider(Qt.Horizontal)
-        self.outline_size.setRange(0, 2)
-        self.outline_size.setValue(1)
-        self.outline_size.setPageStep(1)
-        self.outline_size.setToolTip("Which of the image model's outlines to use, from the smallest "
-                                     "thing round the click to the largest")
-        self.outline_label = QLabel("Medium")
-        self.outline_label.setMinimumWidth(52)
-        orow = QHBoxLayout()
-        fl.addRow("Outline", orow)
-        orow.addWidget(self.outline_size, 1)
-        orow.addWidget(self.outline_label)
-        self.brush = QSlider(Qt.Horizontal)
-        self.brush.setRange(1, 20)                  # half-millimetres: 0.5–10 mm
-        self.brush.setValue(4)
-        self.brush.setToolTip("The brush's radius: drag on the model to draw round a part. Ctrl+scroll "
-                              "over the model changes it too.")
-        self.brush_label = QLabel("2 mm")
-        self.brush_label.setMinimumWidth(52)
-        brow = QHBoxLayout()
-        fl.addRow("Brush", brow)
-        brow.addWidget(self.brush, 1)
-        brow.addWidget(self.brush_label)
-        self.draw_ai = QCheckBox("Use the AI for the edge")
-        self.draw_ai.setChecked(False)
-        self.draw_ai.setToolTip("Let the image model's outline of what you drew round help place the "
-                                "edge. Helps where a part blends smoothly into the rest with no crease; "
-                                "can hurt on rough or textured surfaces. Preferences → Picture "
-                                "selection sets the model.")
-        if not ok:
-            self.draw_ai.setChecked(False)
-            self.draw_ai.setToolTip("Not available: " + why)
-        arow = QHBoxLayout()
-        fl.addRow(arow)
-        arow.addWidget(self.draw_ai)
-        self.draw_hint = QLabel("Drag on the model to draw all the way round the part (the line can "
-                                "be rough). Each drag adds to the drawing; Clear starts again.")
-        self.draw_hint.setWordWrap(True)
-        hrow = QHBoxLayout()
-        fl.addRow(hrow)
-        hrow.addWidget(self.draw_hint)
-        self.part_size = QSlider(Qt.Horizontal)
-        self.part_size.setRange(0, 0)
-        self.part_size.setPageStep(1)
-        self.part_size.setToolTip("Smaller or larger parts round the last click, from the smallest piece "
-                                  "to most of the model; the click picks the clearest one")
-        self.part_size_label = QLabel("–")
-        self.part_size_label.setMinimumWidth(52)
-        zrow = QHBoxLayout()
-        fl.addRow("Part size", zrow)
-        zrow.addWidget(self.part_size, 1)
-        zrow.addWidget(self.part_size_label)
-        self._mode_rows = {"surface": (srow, crow), "parts": (prow,), "picture": (orow,),
-                           "draw": (brow, arow, hrow), "partsai": (zrow,)}
-        self.region_info = QLabel("Nothing selected")
-        self.region_info.setWordWrap(True)
-        fl.addRow(self.region_info)
-        self.cut_depth = _spin(0.2, 100, 2, " mm", 0.5)
-        self.cut_depth.setValue(3.0)
-        self.cut_depth.setToolTip("How far the cut reaches below the selection's lowest edge. On a "
-                                  "hollowed part, more than its wall thickness opens the cavity.")
-        fl.addRow("Cut depth", self.cut_depth)
-        self.cut_smooth = _spin(0, 5, 2, " mm", 0.1)
-        self.cut_smooth.setValue(0.5)
-        self.cut_smooth.setToolTip("Round off the outline's small notches and spikes (0: follow every "
-                                   "triangle edge)")
-        fl.addRow("Smoothing", self.cut_smooth)
-        self.cut_gap = _spin(0, 1, 2, " mm", 0.05)
-        self.cut_gap.setValue(0.1)
-        self.cut_gap.setToolTip("Room left between the piece and the part all round its cut, for "
-                                "glue (0: an exact fit)")
-        fl.addRow("Fit gap", self.cut_gap)
-        self.lay_cut = QCheckBox("Lay cut side on the plate")
-        self.lay_cut.setChecked(True)
-        self.lay_cut.setToolTip("Turn the new piece so its cut side faces the plate, beside the part")
-        fl.addRow(self.lay_cut)
-        self.grow_btn = QPushButton("Grow selection")
-        self.grow_btn.setToolTip("Grow the selection by this distance along the surface (negative "
-                                 "shrinks it)")
-        self.grow_mm = _spin(-20, 20, 2, " mm", 0.5)
-        self.grow_mm.setValue(1.0)
-        self.grow_mm.setToolTip("How far Grow selection grows the selection (negative shrinks)")
-        grow_row = QHBoxLayout()
-        fl.addRow(grow_row)
-        grow_row.addWidget(self.grow_btn, 1)
-        grow_row.addWidget(self.grow_mm)
-        self.cut_btn = QPushButton("Cut out selection")
-        self.cut_btn.setToolTip("Cut the selection off along its outline (shown in the 3D view) as a "
-                                "new part, to print separately and glue back on. The cut follows "
-                                "the outline's curves, so the piece fits back only one way.")
-        fl.addRow(self.cut_btn)
         lay.addWidget(g)
         lay.addStretch(1)
 
@@ -530,37 +353,9 @@ class PropertiesPanel(QWidget):
         self.btn_center.clicked.connect(lambda: self._edit("Center", self._center))
         self.btn_reset.clicked.connect(lambda: self._edit("Reset transform", self._reset))
         self.btn_repair.clicked.connect(win.repair_selected)
-        self.select_btn.toggled.connect(win.set_region_mode)
-        self.clear_region_btn.clicked.connect(win.clear_region)
-        self.spread.valueChanged.connect(lambda v: (self.spread_label.setText(f"{v}°"), win.region_settings_changed()))
-        for w in (self.cut_depth, self.cut_smooth, self.cut_gap):
-            w.valueChanged.connect(lambda _v: win.region_settings_changed())
-        self.stop_contours.toggled.connect(lambda _on: win.region_settings_changed())
-        self.contour_angle.valueChanged.connect(
-            lambda v: (self.contour_label.setText(f"{v}°"), win.region_settings_changed()))
-        self.select_by.currentIndexChanged.connect(lambda _i: (self.show_select_by(), win.select_by_changed()))
-        self.part_edges.valueChanged.connect(
-            lambda v: (self.part_edges_label.setText(f"{v}°"), win.region_settings_changed()))
-        self.brush.valueChanged.connect(lambda v: (self.brush_label.setText(f"{v / 2:g} mm"),
-                                                   win.brush_changed()))
-        self.draw_ai.toggled.connect(lambda _on: win.region_settings_changed())
-        self.part_size.valueChanged.connect(lambda _v: win.part_size_changed())
-        self.outline_size.valueChanged.connect(lambda v: (self.outline_label.setText(
-            ("Small", "Medium", "Large")[v]), win.region_settings_changed()))
-        self.grow_btn.clicked.connect(win.grow_selection)
-        self.grow_mm.valueChanged.connect(lambda v: win.settings.setValue("modify/grow", float(v)))
-        self.lay_cut.toggled.connect(lambda on: win.settings.setValue("modify/layFlat", bool(on)))
-        self.cut_btn.clicked.connect(win.cut_selection)
-        self.show_select_by()
         self.btn_auto.clicked.connect(win.auto_position)
         self.btn_arrange.clicked.connect(win.arrange_all)
         self.set_part(None, None)
-
-    def set_mesh_visible(self, on: bool) -> None:
-        self.mesh_box.setVisible(on)
-        self.mesh_btn.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
-        if self.mesh_btn.isChecked() != on:
-            self.mesh_btn.setChecked(on)
 
     def set_transform_visible(self, on: bool) -> None:
         self.transform.setVisible(on)
@@ -569,30 +364,18 @@ class PropertiesPanel(QWidget):
             self.transform_btn.setChecked(on)
 
     # ---------------------------------------------------------------- view
-    def show_select_by(self) -> None:
-        """Show the controls of the Select by mode only."""
-        key = self.select_by.currentData()
-        for mode, rows in self._mode_rows.items():
-            for r in rows:
-                self._modify_form.setRowVisible(r, mode == key)
-
     def set_part(self, part, report: MeshReport | None):
         self.part = part
         enabled = part is not None
         for t in (QDoubleSpinBox, QPushButton, QCheckBox, QComboBox):
             for w in self.findChildren(t):
                 w.setEnabled(enabled)
-        if enabled and not self.draw_ai.toolTip().startswith("Let"):      # no image model
-            self.draw_ai.setEnabled(False)
         if getattr(self.win, "_orienting", False):
             self.btn_auto.setEnabled(False)             # one Auto Position at a time
         self.btn_arrange.setEnabled(bool(self.win.scene.parts))    # works on all parts, selected or not
-        self.spread.setEnabled(enabled)
         if not enabled:
             self.title.setText("No part selected")
             self.mesh_info.setText("–")
-            self.mesh_btn.setText("Mesh")
-            self.win.update_region_panel()
             return
         self.title.setText(f"<b>{part.name}</b>")
         lo, hi = part.bounds()
@@ -603,16 +386,12 @@ class PropertiesPanel(QWidget):
                 w.setValue(float(x))
                 w.blockSignals(False)
         self.set_report(report)
-        self.win.update_region_panel()
 
     def set_report(self, r: MeshReport | None):
         if r is None:
             self.mesh_info.setText("Analysing…")
-            self.mesh_btn.setText("Mesh: checking…")
             self.btn_repair.setEnabled(False)
             return
-        n = len(r.problems())
-        self.mesh_btn.setText("Mesh: OK" if r.ok else f"Mesh: ⚠ {max(n, 1)} problem{'s' if n != 1 else ''}")
         vol = f"{r.volume:,.1f} mm³" if r.volume is not None else "n/a (not closed)"
         status = "✔ printable mesh" if r.ok else "⚠ " + "; ".join(r.problems())
         self.mesh_info.setText(f"{r.triangles:,} triangles · {r.components} shell(s)<br>"

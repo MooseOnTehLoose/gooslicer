@@ -44,34 +44,6 @@ void main(){
   frag = vec4(color * d, alpha);
 }
 """
-# Select by Picture (11): the picture the image model sees is shaded smoothly (per-vertex
-# normals): flat shading of a finely sculpted mesh sparkles, and the model reads that as texture
-SMOOTH_VS = """#version 330 core
-layout(location=0) in vec3 pos; layout(location=1) in vec3 nrm;
-uniform mat4 mvp; uniform mat4 model; uniform mat3 nmat; uniform float clipZ;
-out vec3 vN;
-void main(){ vec3 w = (model * vec4(pos, 1.0)).xyz; vN = nmat * nrm; gl_Position = mvp * vec4(pos, 1.0);
-             gl_ClipDistance[0] = clipZ - w.z; }
-"""
-SMOOTH_FS = """#version 330 core
-in vec3 vN; out vec4 frag;
-uniform vec3 color; uniform vec3 lightA; uniform vec3 lightB; uniform vec3 backColor;
-void main(){
-  if (!gl_FrontFacing) { frag = vec4(backColor, 1.0); return; }
-  vec3 n = normalize(vN);
-  float d = 0.30 + 0.55 * max(dot(n, lightA), 0.0) + 0.25 * max(dot(n, lightB), 0.0);
-  frag = vec4(color * d, 1.0);
-}
-"""
-# Select by Picture (11): each face's index written into the colour (24 bits), back faces none
-ID_FS = """#version 330 core
-out vec4 frag;
-void main(){
-  if (!gl_FrontFacing) { frag = vec4(0.0); return; }
-  int i = gl_PrimitiveID;
-  frag = vec4(float(i & 255), float((i >> 8) & 255), float((i >> 16) & 255), 255.0) / 255.0;
-}
-"""
 LINE_VS = """#version 330 core
 layout(location=0) in vec3 pos; uniform mat4 mvp; uniform float clipZ;
 void main(){ gl_Position = mvp * vec4(pos, 1.0); gl_ClipDistance[0] = clipZ - pos.z; }  // world pos
@@ -86,7 +58,6 @@ void main(){ frag = color; }
 COL_OUTSIDE = (0.90, 0.25, 0.22)
 COL_ISLAND = (0.92, 0.16, 0.14)       # unsupported islands, after the island check
 BACK_FACE = (0.85, 0.15, 0.55)         # inside / back faces (no layer cut)
-CONTOUR_PULL = 4e-4                    # NDC depth the contour lines are pulled forward
 OPAQUE = 0.999                         # an opacity at least this is drawn solid
 GUIDE_DIM = 0.35                       # island guide lines where something is in front of them
 COL_HOLE = (0.15, 0.45, 1.0)           # drain-hole preview (blue)
@@ -262,11 +233,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     selectionChanged = Signal(list)                # [part ids]
     moveFinished = Signal(object)                  # {id: (before PartState, after PartState)}
     layFlatPicked = Signal(int, int)               # part id, local face index
-    regionPicked = Signal(int, int, bool)          # part id, local face index, add (Ctrl)
-    regionExcluded = Signal(int, int)              # right-click in Select by Picture: part id, face
-    strokeDrawn = Signal(int, object, object)      # Select by Drawing: part id, faces, path (k, 3)
-    brushChanged = Signal(float)                   # Select by Drawing: Ctrl+scroll, new radius (mm)
-    regionModeEnded = Signal()
     holePicked = Signal(int, int, object)          # part id, local face index, world hit point
     holeModeEnded = Signal()
     escapePressed = Signal()                       # Esc with no mode or drag to cancel
@@ -291,18 +257,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self.camera = OrbitCamera()
         self.selected: list[int] = []
         self.lay_flat_mode = False
-        self.region_mode = False                   # Select surface (11): clicks pick regions
-        self.region_exclude = False                # …and a right-click marks what to leave out
-        self.region_mesh = None                    # world trimesh of the selected surface
-        self.cut_preview = None                    # world trimesh: the cut's faces inside the part
-        self.contour_lines = None                  # (k, 2, 3) world segments: Select surface contours
-        self.cut_lines = None                      # (k, 2, 3) world segments: where the cut meets the part
-        self.region_draw = False                   # Select by Drawing: a left drag paints
-        self.brush_mm = 2.0
-        self.draw_lines = None                     # (k, 2, 3) world segments: the drawing so far
-        self.brush_ring = None                     # (k, 2, 3) world segments: the brush at the cursor
-        self._stroke = None                        # the stroke being drawn
-        self._line_bufs: dict = {}                 # attribute name -> (source array, _Buffer)
         self.hole_mode = False
         self.support_mode = False
         self._spress = None             # support mode: a left press waiting to become a click or a drag
@@ -411,8 +365,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     def initializeGL(self):
         self._mesh_prog = _compile(MESH_VS, MESH_FS)
         self._line_prog = _compile(LINE_VS, LINE_FS)
-        self._id_prog = _compile(MESH_VS, ID_FS)
-        self._smooth_prog = _compile(SMOOTH_VS, SMOOTH_FS)
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glEnable(GL.GL_MULTISAMPLE)
         self._gl_ready = True
@@ -426,10 +378,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if self._guide_buf is not None:
             self._guide_buf.delete()
             self._guide_buf, self._guide_src = None, None
-        for _src, buf in self._line_bufs.values():
-            if buf is not None:
-                buf.delete()
-        self._line_bufs.clear()
         if self._sel_buf is not None:
             self._sel_buf.delete()
             self._sel_buf, self._sel_src = None, None
@@ -445,9 +393,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         live.update({id(m): m for m, _ in self._extras})
         live.update({id(m): m for m in self.island_meshes})
         live.update({id(m): m for m in self.cavity_meshes})
-        for m in (self.region_mesh, self.cut_preview):
-            if m is not None:
-                live[id(m)] = m
         if self.hole_preview is not None:
             live[id(self.hole_preview)] = self.hole_preview
         for k in [k for k in self._buffers if k not in live]:
@@ -533,15 +478,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 a = min(a, max(p.opacity, 0.05))
             (solid if a >= OPAQUE else clear).append((self._buffers[id(p.mesh)][1], p.matrix(), col, a))
         self._draw_meshes(solid, vp, u_mvp, u_n, u_c, u_alpha)
-        if self.cut_preview is not None:
-            # where the cut goes through the part: solid, so a see-through part shows it inside
-            *rgb, _a = colormod.rgba(self.colors["region"])
-            rgb = tuple(np.asarray(rgb) * 0.7)
-            GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *rgb)
-            self._draw_meshes([(self._buffers[id(self.cut_preview)][1], np.eye(4), rgb, 1.0)],
-                              vp, u_mvp, u_n, u_c, u_alpha)
-            back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
-            GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "backColor"), *back)
         if self.island_meshes or self.cavity_meshes:
             # the unsupported / cavity surface, drawn over the part's own faces (same depth):
             # pulled forward
@@ -581,9 +517,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         # supports first when solid (they hide what's behind them), last when see-through
         self._draw_meshes(sup if sa >= OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha, cull=True)
         self._draw_meshes(clear, vp, u_mvp, u_n, u_c, u_alpha, layered=True)
-        self._draw_region(vp, u_mvp, u_n, u_c, u_alpha)
-        self._draw_contours(vp)
-        GL.glUseProgram(self._mesh_prog)
         self._draw_meshes(sup if sa < OPAQUE else [], vp, u_mvp, u_n, u_c, u_alpha)
         self._draw_selected_guides(vp)
         if self.hole_preview is not None:
@@ -602,69 +535,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 self._draw_drag_marker(painter, vp)
         finally:
             painter.end()
-
-    def _line_buffer(self, name: str):
-        """The GL buffer of the segments in attribute `name`, rebuilt when it changes."""
-        src = getattr(self, name)
-        old = self._line_bufs.get(name)
-        if old is None or old[0] is not src:
-            if old is not None and old[1] is not None:
-                old[1].delete()
-            buf = _Buffer(np.asarray(src, float).reshape(-1, 3), False) if src is not None and len(src) else None
-            self._line_bufs[name] = old = (src, buf)
-        return old[1]
-
-    def _draw_surface_lines(self, vp, buf, rgb, thick: bool) -> None:
-        """Segments lying on a surface, pulled a little toward the camera so the faces they lie
-        on don't hide them; `thick` draws them again a pixel off each way."""
-        GL.glUseProgram(self._line_prog)
-        u_mvp = GL.glGetUniformLocation(self._line_prog, "mvp")
-        GL.glUniform4f(GL.glGetUniformLocation(self._line_prog, "color"), *rgb, 1.0)
-        GL.glDepthFunc(GL.GL_LEQUAL)
-        GL.glBindVertexArray(buf.vao)
-        px, py = 2.0 / max(self.width(), 1), 2.0 / max(self.height(), 1)
-        for dx, dy in (((0, 0), (px, 0), (-px, 0), (0, py), (0, -py)) if thick else ((0, 0),)):
-            T = np.eye(4)
-            T[0, 3], T[1, 3] = dx, dy
-            T[2, 3] = -CONTOUR_PULL                  # clip z − pull·w: a constant NDC depth pull
-            GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (T @ vp).astype(np.float32))
-            GL.glDrawArrays(GL.GL_LINES, 0, buf.count)
-        GL.glDepthFunc(GL.GL_LESS)
-
-    def _draw_contours(self, vp) -> None:
-        """The contours Select surface stops at (thin, dark) and the cut line where a cut out
-        would meet the part's surface (thick, light) (11)."""
-        region = np.asarray(colormod.rgba(self.colors["region"])[:3])
-        buf = self._line_buffer("contour_lines")
-        if buf is not None:
-            self._draw_surface_lines(vp, buf, region * 0.55, False)
-        buf = self._line_buffer("cut_lines")
-        if buf is not None:
-            self._draw_surface_lines(vp, buf, region * 0.4 + 0.6, True)
-        buf = self._line_buffer("draw_lines")
-        if buf is not None:
-            self._draw_surface_lines(vp, buf, (1.0, 0.78, 0.2), True)
-        buf = self._line_buffer("brush_ring")
-        if buf is not None:
-            self._draw_surface_lines(vp, buf, (1.0, 1.0, 1.0), False)
-
-    def _draw_region(self, vp, u_mvp, u_n, u_c, u_alpha) -> None:
-        """The selected surface over its part (pulled forward, as the island overlay) (11)."""
-        if self.region_mesh is None:
-            return
-        rgb = colormod.rgba(self.colors["region"])[:3]
-        GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, vp.astype(np.float32))
-        GL.glUniformMatrix4fv(u_n, 1, GL.GL_TRUE, np.eye(4, dtype=np.float32))
-        GL.glUniform3f(u_c, *rgb)
-        GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
-        GL.glPolygonOffset(-1.0, -2.0)
-        GL.glDepthFunc(GL.GL_LEQUAL)
-        GL.glEnable(GL.GL_CULL_FACE)
-        GL.glCullFace(GL.GL_BACK)
-        self._buffers[id(self.region_mesh)][1].draw()
-        GL.glDisable(GL.GL_CULL_FACE)
-        GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
-        GL.glDepthFunc(GL.GL_LESS)
 
     def _draw_meshes(self, items, vp, u_mvp, u_n, u_c, u_alpha, cull: bool = False,
                      layered: bool = False) -> None:
@@ -1014,7 +884,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     def rings(self):
         """(centre, radius) of the rotation rings around the selection, or None."""
         if (not self.show_rings or self.handle_mode != "rotate" or self.support_mode or self.hole_mode
-                or self.lay_flat_mode or self.region_mode):
+                or self.lay_flat_mode):
             return None
         parts = [p for p in (self.scene.get(i) for i in self.selected) if p]
         if not parts:
@@ -1036,95 +906,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         t = np.linspace(0, 2 * np.pi, n + 1)
         u, w = RING_BASIS[axis]
         return centre + radius * (np.cos(t)[:, None] * u + np.sin(t)[:, None] * w)
-
-    def capture(self, part: Part, scale: int = 2) -> dict:
-        """The part alone as it's seen now (opaque, model colour, the view's background, no
-        overlays) and a face-index render of it, both at `scale`× the widget's device pixels
-        (11, Select by Picture): {"rgb": (H, W, 3) uint8, "ids": (H, W) int64 (-1: none),
-        "vp", "w", "h" (widget pixels), "dpr", "scale"}."""
-        return self.capture_views(part, [self.camera], scale)[0]
-
-    def capture_views(self, part: Part, cameras: list, scale: int = 2) -> list[dict]:
-        """`capture` from each of `cameras` (OrbitCamera; the widget's size and clipping)."""
-        from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat
-        w, h = max(self.width(), 1), max(self.height(), 1)
-        dpr = self.devicePixelRatioF()
-        W, H = int(round(w * dpr)), int(round(h * dpr))
-        outs = []
-        fmt = QOpenGLFramebufferObjectFormat()
-        fmt.setAttachment(QOpenGLFramebufferObject.Depth)
-        self.makeCurrent()
-        try:
-            self._sync_buffers()
-            buf = self._buffers[id(part.mesh)][1]
-            M = part.matrix()
-            # the mesh with per-vertex normals, for the smooth picture (deleted after)
-            from gooslicer.scene import gpu_arrays
-            v, f = gpu_arrays(part.mesh)
-            vn = np.asarray(part.mesh.vertex_normals, np.float32)
-            sbuf = _Buffer(np.c_[v, vn], indices=f)
-            GL.glBindVertexArray(sbuf.vao)
-            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, sbuf.vbo)
-            GL.glEnableVertexAttribArray(1)
-            _raw_attrib_pointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 24, ctypes.c_void_p(12))
-            GL.glBindVertexArray(0)
-            nmat = np.linalg.inv(M[:3, :3]).T * np.sign(np.linalg.det(M[:3, :3]))
-            clip = 1e9 if self.clip_z is None else float(self.clip_z) + 1e-4
-            for cam in cameras:
-                vp = cam.projection(w / h) @ cam.view()
-                out = {"vp": vp, "w": w, "h": h, "dpr": dpr, "scale": scale}
-                outs.append(out)
-                for prog in (self._smooth_prog, self._id_prog):
-                    size = (W * scale, H * scale)
-                    fbo = QOpenGLFramebufferObject(size[0], size[1], fmt)
-                    fbo.bind()
-                    try:
-                        GL.glViewport(0, 0, *size)
-                        GL.glDisable(GL.GL_SCISSOR_TEST)
-                        GL.glDisable(GL.GL_BLEND)
-                        GL.glDisable(GL.GL_CULL_FACE)
-                        GL.glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)
-                        GL.glEnable(GL.GL_DEPTH_TEST)
-                        GL.glDepthMask(GL.GL_TRUE)
-                        GL.glDepthFunc(GL.GL_LESS)
-                        if prog == self._smooth_prog:
-                            GL.glClearColor(0.16, 0.17, 0.19, 1.0)
-                        else:
-                            GL.glClearColor(0.0, 0.0, 0.0, 0.0)
-                        GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
-                        GL.glUseProgram(prog)
-                        loc = lambda n: GL.glGetUniformLocation(prog, n)  # noqa: E731
-                        GL.glUniformMatrix4fv(loc("mvp"), 1, GL.GL_TRUE, (vp @ M).astype(np.float32))
-                        GL.glUniformMatrix4fv(loc("model"), 1, GL.GL_TRUE, M.astype(np.float32))
-                        GL.glUniform1f(loc("clipZ"), clip)
-                        GL.glEnable(GL.GL_CLIP_DISTANCE0)
-                        if prog == self._smooth_prog:
-                            GL.glUniformMatrix3fv(loc("nmat"), 1, GL.GL_TRUE, nmat.astype(np.float32))
-                            eye = cam.eye() - cam.target
-                            eye /= np.linalg.norm(eye)
-                            GL.glUniform3f(loc("lightA"), *eye)
-                            GL.glUniform3f(loc("lightB"), 0.0, 0.0, 1.0)
-                            GL.glUniform3f(loc("color"), *colormod.rgba(self.colors["model"])[:3])
-                            back = BACK_FACE if self.clip_z is None else colormod.rgba(self.colors["cut"])[:3]
-                            GL.glUniform3f(loc("backColor"), *back)
-                        (sbuf if prog == self._smooth_prog else buf).draw()
-                        GL.glDisable(GL.GL_CLIP_DISTANCE0)
-                        px = GL.glReadPixels(0, 0, size[0], size[1], GL.GL_RGBA, GL.GL_UNSIGNED_BYTE)
-                        a = np.frombuffer(px, np.uint8).reshape(size[1], size[0], 4)[::-1]
-                    finally:
-                        fbo.release()
-                        GL.glBindVertexArray(0)
-                        GL.glUseProgram(0)
-                    if prog == self._smooth_prog:
-                        out["rgb"] = np.ascontiguousarray(a[:, :, :3])
-                    else:
-                        ids = a[:, :, 0].astype(np.int64) | (a[:, :, 1].astype(np.int64) << 8) \
-                            | (a[:, :, 2].astype(np.int64) << 16)
-                        out["ids"] = np.where(a[:, :, 3] > 0, ids, -1)
-            sbuf.delete()
-        finally:
-            self.doneCurrent()
-        return outs
 
     def _screen(self, pts, vp=None):
         """Screen positions (N, 2) of world points, and which are in front of the camera."""
@@ -1345,17 +1126,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                     self.unsetCursor()
                     self.layFlatPicked.emit(part.id, face)
                 return
-            if self.region_mode and self.region_draw:
-                self._stroke = {"pid": None if part is None else part.id, "faces": [], "pts": [],
-                                "pos": QPointF(e.position()), "base": self.draw_lines}
-                if part is not None:
-                    self._stroke["faces"].append(int(face))
-                    self._stroke["pts"].append(np.asarray(hit, float))
-                return
-            if self.region_mode:
-                if part is not None:
-                    self.regionPicked.emit(part.id, face, bool(e.modifiers() & Qt.ControlModifier))
-                return
             if part is None:
                 if not (e.modifiers() & Qt.ControlModifier):
                     self.set_selection([])
@@ -1372,7 +1142,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                           "before": {p.id: p.state() for p in moving}}
 
     def _restore_cursor(self) -> None:
-        if self.support_mode or self.hole_mode or self.lay_flat_mode or self.region_mode:
+        if self.support_mode or self.hole_mode or self.lay_flat_mode:
             self.setCursor(Qt.CrossCursor)
         elif self._ring_hover is not None or self._handle_hover is not None:
             self.setCursor(Qt.OpenHandCursor)
@@ -1388,12 +1158,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             return
         if self._hdrag is not None and e.buttons() & Qt.LeftButton:
             self._drag_handle(pos, bool(e.modifiers() & Qt.ControlModifier))
-            return
-        if self._stroke is not None and e.buttons() & Qt.LeftButton:
-            self._extend_stroke(pos)
-            return
-        if self.region_mode and self.region_draw and not e.buttons():
-            self._show_brush(pos)
             return
         if self._spress is not None and e.buttons() & Qt.LeftButton:
             if (pos - self._spress["pos"]).manhattanLength() > 4:
@@ -1448,75 +1212,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             self.camera.orbit(-dx * 0.4, dy * 0.4)
             self.update()
 
-    # ------------------------------------------------------------ Select by Drawing
-    STROKE_STEP = 3.0                              # px between picks along a drag
-
-    def _extend_stroke(self, pos, st=None) -> None:
-        """Pick the model every STROKE_STEP px from the stroke's last point to `pos`."""
-        st = st or self._stroke
-        a = st["pos"]
-        n = max(1, int(np.hypot(pos.x() - a.x(), pos.y() - a.y()) / self.STROKE_STEP))
-        for i in range(1, n + 1):
-            q = QPointF(a.x() + (pos.x() - a.x()) * i / n, a.y() + (pos.y() - a.y()) * i / n)
-            part, face, hit = self.scene.pick(*self._ray(q))
-            if part is None:
-                continue
-            if st["pid"] is None:
-                st["pid"] = part.id
-            if part.id == st["pid"] and (not st["faces"] or st["faces"][-1] != face):
-                st["faces"].append(int(face))
-                st["pts"].append(np.asarray(hit, float))
-        st["pos"] = QPointF(pos)
-        if st is self._stroke:                     # while drawing: the drawing so far plus this
-            self._show_brush(pos)
-            self.draw_lines = self._with_stroke(st["base"], st)
-            self.update()
-
-    @staticmethod
-    def _with_stroke(lines, st):
-        """`lines` plus a stroke's path as segments."""
-        pts = np.asarray(st["pts"], float).reshape(-1, 3)
-        if len(pts) < 2:
-            return lines
-        seg = np.stack([pts[:-1], pts[1:]], axis=1)
-        return seg if lines is None or not len(lines) else np.concatenate([lines, seg])
-
-    def _show_brush(self, pos) -> None:
-        """A ring of the brush's radius on the surface under the cursor."""
-        part, face, hit = self.scene.pick(*self._ray(pos))
-        if part is None:
-            ring = None
-        else:
-            n = self._face_normal(part, face)
-            u = np.cross(n, (1.0, 0.0, 0.0) if abs(n[0]) < 0.9 else (0.0, 1.0, 0.0))
-            u /= np.linalg.norm(u)
-            v = np.cross(n, u)
-            t = np.linspace(0, 2 * np.pi, 33)
-            c = np.asarray(hit, float) + self.brush_mm * (np.outer(np.cos(t), u) + np.outer(np.sin(t), v))
-            ring = np.stack([c[:-1], c[1:]], axis=1)
-        if ring is not None or self.brush_ring is not None:
-            self.brush_ring = ring
-            self.update()
-
-    def _face_normal(self, part, face) -> np.ndarray:
-        M = part.matrix()
-        tri = np.asarray(part.mesh.vertices)[np.asarray(part.mesh.faces)[face]] @ M[:3, :3].T + M[:3, 3]
-        n = np.cross(tri[1] - tri[0], tri[2] - tri[0])
-        if np.linalg.det(M[:3, :3]) < 0:
-            n = -n
-        ln = np.linalg.norm(n)
-        return n / ln if ln > 0 else np.array([0.0, 0.0, 1.0])
-
     def mouseReleaseEvent(self, e):
-        if self._stroke is not None and e.button() == Qt.LeftButton:
-            st, self._stroke = self._stroke, None
-            self._extend_stroke(e.position(), st)
-            self.draw_lines = self._with_stroke(st["base"], st)
-            if st["pid"] is not None and st["faces"]:
-                self.strokeDrawn.emit(st["pid"], np.asarray(st["faces"], np.int64),
-                                      np.asarray(st["pts"], float).reshape(-1, 3))
-            self.update()
-            return
         if self._rot is not None and e.button() == Qt.LeftButton:
             self._end_rotate()
             return
@@ -1534,10 +1230,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             return
         if e.button() == Qt.RightButton and self._rpress is not None:
             pos, self._rpress = self._rpress, None
-            part, face, _ = self.scene.pick(*self._ray(pos))
-            if part is not None and self.region_mode and self.region_exclude:
-                self.regionExcluded.emit(part.id, face)
-                return
+            part, _, _ = self.scene.pick(*self._ray(pos))
             if part is not None:
                 self.set_selection([part.id])
                 self.partContextMenu.emit(part.id, self.mapToGlobal(pos.toPoint()))
@@ -1551,18 +1244,11 @@ class Viewport(HandlesMixin, QOpenGLWidget):
 
     def wheelEvent(self, e):
         steps = e.angleDelta().y() / 120.0
-        if self.region_mode and self.region_draw and e.modifiers() & Qt.ControlModifier:
-            self.brushChanged.emit(float(np.clip(self.brush_mm * 1.15 ** steps, 0.5, 10.0)))
-            self._show_brush(e.position())
-            return
         self.camera.zoom(0.88 ** steps)
         self.update()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape and self.cancel_handle_drag():
-            return
-        if e.key() == Qt.Key_Escape and self.region_mode:
-            self.stop_region_mode()
             return
         if e.key() == Qt.Key_Escape and (self.lay_flat_mode or self.hole_mode or self.support_mode):
             if self.hole_mode:
@@ -1603,18 +1289,6 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if self.hole_mode and self._hole_hover is not None:
             self.clear_hole_hover()
         super().leaveEvent(e)
-
-    def start_region_mode(self):
-        self.region_mode = True
-        self.setCursor(Qt.CrossCursor)
-
-    def stop_region_mode(self):
-        if self.region_mode:
-            self.region_mode = False
-            self._stroke = None
-            self.brush_ring = None
-            self.unsetCursor()
-            self.regionModeEnded.emit()
 
     def start_lay_flat(self):
         self.lay_flat_mode = True

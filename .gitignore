@@ -10,7 +10,7 @@ build/
 dist/
 .flatpak-builder/
 
-# MobileSAM model files (scripts/fetch-models.sh; the Flatpak downloads its own)
+# Local AI model files (not published)
 models/
 
 # Kept local, not published:

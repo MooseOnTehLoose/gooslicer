@@ -35,7 +35,6 @@ from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowPanel, see_throug
                         hole_preview_mesh)
 from .jobpanel import JobPanel
 from .memory import MemoryMonitor, StatusBar, trim_memory_soon
-from .modifying import ModifyingMixin
 from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, ToolWindow, show_popup
 from .printers import PrinterControlPanel
 from .projectio import ProjectController
@@ -222,11 +221,10 @@ def cpu_name() -> str:
     return f"{name}, {n} threads" if n else name
 
 
-class MainWindow(ModifyingMixin, QMainWindow):
+class MainWindow(QMainWindow):
     importFinished = Signal(int)  # number of parts added (for tests / status)
     hollowFinished = Signal(bool)
     supportsFinished = Signal(int)      # islands left (-1 = failed)
-    cutFinished = Signal(bool)          # Cut out selection done (11)
 
     def __init__(self, settings: QSettings | None = None, lan_ports: dict | None = None):
         super().__init__()
@@ -365,12 +363,6 @@ class MainWindow(ModifyingMixin, QMainWindow):
         self.viewport.handleModeChanged.connect(self._handle_mode_changed)
         self.viewport.partContextMenu.connect(self._part_context)
         self.viewport.layFlatPicked.connect(self._lay_flat)
-        self.viewport.regionPicked.connect(self.region_pick)
-        self.viewport.regionExcluded.connect(self.region_exclude)
-        self.viewport.strokeDrawn.connect(self.region_stroke)
-        self.viewport.brushChanged.connect(lambda mm: self.props.brush.setValue(int(round(mm * 2))))
-        self.viewport.regionModeEnded.connect(self._region_mode_ended)
-        self.load_modify_settings()
         self.viewport.holePicked.connect(self._hole_picked)
         self.viewport.holeModeEnded.connect(lambda: self.statusBar().clearMessage())
         self.viewport.extra_meshes = self.supports.display
@@ -609,7 +601,6 @@ class MainWindow(ModifyingMixin, QMainWindow):
             self.viewport.set_selection(select, emit=False)
         else:
             self.viewport.set_selection(self.selected_ids(), emit=False)
-        self._region_scene_changed()
         self._sync_panels()
         self.update_layer_slider()
         self.viewport.update()
