@@ -371,6 +371,7 @@ class MainWindow(QMainWindow):
         self.plate_ctl = PlateController(self)
         self.viewport.plateAddRequested.connect(self.plate_ctl.add_plate)
         self.viewport.plateDeleteRequested.connect(self.plate_ctl.delete_plate)
+        self.viewport.plateLabelClicked.connect(self.set_current_plate)
         self.shortcuts = ShortcutRegistry(self.settings, self)
         self.viewport.set_handle_mode(str(self.settings.value("view/handleMode", "rotate")))
         self.viewport.colors = colormod.load_colors(self.settings)

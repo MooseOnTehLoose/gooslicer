@@ -252,6 +252,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     transformLive = Signal()                       # parts changed during a handle drag
     plateAddRequested = Signal()                   # the + beside a plate's label (11 §3)
     plateDeleteRequested = Signal(int)             # the − beside plate i's label
+    plateLabelClicked = Signal(int)                # a click on "Plate N": make it current
 
     def __init__(self, scene: Scene, parent=None):
         super().__init__(parent)
@@ -951,6 +952,19 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 return kind, i
         return None
 
+    def plate_label_at(self, pos) -> int | None:
+        """The plate whose "Plate N" label is under `pos` (only while it's readable), unless a
+        model is in front of it there."""
+        pt = QPointF(pos)
+        for i in range(self.scene.plates):
+            q = self.plate_label_quad(i)
+            if q is None or abs(_area(q)) < 40:
+                continue
+            if QPolygonF(q).containsPoint(pt, Qt.OddEvenFill):
+                part, _, _ = self.scene.pick(*self._ray(pt))
+                return None if part is not None else i
+        return None
+
     def _draw_plate_buttons(self, p: QPainter, vp, w, h) -> None:
         p.save()
         p.setRenderHint(QPainter.Antialiasing)
@@ -972,7 +986,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         for i in range(self.scene.plates):         # "Plate N" even with one plate: its + adds one
             q = self.plate_label_quad(i, vp, w, h)
             if q is not None:
-                bright = QColor(255, 255, 255) if i == self.current_plate else QColor(175, 180, 190)
+                hot = i == self.current_plate or getattr(self, "_plate_btn_hover", None) == ("label", i)
+                bright = QColor(255, 255, 255) if hot else QColor(175, 180, 190)
                 self._draw_floor_text(p, q, f"Plate {i + 1}", bright)
         quad = self.front_label_quad(vp, w, h)
         if quad is None:
@@ -1227,6 +1242,11 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                     self.plateDeleteRequested.emit(btn[1])
                 self.update()
                 return
+            plate = self.plate_label_at(e.position()) if self.show_front else None
+            if plate is not None:
+                self.plateLabelClicked.emit(plate)
+                self.update()
+                return
             lab = self.guide_label_at(e.position())
             if lab is not None:
                 self.toggle_guide(lab)
@@ -1307,6 +1327,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             return
         if not e.buttons() and self.show_front:
             btn = self.plate_button_at(pos)
+            if btn is None:
+                k = self.plate_label_at(pos)
+                btn = None if k is None else ("label", k)
             if btn != getattr(self, "_plate_btn_hover", None):
                 self._plate_btn_hover = btn
                 if btn is None:
@@ -1317,6 +1340,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                     n = len(self.scene.on_plate(btn[1]))
                     QToolTip.showText(e.globalPosition().toPoint(),
                                       "Add a build plate" if btn[0] == "add" else
+                                      f"Make plate {btn[1] + 1} the current plate" if btn[0] == "label" else
                                       f"Delete plate {btn[1] + 1}"
                                       + (f" (its {n} part{'' if n == 1 else 's'} move to the other plates)"
                                          if n else ""), self)

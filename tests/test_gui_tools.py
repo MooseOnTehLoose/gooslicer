@@ -265,3 +265,23 @@ def test_plate_buttons_in_the_view(app, win, tmp_path):
         win.scene.remove(p.id)
     vp.update()
     assert {k for k, _, _ in vp.plate_buttons()} == {"add"}
+
+
+def test_clicking_a_plate_label_makes_it_current(app, win, tmp_path):
+    from PySide6.QtCore import QEvent
+    from test_gui_viewport import mouse
+    win.plate_ctl.add_plate()
+    win.plate_ctl.add_plate()
+    vp = win.viewport
+    vp.set_view(-90, 60)
+    vp.frame_all_plates()
+    pump(app)
+    assert win.current_plate == 2
+    for i in (0, 1):
+        q = vp.plate_label_quad(i)
+        c = (q[0] + q[1] + q[2] + q[3]) / 4
+        assert vp.plate_label_at(c) == i
+        for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+            mouse(vp, kind, c)
+        assert win.current_plate == i and vp.current_plate == i
+    assert win.scene.plates == 3 and win.undo.index() == 2      # nothing else changed
