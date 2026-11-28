@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 
 import numpy as np
 from OpenGL import GL
@@ -14,6 +15,7 @@ from typing import NamedTuple
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF, QSurfaceFormat, QTransform
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtWidgets import QToolTip
 
 from gooslicer.camera import OrbitCamera, axis_gizmo, ray_plane
 from gooslicer.scene import Part, PartState, Scene, rotation_matrix
@@ -204,6 +206,7 @@ def plate_lines(size, step: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
 # the default camera look from there, and slices match SatelLite's (05-slicing-spec §11).
 FRONT_TEXT = "FRONT"
 FRONT_ASPECT = 4.6       # label width / height
+PLATE_BTN_R = 9.0        # the − and + beside a plate label: radius in px
 FRONT_FONT_PX = 64       # drawing resolution of the label before it is projected
 
 
@@ -247,6 +250,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
     handleModeChanged = Signal(str)                # "move", "rotate" or "scale" (handles.py)
     transformFinished = Signal(object, str)        # a handle drag: {id: (before, after)}, undo text
     transformLive = Signal()                       # parts changed during a handle drag
+    plateAddRequested = Signal()                   # the + beside a plate's label (11 §3)
+    plateDeleteRequested = Signal(int)             # the − beside plate i's label
 
     def __init__(self, scene: Scene, parent=None):
         super().__init__(parent)
@@ -554,6 +559,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             if self.show_compass:
                 self._draw_compass(painter)
             self._draw_guide_labels(painter, vp, w, h)
+            if self.show_front:
+                self._draw_plate_buttons(painter, vp, w, h)
             self._draw_rings(painter, vp, w, h)
             self._draw_handles(painter, vp)
             if self.support_drag_marker is not None:
@@ -917,13 +924,56 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             pts.append(QPointF((c[0] / c[3] + 1) * w / 2, (1 - c[1] / c[3]) * h / 2))
         return pts
 
+    def plate_buttons(self, vp=None, w=None, h=None) -> list[tuple[str, int, QPointF]]:
+        """The − and + beside each plate's label, in screen space: (kind, plate, centre).
+        − deletes that plate (not offered with one plate left); + adds a plate at the end."""
+        out = []
+        for i in range(self.scene.plates):
+            q = self.plate_label_quad(i, vp, w, h)
+            if q is None or abs(_area(q)) < 40:               # label not drawn: no buttons
+                continue
+            m = (q[1] + q[2]) / 2                              # the label's right end
+            d = q[1] - q[0]
+            n = math.hypot(d.x(), d.y())
+            d = QPointF(1.0, 0.0) if n < 1e-6 else d / n
+            k = 1
+            if self.scene.plates > 1:
+                out.append(("delete", i, m + d * (PLATE_BTN_R + 6)))
+                k = 2
+            out.append(("add", i, m + d * (PLATE_BTN_R * (2 * k - 1) + 6 + 4 * (k - 1))))
+        return out
+
+    def plate_button_at(self, pos) -> tuple[str, int] | None:
+        pos = QPointF(pos)
+        for kind, i, c in self.plate_buttons():
+            if (pos - c).manhattanLength() <= PLATE_BTN_R * 1.5 and \
+                    math.hypot(pos.x() - c.x(), pos.y() - c.y()) <= PLATE_BTN_R + 2:
+                return kind, i
+        return None
+
+    def _draw_plate_buttons(self, p: QPainter, vp, w, h) -> None:
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        hover = getattr(self, "_plate_btn_hover", None)
+        for kind, i, c in self.plate_buttons(vp, w, h):
+            on = hover == (kind, i)
+            accent = QColor(230, 90, 80) if kind == "delete" else QColor(90, 170, 240)
+            p.setPen(QPen(accent if on else QColor(255, 255, 255, 120), 1.2))
+            p.setBrush(accent.darker(160) if on else QColor(0x22, 0x24, 0x28, 220))
+            p.drawEllipse(c, PLATE_BTN_R, PLATE_BTN_R)
+            p.setPen(QPen(QColor(255, 255, 255) if on else QColor(220, 224, 230), 1.8, Qt.SolidLine, Qt.RoundCap))
+            a = PLATE_BTN_R * 0.5
+            p.drawLine(QPointF(c.x() - a, c.y()), QPointF(c.x() + a, c.y()))
+            if kind == "add":
+                p.drawLine(QPointF(c.x(), c.y() - a), QPointF(c.x(), c.y() + a))
+        p.restore()
+
     def _draw_front(self, p: QPainter, vp, w, h) -> None:
-        if self.scene.plates > 1:
-            for i in range(self.scene.plates):
-                q = self.plate_label_quad(i, vp, w, h)
-                if q is not None:
-                    bright = QColor(255, 255, 255) if i == self.current_plate else QColor(175, 180, 190)
-                    self._draw_floor_text(p, q, f"Plate {i + 1}", bright)
+        for i in range(self.scene.plates):         # "Plate N" even with one plate: its + adds one
+            q = self.plate_label_quad(i, vp, w, h)
+            if q is not None:
+                bright = QColor(255, 255, 255) if i == self.current_plate else QColor(175, 180, 190)
+                self._draw_floor_text(p, q, f"Plate {i + 1}", bright)
         quad = self.front_label_quad(vp, w, h)
         if quad is None:
             return
@@ -1167,6 +1217,16 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if e.button() == Qt.RightButton and not (e.modifiers() & Qt.ShiftModifier):
             self._rpress = e.position()
         if e.button() == Qt.LeftButton and not e.modifiers() and self._rot is None:
+            btn = self.plate_button_at(e.position()) if self.show_front else None
+            if btn is not None:
+                self._plate_btn_hover = None
+                QToolTip.hideText()
+                if btn[0] == "add":
+                    self.plateAddRequested.emit()
+                else:
+                    self.plateDeleteRequested.emit(btn[1])
+                self.update()
+                return
             lab = self.guide_label_at(e.position())
             if lab is not None:
                 self.toggle_guide(lab)
@@ -1245,6 +1305,24 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             if not self._hole_timer.isActive():
                 self._hole_timer.start()
             return
+        if not e.buttons() and self.show_front:
+            btn = self.plate_button_at(pos)
+            if btn != getattr(self, "_plate_btn_hover", None):
+                self._plate_btn_hover = btn
+                if btn is None:
+                    QToolTip.hideText()
+                    self._restore_cursor()
+                else:
+                    self.setCursor(Qt.PointingHandCursor)
+                    n = len(self.scene.on_plate(btn[1]))
+                    QToolTip.showText(e.globalPosition().toPoint(),
+                                      "Add a build plate" if btn[0] == "add" else
+                                      f"Delete plate {btn[1] + 1}"
+                                      + (f" (its {n} part{'' if n == 1 else 's'} move to the other plates)"
+                                         if n else ""), self)
+                self.update()
+            if btn is not None:
+                return
         if not e.buttons():
             on_label = self.guide_label_at(pos) is not None
             if on_label != self._label_hover:

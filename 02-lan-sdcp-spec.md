@@ -93,6 +93,8 @@ Handled in `FUN_1800ca5e0`. [OBSERVED unless noted]
 - **Chunking:**
   - Chunk size is **1 MiB** (`0x100000`); the last chunk is shorter.
   - Chunks are sent sequentially, one request per chunk. `Offset` is the byte offset of the chunk.
+    - Checked again 2026-11-27 (stored decompilation in `evidence/elenetmanager-lan-sdcp.json`): each chunk is one `QNetworkAccessManager::post`, then the reply's `finished` is connected to a local `QEventLoop::quit` and `QEventLoop::exec()` blocks until it completes. Only then is `Offset` advanced. **One chunk is in flight at a time; there is no parallel upload.** [OBSERVED]
+    - One `QNetworkAccessManager` serves the whole upload, so Qt reuses the TCP connection between chunks (GooSlicer opens one per chunk). [INFERRED from Qt's connection reuse]
   - Each chunk is retried up to **3** times. Success means the `QNetworkReply` has no error; the response body is not read by this function.
   - Upload stops on a cancel flag (object+0x40).
 - **Form parts, in this order** (`FUN_1800c9f50` adds the plain fields):

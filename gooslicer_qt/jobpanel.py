@@ -7,7 +7,7 @@ import numpy as np
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+                               QLabel, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
 from . import flaws as flawmod
 from .panels import InfoButton, show_popup
@@ -80,9 +80,12 @@ class JobPanel(QWidget):
         form = QFormLayout()
         sl.addLayout(form)
         form.addRow("Support type", self.support_type)
+        # the summary is a row of its own: a wrapped label beside a button in a nested layout
+        # got one line's height and was cut off
+        form.addRow("Tips", self.tips_label)
         trow = QHBoxLayout()
-        form.addRow("Tips", trow)
-        trow.addWidget(self.tips_label, 1)
+        form.addRow(trow)
+        trow.addStretch(1)
         trow.addWidget(self.tips_btn)
         sl.addWidget(self.support_note)
         sl.addLayout(self._button_grid([self.generate_btn, self.remove_btn, self.islands_btn, self.fix_btn]))
@@ -163,6 +166,19 @@ class JobPanel(QWidget):
         out.addWidget(self.export_btn, 1)
         out.addWidget(self.send_btn, 1)
         vl.addLayout(out)
+        # sending to the printer: a bar under Send to printer (and in the status bar)
+        self.upload_row = QWidget()
+        ur = QHBoxLayout(self.upload_row)
+        ur.setContentsMargins(0, 0, 0, 0)
+        self.upload_bar = QProgressBar()
+        self.upload_bar.setRange(0, 1000)
+        self.upload_bar.setTextVisible(True)
+        self.upload_cancel_btn = QPushButton("Cancel")
+        self.upload_cancel_btn.setToolTip("Stop sending the file (the printer drops the partial file)")
+        ur.addWidget(self.upload_bar, 1)
+        ur.addWidget(self.upload_cancel_btn)
+        self.upload_row.hide()
+        vl.addWidget(self.upload_row)
         self._update_icons()
         vl.addWidget(self.status)
         vl.addWidget(self.results)
@@ -439,6 +455,19 @@ class JobPanel(QWidget):
         self.status.show()
         self.results.hide()
         self._set_held(False)
+
+    def upload_started(self, name: str, size: int) -> None:
+        self.upload_name = name
+        self.upload_bar.setValue(0)
+        self.upload_bar.setFormat(f"Sending {name}… 0%")
+        self.upload_row.show()
+
+    def upload_progress(self, done: int, total: int) -> None:
+        self.upload_bar.setValue(int(1000 * done / max(1, total)))
+        self.upload_bar.setFormat(f"Sending… %p% ({done / 1e6:.1f} / {total / 1e6:.1f} MB)")
+
+    def upload_finished(self, name: str, ok: bool, msg: str) -> None:
+        self.upload_row.hide()
 
     def slicing_progress(self, done: int, total: int) -> None:
         self.status.setText(f"Slicing… {done} / {total} layers")

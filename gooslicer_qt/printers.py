@@ -55,6 +55,7 @@ class PrinterControlPanel(QWidget):
     log = Signal(str)
     uploadProgress = Signal(int, int)
     uploadFinished = Signal(str, bool, str)     # filename, ok, message
+    uploadStarted = Signal(str, int)            # filename, size in bytes
     connectionStateChanged = Signal(bool)       # connected or not (also on disconnect by the user)
     attributesUpdated = Signal()                # the printer's attributes arrived (camera, …)
 
@@ -521,6 +522,7 @@ class PrinterControlPanel(QWidget):
         self.cancel_upload_btn.show()
         self._update_buttons()
         self.log.emit(f"Uploading {name} to {p.name}…")
+        self.uploadStarted.emit(name, os.path.getsize(path))
         sess = self.session
 
         def work():
@@ -533,6 +535,9 @@ class PrinterControlPanel(QWidget):
                 self.uploadFinished.emit(name, True, "")
         threading.Thread(target=work, name="goo-upload", daemon=True).start()
         return True
+
+    def cancel_upload(self) -> None:
+        self._upload_cancel.set()
 
     def _upload_progress(self, done, total):
         self.upload_bar.setValue(int(1000 * done / max(1, total)))

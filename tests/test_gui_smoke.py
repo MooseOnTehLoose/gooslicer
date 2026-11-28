@@ -147,10 +147,16 @@ def test_printer_control_against_simulator(app, tmp_path, monkeypatch):
         trimesh.creation.box((8, 6, 1)).export(stl)
         w.import_files([str(stl)])
         assert _wait(app, lambda: len(w.scene.parts) == 1)
+        shown = []                               # the upload's progress, under Send to printer
+        lan.uploadStarted.connect(lambda name, size: shown.append(
+            (name, w.job_panel.upload_row.isVisibleTo(w.job_panel), w._upload_progress.isVisibleTo(w))))
+        w.job_panel.upload_bar.valueChanged.connect(lambda v: shown.append(v))
         w.slice_and_send()
         assert _wait(app, lambda: "Start print" in asked, 120)
         assert asked[:2] == ["Send to printer", "Start print"]
         assert "box.goo" in sim.files
+        assert ("box.goo", True, True) in shown and shown[-1] == 1000
+        assert not w.job_panel.upload_row.isVisibleTo(w.job_panel) and not w._upload_progress.isVisibleTo(w)
         assert _wait(app, lambda: lan.state.is_printing and lan.layer_label.text().endswith("/ 20"))
         assert _wait(app, lambda: lan.files.count() == 1)
         assert lan.pause_btn.isEnabled() and lan.stop_btn.isEnabled() and not lan.print_file_btn.isEnabled()

@@ -54,6 +54,9 @@ class PlateController(QObject):
             a.setChecked(i == self.win.current_plate)
             group.addAction(a)
         self.delete_action.setEnabled(self.scene.plates > 1)
+        n = len(self.scene.on_plate(self.win.current_plate))
+        self.delete_action.setText(f"&Delete plate {self.win.current_plate + 1}"
+                                   + (f" ({n} part{'' if n == 1 else 's'} move to other plates)" if n else ""))
 
     def step(self, d: int) -> None:
         self.win.set_current_plate((self.win.current_plate + d) % self.scene.plates)

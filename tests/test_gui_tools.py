@@ -221,3 +221,47 @@ def test_library_save_version_and_window(app, win, tmp_path, monkeypatch):
     assert win.project.path == d.path and win.project.is_modified()
     assert "(V1)" in win.windowTitle()
     lw.close()
+
+
+def _layout(win):
+    """Each part's plate and its place on that plate."""
+    s = win.scene
+    return sorted((s.plate_of(p), round(float(p.position[0] - s.plate_offset(s.plate_of(p))[0]), 3),
+                   round(float(p.position[1]), 3)) for p in s.parts)
+
+
+def test_plate_buttons_in_the_view(app, win, tmp_path):
+    """11 §3: the − beside a plate's label deletes that plate (an empty one moves nothing but
+    the later plates, which keep their layout); the + adds a plate; no − with one plate."""
+    from PySide6.QtCore import QEvent
+    from test_gui_viewport import mouse
+    f = box_file(tmp_path, size=(30, 30, 10))
+    wait_import(app, win, [f, f])
+    win.plate_ctl.add_plate()
+    win.plate_ctl.add_plate()
+    wait_import(app, win, [f, f])                           # onto plate 3
+    vp = win.viewport
+    vp.set_view(-90, 60)
+    vp.frame_all_plates()
+    pump(app)
+    win.select([win.scene.parts[0].id])                     # plate 1 current: the − must not care
+    before = _layout(win)
+    assert [p for _, p, _ in before] and {k for k, _, _ in before} == {0, 2}
+    btn = {(k, i): c for k, i, c in vp.plate_buttons()}
+    assert set(btn) == {(k, i) for k in ("add", "delete") for i in range(3)}
+    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        mouse(vp, kind, btn[("delete", 1)])
+    pump(app)
+    assert win.scene.plates == 2
+    assert _layout(win) == [((1 if k == 2 else k), x, y) for k, x, y in before]
+    win.undo.undo()
+    assert win.scene.plates == 3 and _layout(win) == before
+    btn = {(k, i): c for k, i, c in vp.plate_buttons()}
+    for kind in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+        mouse(vp, kind, btn[("add", 0)])
+    assert win.scene.plates == 4 and _layout(win) == before
+    win.scene.plates = 1
+    for p in list(win.scene.parts):
+        win.scene.remove(p.id)
+    vp.update()
+    assert {k for k, _, _ in vp.plate_buttons()} == {"add"}

@@ -352,10 +352,25 @@ class MainWindow(QMainWindow):
         self.memory_monitor.start()
         self.statusBar().addPermanentWidget(self._progress)
         self.statusBar().addPermanentWidget(self._cancel_btn)
+        self._upload_progress = QProgressBar()      # only shown while sending to the printer
+        self._upload_progress.setMaximumWidth(260)
+        self._upload_progress.setRange(0, 1000)
+        self._upload_progress.hide()
+        self.statusBar().addPermanentWidget(self._upload_progress)
+        jp, lan = self.job_panel, self.lan
+        lan.uploadStarted.connect(jp.upload_started)
+        lan.uploadProgress.connect(jp.upload_progress)
+        lan.uploadFinished.connect(jp.upload_finished)
+        jp.upload_cancel_btn.clicked.connect(lan.cancel_upload)
+        lan.uploadStarted.connect(self._upload_started)
+        lan.uploadProgress.connect(self._upload_step)
+        lan.uploadFinished.connect(self._upload_done)
 
         self.project = ProjectController(self)
         self.current_plate = 0                  # the plate slicing and new parts use (11 §3)
         self.plate_ctl = PlateController(self)
+        self.viewport.plateAddRequested.connect(self.plate_ctl.add_plate)
+        self.viewport.plateDeleteRequested.connect(self.plate_ctl.delete_plate)
         self.shortcuts = ShortcutRegistry(self.settings, self)
         self.viewport.set_handle_mode(str(self.settings.value("view/handleMode", "rotate")))
         self.viewport.colors = colormod.load_colors(self.settings)
@@ -2237,6 +2252,21 @@ class MainWindow(QMainWindow):
         if res.backend.startswith("gpu ("):
             return res.backend[5:-1]
         return cpu_name()
+
+    def _upload_started(self, name: str, size: int) -> None:
+        self._upload_progress.setValue(0)
+        self._upload_progress.setFormat("Sending… %p%")
+        self._upload_progress.show()
+        self.statusBar().showMessage(f"Sending {name} to the printer ({size / 1e6:.1f} MB)…")
+
+    def _upload_step(self, done: int, total: int) -> None:
+        self._upload_progress.setValue(int(1000 * done / max(1, total)))
+        self.statusBar().showMessage(f"Sending to the printer… {done / 1e6:.1f} / {total / 1e6:.1f} MB")
+
+    def _upload_done(self, name: str, ok: bool, msg: str) -> None:
+        self._upload_progress.hide()
+        self.statusBar().showMessage(f"Sent {name} to the printer" if ok else
+                                     f"Sending {name} {'cancelled' if msg == 'cancelled' else 'failed'}", 10000)
 
     def cancel_slice(self):
         if self._slice_thread:
