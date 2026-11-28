@@ -1999,7 +1999,8 @@ def test_vertex_data_float32_and_memory_trim(app):
     from gooslicer_qt import memory as M
     from gooslicer.scene import GPU_KEY, Part, gpu_arrays, hull_index, prepare
     m = trimesh.creation.icosphere(2)
-    v, f = gpu_arrays(prepare(m))
+    v, f, sm = gpu_arrays(prepare(m))
+    assert sm.shape == (len(v), 16) and sm.dtype == np.uint8
     assert v.dtype == np.float32 and f.dtype == np.uint32 and np.allclose(v, m.vertices, atol=1e-6)
     assert (f == m.faces).all() and GPU_KEY in m._cache
     m.apply_translation([1, 0, 0])                          # a changed mesh drops the stale copy

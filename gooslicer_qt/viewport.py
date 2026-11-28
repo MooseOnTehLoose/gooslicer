@@ -28,20 +28,40 @@ from .layerslider import LayerSlider
 # needs a face normal: the fragment shader takes it from the screen-space derivatives of the
 # world position, which lie in the triangle's plane. It faces the viewer, which for a front face
 # is the outward normal; back faces are painted a fixed colour anyway.
+# Zoomed out, a detailed model's triangles get smaller than a pixel and each pixel shows one
+# random facet: a speckle of light and dark. Meshes uploaded with smooth_attributes carry three
+# ever-smoother normals (locations 1–3) and the local edge length (location 4); as a pixel grows
+# past the edge length the shading steps through them, like mipmaps. Up close it stays
+# flat-shaded. Buffers without them read the default (0, 0, 0, 1): edge 0, face normals only.
 MESH_VS = """#version 330 core
 layout(location=0) in vec3 pos;
+layout(location=1) in vec3 n1; layout(location=2) in vec3 n2; layout(location=3) in vec3 n3;
+layout(location=4) in float edge;
 uniform mat4 mvp; uniform mat4 model; uniform float clipZ;
-out vec3 vW;
+out vec3 vW; out vec3 nA; out vec3 nB; out vec3 nC; out float edgeW;
 void main(){ vW = (model * vec4(pos, 1.0)).xyz; gl_Position = mvp * vec4(pos, 1.0);
+             mat3 m = mat3(model);
+             mat3 nm = transpose(inverse(m));                // outward, mirrored parts too
+             nA = nm * n1; nB = nm * n2; nC = nm * n3;
+             edgeW = edge * pow(abs(determinant(m)), 1.0 / 3.0);
              gl_ClipDistance[0] = clipZ - vW.z; }  // layer slider: nothing above clipZ
 """
 MESH_FS = """#version 330 core
-in vec3 vW; out vec4 frag;
+in vec3 vW; in vec3 nA; in vec3 nB; in vec3 nC; in float edgeW; out vec4 frag;
 uniform vec3 color; uniform vec3 lightA; uniform vec3 lightB; uniform float alpha;
 uniform vec3 backColor;
 void main(){
   if (!gl_FrontFacing) { frag = vec4(backColor, alpha); return; }  // inside/back faces
   vec3 n = normalize(cross(dFdx(vW), dFdy(vW)));
+  if (edgeW > 0.0) {
+    float r = max(length(dFdx(vW)), length(dFdy(vW))) / edgeW; // a pixel, in edge lengths
+    vec3 f = n;
+    vec3 s = n;
+    if (dot(nA, nA) > 0.25) s = normalize(mix(s, normalize(nA), smoothstep(0.35, 1.5, r)));
+    if (dot(nB, nB) > 0.25) s = normalize(mix(s, normalize(nB), smoothstep(1.5, 3.5, r)));
+    if (dot(nC, nC) > 0.25) s = normalize(mix(s, normalize(nC), smoothstep(3.5, 8.0, r)));
+    n = normalize(mix(f, s, clamp(dot(s, f) * 4.0, 0.0, 1.0)));  // never turn away from the eye
+  }
   float d = 0.30 + 0.55 * max(dot(n, lightA), 0.0) + 0.25 * max(dot(n, lightB), 0.0);
   frag = vec4(color * d, alpha);
 }
@@ -141,7 +161,8 @@ class _Buffer:
     """VAO + VBO of float32 xyz points, with an optional uint32 index buffer (then `count` is
     the number of indices and draw() uses glDrawElements)."""
 
-    def __init__(self, data: np.ndarray, with_normals: bool = False, indices: np.ndarray | None = None):
+    def __init__(self, data: np.ndarray, with_normals: bool = False, indices: np.ndarray | None = None,
+                 smooth: np.ndarray | None = None):
         data = np.ascontiguousarray(data, dtype=np.float32)
         self.count = len(data)
         self.vao = GL.glGenVertexArrays(1)
@@ -152,6 +173,18 @@ class _Buffer:
         GL.glBufferData(GL.GL_ARRAY_BUFFER, data.nbytes, data, GL.GL_STATIC_DRAW)
         GL.glEnableVertexAttribArray(0)
         _raw_attrib_pointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, data.shape[1] * 4, ctypes.c_void_p(0))
+        self.sbo = None
+        if smooth is not None and len(smooth) == len(data):          # locations 1–4 (MESH_VS)
+            smooth = np.ascontiguousarray(smooth, dtype=np.uint8)
+            stride = smooth.shape[1]
+            self.sbo = GL.glGenBuffers(1)
+            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.sbo)
+            GL.glBufferData(GL.GL_ARRAY_BUFFER, smooth.nbytes, smooth, GL.GL_STATIC_DRAW)
+            for loc in (1, 2, 3):                                     # signed normalized bytes
+                GL.glEnableVertexAttribArray(loc)
+                _raw_attrib_pointer(loc, 3, GL.GL_BYTE, GL.GL_TRUE, stride, ctypes.c_void_p(4 * (loc - 1)))
+            GL.glEnableVertexAttribArray(4)
+            _raw_attrib_pointer(4, 1, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(12))
         if indices is not None:
             indices = np.ascontiguousarray(indices, dtype=np.uint32)
             self.ebo = GL.glGenBuffers(1)
@@ -169,6 +202,8 @@ class _Buffer:
 
     def delete(self):
         GL.glDeleteBuffers(1, [self.vbo])
+        if self.sbo is not None:
+            GL.glDeleteBuffers(1, [self.sbo])
         if self.ebo is not None:
             GL.glDeleteBuffers(1, [self.ebo])
         GL.glDeleteVertexArrays(1, [self.vao])
@@ -178,8 +213,8 @@ def mesh_buffer(mesh) -> _Buffer:
     """A mesh's indexed GPU buffer, from the float32/uint32 arrays gpu_arrays() keeps on it
     (made on a worker thread where possible)."""
     from gooslicer.scene import GPU_KEY, gpu_arrays
-    v, f = gpu_arrays(mesh)
-    buf = _Buffer(v, indices=f)
+    v, f, sm = gpu_arrays(mesh)
+    buf = _Buffer(v, indices=f, smooth=sm)
     mesh._cache.cache.pop(GPU_KEY, None)          # on the GPU now: free the copy
     return buf
 

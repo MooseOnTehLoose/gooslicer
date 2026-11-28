@@ -61,11 +61,12 @@ def checked(mesh: trimesh.Trimesh, repair: bool):
     """(mesh, its check, what repair fixed or None): the mesh repaired when `repair` is on and
     it fails its check (04: repair after edits)."""
     from . import mesh as M
+    from .scene import prepare
     rep = M.analyze(mesh)
     if not repair or rep.ok:
-        return mesh, rep, None
+        return prepare(mesh), rep, None           # ready for the 3D view, off the GUI thread
     fixed = M.repair(mesh)
-    return fixed, M.analyze(fixed), rep.problems()
+    return prepare(fixed), M.analyze(fixed), rep.problems()
 
 
 def hollow_checked(mesh: trimesh.Trimesh, scale, s, repair: bool):

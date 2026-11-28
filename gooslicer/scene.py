@@ -44,13 +44,62 @@ def _keep_hull(src: trimesh.Trimesh, dst: trimesh.Trimesh) -> trimesh.Trimesh:
 GPU_KEY = "gs_gpu"
 
 
-def gpu_arrays(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
-    """(float32 vertices, uint32 faces): what the 3D view uploads. Kept in trimesh's cache, which
-    drops it when the mesh changes; the view frees it after uploading."""
+SMOOTH_LEVELS = (0, 4, 16)          # rounds of neighbour averaging for each normal level
+SMOOTH_STRIDE = 16                  # bytes per vertex: 3 normals as 4 signed bytes, float edge
+
+
+def smooth_attributes(vertices, faces) -> np.ndarray:
+    """Per vertex, for the 3D view's zoomed-out shading (uint8 N×16): three normals of the
+    surface around it, ever wider (the area-weighted normal of its faces, then that averaged
+    with its neighbours 4 and 16 times, roughly 2 and 4 edges across), each as 4 signed
+    normalized bytes, then the mean length of its edges as a float32. Where triangles are
+    smaller than a pixel, per-face normals are noise (a speckle of light and dark facets); the
+    view shades with the level whose width matches a pixel, like a texture's mipmaps."""
+    v = np.asarray(vertices, np.float64)
+    f = np.asarray(faces, np.int64)
+    n = len(v)
+    out = np.zeros((n, SMOOTH_STRIDE), np.uint8)
+    if not len(f) or not n:
+        return out
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    fn = np.cross(b - a, c - a)                                  # length = 2 × area
+    idx = f.ravel()
+    acc = np.stack([np.bincount(idx, np.repeat(fn[:, k], 3), n) for k in range(3)], 1)
+    ab, bc, ca = (np.linalg.norm(b - a, axis=1), np.linalg.norm(c - b, axis=1), np.linalg.norm(a - c, axis=1))
+    total = (np.bincount(f[:, 0], ab + ca, n) + np.bincount(f[:, 1], ab + bc, n)
+             + np.bincount(f[:, 2], bc + ca, n))
+    edge = (total / np.maximum(2 * np.bincount(idx, minlength=n), 1)).astype(np.float32)
+    import scipy.sparse as sp
+    e = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+    adj = sp.coo_matrix((np.ones(2 * len(e), np.float32), (np.r_[e[:, 0], e[:, 1]], np.r_[e[:, 1], e[:, 0]])),
+                        shape=(n, n)).tocsr()
+    adj.data[:] = 1.0                       # an edge shared by two faces counts once
+    adj = (adj + sp.identity(n, np.float32, format="csr")).astype(np.float32)
+    # sums of area-weighted normals stay area-weighted; rescaled once a level (a round grows a
+    # value at most (degree + 1)-fold: 16 rounds stay far inside float32)
+    acc = (acc / max(float(np.abs(acc).max()), 1e-30)).astype(np.float32)
+    done = 0
+    for k, rounds in enumerate(SMOOTH_LEVELS):
+        for _ in range(rounds - done):
+            acc = adj @ acc
+        acc /= np.maximum(np.abs(acc).max(axis=1, keepdims=True), np.float32(1e-30))
+        done = rounds
+        ln = np.linalg.norm(acc, axis=1, keepdims=True)
+        unit = np.divide(acc, ln, out=np.zeros_like(acc), where=ln > 0)
+        out[:, 4 * k:4 * k + 3] = np.round(unit * 127).astype(np.int8).view(np.uint8)
+    out[:, 12:16] = edge.view(np.uint8).reshape(n, 4)
+    return out
+
+
+def gpu_arrays(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(float32 vertices, uint32 faces, smooth_attributes): what the 3D view uploads.
+    Kept in trimesh's cache, which drops it when the mesh changes; the view frees it after
+    uploading."""
     c = mesh._cache
     if GPU_KEY not in c:
         c[GPU_KEY] = (np.ascontiguousarray(mesh.vertices, np.float32),
-                      np.ascontiguousarray(mesh.faces, np.uint32))
+                      np.ascontiguousarray(mesh.faces, np.uint32),
+                      smooth_attributes(mesh.vertices, mesh.faces))
     return c[GPU_KEY]
 
 
@@ -98,8 +147,11 @@ class Part:
     @classmethod
     def from_mesh(cls, name: str, mesh: trimesh.Trimesh) -> "Part":
         m = _keep_hull(mesh, mesh.copy())
+        gpu = mesh._cache.cache.get(GPU_KEY)
         centre = m.bounds.mean(axis=0)
         m.apply_translation(-centre)
+        if gpu is not None:                 # faces and smooth normals don't move: keep them
+            m._cache[GPU_KEY] = (np.ascontiguousarray(m.vertices, np.float32), gpu[1], gpu[2])
         return cls(name, m, position=centre.astype(float))
 
     @property

@@ -380,3 +380,26 @@ def test_checked_repairs_only_when_asked_and_broken():
     assert out is holey and not rep.ok and fixed is None
     out, rep, fixed = jobs.checked(box, True)
     assert out is box and rep.ok and fixed is None
+
+
+def test_smooth_attributes_for_zoomed_out_shading():
+    """Three ever-smoother normals per vertex (signed bytes) and its mean edge length (float):
+    on a sphere every level points outward; Part.from_mesh keeps them when it re-centres."""
+    import numpy as np
+    import trimesh
+    from gooslicer.scene import GPU_KEY, Part, gpu_arrays, prepare, smooth_attributes
+    s = trimesh.creation.icosphere(3, radius=10)
+    a = smooth_attributes(s.vertices, s.faces)
+    assert a.shape == (len(s.vertices), 16) and a.dtype == np.uint8
+    normals = a[:, :12].view(np.int8).reshape(-1, 3, 4)[:, :, :3] / 127.0
+    outward = s.vertices / np.linalg.norm(s.vertices, axis=1, keepdims=True)
+    assert (normals * outward[:, None, :]).sum(axis=2).min() > 0.98
+    edge = a[:, 12:16].copy().view(np.float32).ravel()
+    assert np.allclose(edge, s.edges_unique_length.mean(), rtol=0.15)
+    m = prepare(s.copy())
+    m.apply_translation([30, 0, 0])
+    prepare(m)
+    p = Part.from_mesh("ball", m)                  # re-centred: positions move, the rest is kept
+    v, f, sm = p.mesh._cache.cache[GPU_KEY]
+    assert np.allclose(v, p.mesh.vertices, atol=1e-5) and (sm == gpu_arrays(m)[2]).all()
+    assert smooth_attributes(np.zeros((0, 3)), np.zeros((0, 3), int)).shape == (0, 16)

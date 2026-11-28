@@ -204,7 +204,7 @@ def _repair_and_analyze(m, progress=None):
     fixed = meshmod.repair(m, progress=progress)
     if progress:
         progress("checking the result")
-    return fixed, meshmod.analyze(fixed)
+    return prepare(fixed), meshmod.analyze(fixed)       # ready for the 3D view, off the GUI thread
 
 
 def cpu_name() -> str:

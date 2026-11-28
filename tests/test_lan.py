@@ -131,6 +131,10 @@ def test_ws_request_response_loopback():
         sent = srv.received[0]
         assert sent["Topic"] == f"sdcp/request/{MAINBOARD}" and sent["Data"]["Cmd"] == 129
         assert sent["Data"]["Data"] == {} and sent["Id"] == "conn-1"
+        import time
+        end = time.monotonic() + 2.0          # the server thread records the pong on its own time
+        while not srv.pongs and time.monotonic() < end:
+            time.sleep(0.01)
         assert srv.pongs == [b"hb"]
     finally:
         srv.shutdown(); srv.server_close()
