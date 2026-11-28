@@ -1036,3 +1036,30 @@ def test_layer_slider_hides_above_cut(app, win, tmp_path):
     win.undo.undo()                                         # plate empty again: slider hidden, all shown
     pump(app)
     assert sl.isHidden() and vp.clip_z is None
+
+
+def test_zoomed_out_detailed_model_is_drawn_whole(app, win, tmp_path):
+    """Far away, a model of sub-pixel triangles still covers its area: the view supersamples
+    (2×2, no multisampling; multisampled, an RX 9070 XT dropped sub-pixel triangles and a dense
+    sphere vanished)."""
+    from gooslicer_qt import viewport as V
+    m = trimesh.creation.icosphere(6, radius=15)            # 82k triangles
+    f = tmp_path / "ball.stl"
+    m.export(f)
+    wait_import(app, win, [f])
+    vp = win.viewport
+    vp.show_front = vp.show_compass = False
+    win.select([])
+    p = win.scene.parts[0]
+    vp.camera.frame(*p.bounds())
+    vp.camera.distance *= 8
+    img = vp.grabFramebuffer()
+    assert vp.format().samples() <= 1 and vp._ss_fbo is not None
+    assert vp._ss_fbo.width() == V.SUPERSAMPLE * img.width()
+    a = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.width(), 4).astype(int)
+    lit = (np.abs(a[..., :3] - a[0, 0, :3]).sum(axis=2) > 60).sum()   # differs from the background
+    c = vp.camera.projection(img.width() / img.height()) @ vp.camera.view()
+    centre = c @ np.append(p.position, 1.0)
+    edge = c @ np.append(p.position + vp.camera.view()[0, :3] * 15, 1.0)
+    r = abs(edge[0] / edge[3] - centre[0] / centre[3]) / 2 * img.width()   # radius in pixels
+    assert lit > 0.8 * np.pi * r * r

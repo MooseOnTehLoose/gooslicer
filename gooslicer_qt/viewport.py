@@ -14,6 +14,7 @@ from typing import NamedTuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF, QSurfaceFormat, QTransform
+from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat, QOpenGLPaintDevice
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QToolTip
 
@@ -68,7 +69,9 @@ void main(){
 """
 LINE_VS = """#version 330 core
 layout(location=0) in vec3 pos; uniform mat4 mvp; uniform float clipZ;
-void main(){ gl_Position = mvp * vec4(pos, 1.0); gl_ClipDistance[0] = clipZ - pos.z; }  // world pos
+uniform vec2 pxOff;   // a shift in NDC: lines drawn twice, a pixel apart, are 2 pixels wide
+void main(){ gl_Position = mvp * vec4(pos, 1.0); gl_Position.xy += pxOff * gl_Position.w;
+             gl_ClipDistance[0] = clipZ - pos.z; }  // world pos
 """
 LINE_FS = """#version 330 core
 out vec4 frag; uniform vec4 color;
@@ -133,8 +136,14 @@ def default_format() -> QSurfaceFormat:
     f.setProfile(QSurfaceFormat.CoreProfile)
     f.setDepthBufferSize(24)
     f.setStencilBufferSize(8)            # see-through parts: where their own surface is nearest
-    f.setSamples(4)
+    # no multisampling: the view supersamples instead (Viewport.paintGL). Multisampled, an AMD
+    # RX 9070 XT (RDNA 4, Mesa 26.2) drops triangles much smaller than a pixel, so zoomed-out
+    # detailed models broke up and vanished; a closed 15 mm sphere disappeared entirely
+    f.setSamples(0)
     return f
+
+
+SUPERSAMPLE = 2          # the 3D view draws at 2× width and height, then scales down 2:1
 
 
 def _compile(vs: str, fs: str) -> int:
@@ -424,6 +433,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
 
     def _cleanup(self):
         self.makeCurrent()
+        self._ss_fbo = None                 # its GL objects go with the context
         for _, b in self._buffers.values():
             b.delete()
         self._buffers.clear()
@@ -465,8 +475,59 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             self._plate = (_Buffer(quad, False), _Buffer(grid, False), _Buffer(box, False))
             self._plate_size = self.scene.size.copy()
 
+    def _ss_target(self):
+        """The offscreen buffer a frame is drawn into, SUPERSAMPLE× the widget's pixels each way
+        (no multisampling), and a paint device for QPainter on it; (None, self) to draw on the
+        widget directly when the buffer can't be made. Scaled down 2:1 with linear filtering,
+        each pixel is the average of 4: smooth edges, and the lighting of a model's sub-pixel
+        triangles averaged rather than one facet picked at random (zoomed out, a speckle)."""
+        if getattr(self, "_ss_failed", False):
+            return None, self
+        dpr = self.devicePixelRatioF()
+        W = max(1, int(round(self.width() * dpr))) * SUPERSAMPLE
+        H = max(1, int(round(self.height() * dpr))) * SUPERSAMPLE
+        fbo = getattr(self, "_ss_fbo", None)
+        if fbo is None or fbo.width() != W or fbo.height() != H:
+            fmt = QOpenGLFramebufferObjectFormat()
+            fmt.setAttachment(QOpenGLFramebufferObject.CombinedDepthStencil)
+            fmt.setSamples(0)
+            fbo = QOpenGLFramebufferObject(W, H, fmt)
+            if not fbo.isValid():
+                self._ss_failed, self._ss_fbo = True, None
+                return None, self
+            self._ss_fbo = fbo
+            self._ss_dev = QOpenGLPaintDevice(W, H)
+        self._ss_dev.setDevicePixelRatio(dpr * SUPERSAMPLE)
+        return fbo, self._ss_dev
+
+    def _draw_lines(self, count: int) -> None:
+        """GL_LINES with the line program bound. Supersampled, a 1-pixel line would come out
+        half a pixel wide and faint (core profile: no glLineWidth above 1), so it's drawn twice,
+        one buffer pixel apart diagonally: a pixel wide once scaled down, as before."""
+        loc = GL.glGetUniformLocation(self._line_prog, "pxOff")
+        GL.glUniform2f(loc, 0.0, 0.0)
+        GL.glDrawArrays(GL.GL_LINES, 0, count)
+        fbo = getattr(self, "_ss_fbo", None)
+        if fbo is not None and not getattr(self, "_ss_failed", False):
+            GL.glUniform2f(loc, 2.0 / fbo.width(), 2.0 / fbo.height())
+            GL.glDrawArrays(GL.GL_LINES, 0, count)
+            GL.glUniform2f(loc, 0.0, 0.0)
+
+    def _ss_resolve(self, fbo) -> None:
+        """Scale the supersampled frame down onto the widget."""
+        dpr = self.devicePixelRatioF()
+        w, h = max(1, int(round(self.width() * dpr))), max(1, int(round(self.height() * dpr)))
+        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, fbo.handle())
+        GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, self.defaultFramebufferObject())
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+        GL.glBlitFramebuffer(0, 0, fbo.width(), fbo.height(), 0, 0, w, h, GL.GL_COLOR_BUFFER_BIT, GL.GL_LINEAR)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+
     def paintGL(self):
         self._sync_buffers()
+        fbo, target = self._ss_target()
+        if fbo is not None:
+            fbo.bind()
         GL.glClearColor(0.16, 0.17, 0.19, 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         w, h = max(self.width(), 1), max(self.height(), 1)
@@ -474,15 +535,19 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         if self.show_front:
             # the FRONT label lies on the floor: painted first, into colour only, so the models
             # drawn after it hide it (painted last it showed through them)
-            painter = QPainter(self)
+            painter = QPainter(target)
             try:
                 self._draw_front(painter, vp, w, h)
             finally:
                 painter.end()
         # QPainter (the label, and the compass drawn last) leaves its own GL state behind:
         # reset ours
-        dpr = self.devicePixelRatioF()
-        GL.glViewport(0, 0, int(round(w * dpr)), int(round(h * dpr)))
+        if fbo is not None:
+            fbo.bind()
+            GL.glViewport(0, 0, fbo.width(), fbo.height())
+        else:
+            dpr = self.devicePixelRatioF()
+            GL.glViewport(0, 0, int(round(w * dpr)), int(round(h * dpr)))
         GL.glDisable(GL.GL_SCISSOR_TEST)
         GL.glDisable(GL.GL_STENCIL_TEST)
         GL.glDisable(GL.GL_CULL_FACE)
@@ -514,13 +579,13 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             GL.glUniformMatrix4fv(u_line_mvp, 1, GL.GL_TRUE, (vp @ T).astype(np.float32))
             GL.glUniform4f(loc, 0.33, 0.35, 0.39, 1.0)
             GL.glBindVertexArray(grid.vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, grid.count)
+            self._draw_lines(grid.count)
             if many and i == self.current_plate:
                 GL.glUniform4f(loc, 0.82, 0.86, 0.95, 1.0)
             else:
                 GL.glUniform4f(loc, 0.55, 0.58, 0.64, 1.0) if not many else GL.glUniform4f(loc, 0.45, 0.47, 0.52, 1.0)
             GL.glBindVertexArray(box.vao)
-            GL.glDrawArrays(GL.GL_LINES, 0, box.count)
+            self._draw_lines(box.count)
         GL.glUniformMatrix4fv(u_line_mvp, 1, GL.GL_TRUE, vp.astype(np.float32))
 
         GL.glUseProgram(self._mesh_prog)
@@ -590,7 +655,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
         GL.glDisable(GL.GL_CLIP_DISTANCE0)          # QPainter draws next
-        painter = QPainter(self)
+        if fbo is not None:
+            fbo.bind()
+        painter = QPainter(target)
         try:
             if self.show_compass:
                 self._draw_compass(painter)
@@ -603,6 +670,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                 self._draw_drag_marker(painter, vp)
         finally:
             painter.end()
+        if fbo is not None:
+            self._ss_resolve(fbo)
 
     def _draw_meshes(self, items, vp, u_mvp, u_n, u_c, u_alpha, cull: bool = False,
                      layered: bool = False) -> None:
@@ -774,7 +843,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             GL.glUniform4f(loc, *rgb, alpha * a)
             for T in (shifts if alpha == 1.0 else shifts[:1]):
                 GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (T @ vp).astype(np.float32))
-                GL.glDrawArrays(GL.GL_LINES, 0, self._guide_buf.count)
+                self._draw_lines(self._guide_buf.count)
         GL.glDepthFunc(GL.GL_LESS)
         GL.glDepthMask(GL.GL_TRUE)
         GL.glDisable(GL.GL_BLEND)
@@ -894,7 +963,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             T = np.eye(4)
             T[0, 3], T[1, 3] = dx, dy
             GL.glUniformMatrix4fv(u_mvp, 1, GL.GL_TRUE, (T @ vp).astype(np.float32))
-            GL.glDrawArrays(GL.GL_LINES, 0, self._sel_buf.count)
+            self._draw_lines(self._sel_buf.count)
         GL.glDisable(GL.GL_BLEND)
         GL.glEnable(GL.GL_DEPTH_TEST)
 

@@ -191,6 +191,8 @@ GooSlicer's output for the same STL will be compared against it layer by layer: 
 - Magnet pockets from a list of common disc sizes, with adjustable diameter, depth and clearance.
 - ✔ Tests: tests/test_library.py, tests/test_cut_magnet.py, plate tests in tests/test_scene.py and tests/test_project.py, GUI tests in tests/test_gui_tools.py.
 
+**3D view rendering note [OBSERVED 2026-11-28 on the user's RX 9070 XT, radeonsi gfx1201, Mesa 26.2.4]:** with a multisampled framebuffer, triangles much smaller than a pixel are dropped. A closed 15 mm icosphere (327 680 triangles) covered 19 964 / 68 / 0 / 0 pixels at 2×/4×/7×/11× zoomed out with 4× MSAA, and about 20 100 at every zoom without it. Per-sample shading, 8× MSAA and the `AMD_DEBUG` switches nonggc, nongg, nodcc, nodccmsaa, nofmask, nohyperz, nooutoforder, forcegfxblit and forcecomputeblit changed nothing. The view therefore renders without MSAA into a 2× offscreen buffer and scales it down 2:1 (`viewport.SUPERSAMPLE`); about 1.4 ms a frame at 1600×1000 on that GPU. Lines are drawn twice a buffer pixel apart to stay 1 px wide.
+
 Rough order of effort: P0 S · P1 L · P2 M · P3 S–M · P4 M · P5 M–L · P6 XL · P7 M.
 
 ## 5. Risks
