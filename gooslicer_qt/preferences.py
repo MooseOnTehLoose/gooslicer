@@ -476,6 +476,21 @@ class PreferencesDialog(QDialog):
                                              lambda path, k=key: s.setValue(k, path) if path else s.remove(k)))
         f.addRow(_note("Where file dialogs open. They follow the last folder used; Automatic means "
                        "your home folder."))
+        self.library_label = _path_label()
+        lib_btn = QPushButton("Choose…")
+        lib_btn.setToolTip("The folder the Project library keeps its projects in")
+
+        def pick_library():
+            from gooslicer.library import DEFAULT_ROOT
+            path = QFileDialog.getExistingDirectory(self, "Library folder", str(s.value("library/root", "") or DEFAULT_ROOT.parent))
+            if path:
+                s.setValue("library/root", path)
+                self._refresh_current()
+        lib_btn.clicked.connect(pick_library)
+        f.addRow("Library", self._row(self.library_label, lib_btn))
+        f.addRow(_note("Where File → Project library… keeps projects, designs and versions (11 §4). "
+                       "In the Flatpak, a folder other than the default needs "
+                       "flatpak override --filesystem=<folder>."))
         proj = self.win.project
         self.autosave_spin = QSpinBox()
         self.autosave_spin.setRange(0, 120)
@@ -512,6 +527,7 @@ class PreferencesDialog(QDialog):
         def refresh():
             for key, lab in self.folder_labels.items():
                 lab.setText(str(s.value(key, "") or Path.home()))
+            self.library_label.setText(str(self.win.library_root()))
             for spin, value in ((self.autosave_spin, proj.autosave_minutes()), (self.recent_spin, proj.recent_max())):
                 spin.blockSignals(True)
                 spin.setValue(value)
@@ -526,6 +542,7 @@ class PreferencesDialog(QDialog):
         def reset():
             for key, *_ in FOLDERS:
                 s.remove(key)
+            s.remove("library/root")
             proj.set_autosave_minutes(5)
             s.remove("recent/max")
             s.remove("import/autoRepair")

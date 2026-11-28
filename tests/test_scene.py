@@ -175,8 +175,59 @@ def test_arrange_no_overlap_and_fits():
     many = S.Scene((30, 30, 30))
     for _ in range(9):
         many.add(make((20, 20, 5)))
-    assert not many.arrange()
+    assert not many.arrange(grow=False) and many.plates == 1     # no plates added: they pile up
+    assert many.arrange() and many.plates == 9                    # 11 §3: one 20 mm part per plate
+    assert sorted(many.plate_of(p) for p in many.parts) == list(range(9))
 
+
+def test_plates_membership_and_volume():
+    """11 §3: plates side by side along +X, pitch = width + 25 mm; a part belongs to the plate
+    nearest its centre and is in volume only inside that plate."""
+    sc = S.Scene((100, 80, 100))
+    sc.plates = 3
+    assert sc.pitch == 125 and list(sc.plate_offset(2)) == [250, 0, 0]
+    p = sc.add(make((10, 10, 10)))
+    assert sc.plate_of(p) == 0 and sc.in_volume(p)
+    p.position[0] = 250
+    assert sc.plate_of(p) == 2 and sc.in_volume(p) and sc.on_plate(2) == [p]
+    p.position[0] = 62.5                      # in the gap between plates 1 and 2
+    assert not sc.in_volume(p)
+    p.position[0] = 900                       # beyond the last plate
+    assert sc.plate_of(p) == 2 and not sc.in_volume(p)
+
+
+def test_arrange_spills_onto_new_plates():
+    sc = S.Scene((50, 50, 50))
+    parts = [sc.add(make((20, 20, 5))) for _ in range(6)]       # 4 fit a plate (2 × 2)
+    assert sc.arrange(spacing=2) and sc.plates == 2
+    assert [len(sc.on_plate(i)) for i in range(2)] == [4, 2]
+    assert all(sc.in_volume(p) for p in parts)
+    sc.plates = 4                             # extra empty plates are kept
+    assert sc.arrange(spacing=2) and sc.plates == 4 and len(sc.on_plate(3)) == 0
+
+
+def test_place_spill_and_delete_plate():
+    """New parts spill to the next plate with room, else onto a new one; deleting a plate
+    shifts later plates left and re-places its parts, adding no plate (11 §3)."""
+    sc = S.Scene((30, 30, 50))                # room for one 20 mm part per plate
+    a = sc.add(make((20, 20, 5)))
+    assert sc.place_spill(a) == (0, False)
+    b = sc.add(make((20, 20, 5)))
+    assert sc.place_spill(b) == (1, True) and sc.plates == 2 and sc.in_volume(b)
+    sc.plates = 3
+    c = sc.add(make((20, 20, 5)))
+    assert sc.place_spill(c) == (2, False)    # plate 2 existed and was empty
+    with pytest.raises(ValueError):
+        S.Scene().delete_plate(0)
+    left = sc.delete_plate(1)                 # b has nowhere to go: left beside the last plate
+    assert sc.plates == 2 and sc.plate_of(c) == 1 and sc.in_volume(c)
+    assert left == [b] and not sc.in_volume(b) and sc.in_volume(a)
+    roomy = S.Scene((30, 30, 50))
+    x = roomy.add(make((20, 20, 5)))
+    roomy.plates = 2
+    x.position[0] = roomy.pitch
+    roomy.delete_plate(1)                     # plate 0 is empty: x moves there
+    assert roomy.plates == 1 and roomy.in_volume(x)
 
 def test_pick():
     sc = S.Scene()

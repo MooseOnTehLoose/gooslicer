@@ -266,6 +266,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         # last hover is kept so the preview can follow settings changes
         self.hole_preview_maker = None
         self.hole_preview = None
+        self.cut_preview = None                    # the Cut panel's plane (11 §2), world trimesh
         self._hole_hover = None
         self._hole_pos = None
         self._hole_pending = None       # the latest cursor spot, picked once the queued moves are in
@@ -303,6 +304,7 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self._last = QPointF()
         self._init_handles()
         self.clip_z: float | None = None           # layer slider: hide everything above (mm)
+        self.current_plate = 0                     # drawn brighter; Reset view frames it (11 §3)
         self.layer_slider = LayerSlider(self)
         self.layer_slider.cutChanged.connect(self._set_clip)
         self.layer_slider.hide()
@@ -310,9 +312,17 @@ class Viewport(HandlesMixin, QOpenGLWidget):
 
     # ------------------------------------------------------------- public
     def reset_view(self):
+        """Frame the current plate from the front, a little to the right and above."""
         sx, sy, sz = self.scene.size
-        self.camera.frame([-sx / 2, -sy / 2, 0], [sx / 2, sy / 2, sz * 0.4])
+        cx = float(self.scene.plate_offset(min(self.current_plate, self.scene.plates - 1))[0])
+        self.camera.frame([cx - sx / 2, -sy / 2, 0], [cx + sx / 2, sy / 2, sz * 0.4])
         self.camera.yaw, self.camera.pitch = -90.0 + 25.0, 28.0
+        self.update()
+
+    def frame_all_plates(self):
+        sx, sy, sz = self.scene.size
+        last = float(self.scene.plate_offset(self.scene.plates - 1)[0])
+        self.camera.frame([-sx / 2, -sy / 2, 0], [last + sx / 2, sy / 2, sz * 0.4])
         self.update()
 
     def set_view(self, yaw: float, pitch: float):
@@ -396,6 +406,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         live.update({id(m): m for m in self.cavity_meshes})
         if self.hole_preview is not None:
             live[id(self.hole_preview)] = self.hole_preview
+        if self.cut_preview is not None:
+            live[id(self.cut_preview)] = self.cut_preview
         for k in [k for k in self._buffers if k not in live]:
             self._buffers.pop(k)[1].delete()
         for k, m in live.items():
@@ -453,12 +465,22 @@ class Viewport(HandlesMixin, QOpenGLWidget):
                               vp.astype(np.float32))
         loc = GL.glGetUniformLocation(self._line_prog, "color")
         _quad, grid, box = self._plate                # the plate itself is see-through: grid only
-        GL.glUniform4f(loc, 0.33, 0.35, 0.39, 1.0)
-        GL.glBindVertexArray(grid.vao)
-        GL.glDrawArrays(GL.GL_LINES, 0, grid.count)
-        GL.glUniform4f(loc, 0.55, 0.58, 0.64, 1.0)
-        GL.glBindVertexArray(box.vao)
-        GL.glDrawArrays(GL.GL_LINES, 0, box.count)
+        u_line_mvp = GL.glGetUniformLocation(self._line_prog, "mvp")
+        many = self.scene.plates > 1
+        for i in range(self.scene.plates):            # side by side along +X (11 §3)
+            T = np.eye(4)
+            T[:3, 3] = self.scene.plate_offset(i)
+            GL.glUniformMatrix4fv(u_line_mvp, 1, GL.GL_TRUE, (vp @ T).astype(np.float32))
+            GL.glUniform4f(loc, 0.33, 0.35, 0.39, 1.0)
+            GL.glBindVertexArray(grid.vao)
+            GL.glDrawArrays(GL.GL_LINES, 0, grid.count)
+            if many and i == self.current_plate:
+                GL.glUniform4f(loc, 0.82, 0.86, 0.95, 1.0)
+            else:
+                GL.glUniform4f(loc, 0.55, 0.58, 0.64, 1.0) if not many else GL.glUniform4f(loc, 0.45, 0.47, 0.52, 1.0)
+            GL.glBindVertexArray(box.vao)
+            GL.glDrawArrays(GL.GL_LINES, 0, box.count)
+        GL.glUniformMatrix4fv(u_line_mvp, 1, GL.GL_TRUE, vp.astype(np.float32))
 
         GL.glUseProgram(self._mesh_prog)
         eye_dir = self.camera.eye() - self.camera.target
@@ -522,6 +544,8 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         self._draw_selected_guides(vp)
         if self.hole_preview is not None:
             self._draw_hole_preview(vp)
+        if self.cut_preview is not None:
+            self._draw_hole_preview(vp, self.cut_preview, cull=False)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
         GL.glDisable(GL.GL_CLIP_DISTANCE0)          # QPainter draws next
@@ -611,19 +635,24 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         p.drawEllipse(c, 6.0, 6.0)
         p.drawPoint(c)
 
-    def _draw_hole_preview(self, vp) -> None:
-        """The drain hole a click would drill: translucent blue, its part inside the model shown
-        fainter through the surface."""
+    def set_cut_preview(self, mesh) -> None:
+        self.cut_preview = mesh
+        self.update()
+
+    def _draw_hole_preview(self, vp, mesh=None, cull: bool = True) -> None:
+        """The drain hole a click would drill (or another preview solid): translucent blue,
+        its part inside the model shown fainter through the surface."""
+        mesh = self.hole_preview if mesh is None else mesh
         GL.glUseProgram(self._mesh_prog)
         GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._mesh_prog, "mvp"), 1, GL.GL_TRUE, vp.astype(np.float32))
         GL.glUniformMatrix4fv(GL.glGetUniformLocation(self._mesh_prog, "model"), 1, GL.GL_TRUE,
                               np.eye(4, dtype=np.float32))
         GL.glUniform3f(GL.glGetUniformLocation(self._mesh_prog, "color"), *COL_HOLE)
         u_alpha = GL.glGetUniformLocation(self._mesh_prog, "alpha")
-        b = self._buffers[id(self.hole_preview)][1]
+        b = self._buffers[id(mesh)][1]
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFuncSeparate(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ZERO, GL.GL_ONE)
-        GL.glEnable(GL.GL_CULL_FACE)
+        GL.glEnable(GL.GL_CULL_FACE) if cull else GL.glDisable(GL.GL_CULL_FACE)
         GL.glCullFace(GL.GL_BACK)
         GL.glDepthMask(GL.GL_FALSE)
         for func, alpha in ((GL.GL_GREATER, HOLE_ALPHA_HIDDEN), (GL.GL_LEQUAL, HOLE_ALPHA)):
@@ -867,10 +896,40 @@ class Viewport(HandlesMixin, QOpenGLWidget):
             pts.append(QPointF((c[0] / c[3] + 1) * w / 2, (1 - c[1] / c[3]) * h / 2))
         return pts
 
+    def plate_label_quad(self, i: int, vp=None, w=None, h=None) -> list[QPointF] | None:
+        """Screen corners of plate i's label ("Plate 2"), flat on the floor just behind the
+        plate's back (+Y) edge, reading from the front; None when behind the camera."""
+        w = w or max(self.width(), 1)
+        h = h or max(self.height(), 1)
+        if vp is None:
+            vp = self.camera.projection(w / h) @ self.camera.view()
+        sx, sy = float(self.scene.size[0]), float(self.scene.size[1])
+        cx = float(self.scene.plate_offset(i)[0])
+        th = float(np.clip(sy * 0.12, 8.0, 22.0))
+        tw = th * FRONT_ASPECT
+        y0 = sy / 2 + th * 0.35
+        y1 = y0 + th
+        pts = []
+        for x, y in ((cx - tw / 2, y1), (cx + tw / 2, y1), (cx + tw / 2, y0), (cx - tw / 2, y0)):
+            c = vp @ np.array([x, y, 0.0, 1.0])
+            if c[3] <= 1e-6:
+                return None
+            pts.append(QPointF((c[0] / c[3] + 1) * w / 2, (1 - c[1] / c[3]) * h / 2))
+        return pts
+
     def _draw_front(self, p: QPainter, vp, w, h) -> None:
+        if self.scene.plates > 1:
+            for i in range(self.scene.plates):
+                q = self.plate_label_quad(i, vp, w, h)
+                if q is not None:
+                    bright = QColor(255, 255, 255) if i == self.current_plate else QColor(175, 180, 190)
+                    self._draw_floor_text(p, q, f"Plate {i + 1}", bright)
         quad = self.front_label_quad(vp, w, h)
         if quad is None:
             return
+        self._draw_floor_text(p, quad, FRONT_TEXT, QColor(255, 255, 255))
+
+    def _draw_floor_text(self, p: QPainter, quad, text: str, color: QColor) -> None:
         poly = QPolygonF(quad)
         if abs(_area(quad)) < 40:                                 # edge-on: nothing readable
             return
@@ -888,9 +947,9 @@ class Viewport(HandlesMixin, QOpenGLWidget):
         font.setLetterSpacing(QFont.PercentageSpacing, 112)
         p.setFont(font)
         p.setPen(QColor(0, 0, 0, 110))                           # soft shadow for contrast
-        p.drawText(src.translated(1.5, 1.5), Qt.AlignCenter, FRONT_TEXT)
-        p.setPen(QColor(255, 255, 255))
-        p.drawText(src, Qt.AlignCenter, FRONT_TEXT)
+        p.drawText(src.translated(1.5, 1.5), Qt.AlignCenter, text)
+        p.setPen(color)
+        p.drawText(src, Qt.AlignCenter, text)
         p.restore()
 
     # ------------------------------------------------------------ rotation rings

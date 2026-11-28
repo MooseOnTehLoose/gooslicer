@@ -175,10 +175,34 @@ def rotation_between(a, b) -> np.ndarray:
     return np.eye(3) + vx + vx @ vx / (1 + c)
 
 
+PLATE_GAP = 25.0        # mm between build plates laid side by side along +X (11 §3)
+
+
 class Scene:
     def __init__(self, size=(211.68, 118.37, 220.0)):
         self.size = np.asarray(size, float)
         self.parts: list[Part] = []
+        self.plates = 1                      # build plates, side by side along +X (11 §3)
+
+    # --------------------------------------------------------------- plates
+    @property
+    def pitch(self) -> float:
+        return float(self.size[0]) + PLATE_GAP
+
+    def plate_offset(self, i: int) -> np.ndarray:
+        """Plate i's centre on the floor (plate 0 at the origin)."""
+        return np.array([i * self.pitch, 0.0, 0.0])
+
+    def plate_at(self, x: float) -> int:
+        """The plate nearest a world x."""
+        return int(np.clip(round(float(x) / self.pitch), 0, self.plates - 1))
+
+    def plate_of(self, part: "Part") -> int:
+        lo, hi = part.bounds()
+        return self.plate_at((lo[0] + hi[0]) / 2)
+
+    def on_plate(self, i: int) -> list["Part"]:
+        return [p for p in self.parts if self.plate_of(p) == i]
 
     # --------------------------------------------------------------- parts
     def get(self, part_id: int) -> Part | None:
@@ -240,49 +264,62 @@ class Scene:
             self.drop_to_plate(part)
 
     def in_volume(self, part: Part, tol: float = 1e-6) -> bool:
+        """Inside the volume of the plate it is on (11 §3)."""
         lo, hi = part.bounds()
+        c = self.plate_offset(self.plate_of(part))[:2]
         half = self.size[:2] / 2
-        return bool(np.all(lo[:2] >= -half - tol) and np.all(hi[:2] <= half + tol)
+        return bool(np.all(lo[:2] - c >= -half - tol) and np.all(hi[:2] - c <= half + tol)
                     and lo[2] >= -tol and hi[2] <= self.size[2] + tol)
 
-    def arrange(self, spacing: float = 3.0, parts: list[Part] | None = None) -> bool:
-        """Shelf-pack footprints (largest first), centre the layout on the plate.
-        Returns False if the layout does not fit in the plate."""
+    def arrange(self, spacing: float = 3.0, parts: list[Part] | None = None, grow: bool = True) -> bool:
+        """Shelf-pack footprints (largest first) onto plate 0, then 1, … (11 §3), each plate's
+        layout centred on it. With grow, plates are added until everything fits; without,
+        what is left goes on the last plate anyway. False if some part is out of volume."""
         parts = list(parts or self.parts)
         if not parts:
             return True
-        width = self.size[0]
+        W, D = self.size[:2]
         order = sorted(parts, key=lambda p: (p.size()[1], p.size()[0]), reverse=True)
-        placed, x, y, row_h, max_w = [], 0.0, 0.0, 0.0, 0.0
+        plates: list[list] = [[]]
+        x = y = row_h = 0.0
         for p in order:
             w, d = p.size()[:2]
-            if x > 0 and x + w > width:
+            if x > 0 and x + w > W + 1e-9:
                 x, y, row_h = 0.0, y + row_h + spacing, 0.0
-            placed.append((p, x, y))
+            if plates[-1] and y + d > D + 1e-9 and (grow or len(plates) < self.plates):
+                plates.append([])
+                x = y = row_h = 0.0
+            plates[-1].append((p, x, y))
             x += w + spacing
             row_h = max(row_h, d)
-            max_w = max(max_w, x - spacing)
-        total = np.array([max_w, y + row_h])
-        origin = -total / 2
-        for p, px, py in placed:
-            lo = p.bounds()[0]
-            p.position[:2] += np.array([origin[0] + px, origin[1] + py]) - lo[:2]
-            self.drop_to_plate(p)
-        return bool(np.all(total <= self.size[:2] + 1e-9))
+        self.plates = max(self.plates, len(plates))
+        for i, placed in enumerate(plates):
+            max_w = max(px + p.size()[0] for p, px, _ in placed)
+            max_d = max(py + p.size()[1] for p, _, py in placed)
+            origin = self.plate_offset(i)[:2] - np.array([max_w, max_d]) / 2
+            for p, px, py in placed:
+                lo = p.bounds()[0]
+                p.position[:2] += origin + np.array([px, py]) - lo[:2]
+                self.drop_to_plate(p)
+        return all(self.in_volume(p) for p in parts)
 
-    def place_free(self, part: Part, near=None, spacing: float = 3.0, step: float = 1.0) -> bool:
-        """Move `part` (XY only) to the free spot on the plate nearest `near` (default: where it
-        is), keeping `spacing` mm from the other parts' footprints. False if none fits."""
+    def place_free(self, part: Part, near=None, spacing: float = 3.0, step: float = 1.0,
+                   plate: int | None = None) -> bool:
+        """Move `part` (XY only) to the free spot nearest `near` (default: where it is) on its
+        plate (or `plate`), keeping `spacing` mm from the other parts' footprints. False if
+        none fits."""
         lo, hi = part.bounds()
         half = (hi - lo)[:2] / 2
         centre = (lo + hi)[:2] / 2
+        i = self.plate_at(centre[0]) if plate is None else int(plate)
+        c = self.plate_offset(i)[:2]
         target = centre if near is None else np.asarray(near, float)[:2]
         others = [o.bounds() for o in self.parts if o is not part]
         lim = self.size[:2] / 2 - half
         if np.any(lim < 0):
             return False
-        xs = np.arange(-lim[0], lim[0] + 1e-9, step)
-        ys = np.arange(-lim[1], lim[1] + 1e-9, step)
+        xs = c[0] + np.arange(-lim[0], lim[0] + 1e-9, step)
+        ys = c[1] + np.arange(-lim[1], lim[1] + 1e-9, step)
         gx, gy = np.meshgrid(xs, ys)
         cand = np.column_stack([gx.ravel(), gy.ravel()])
         ok = np.ones(len(cand), bool)
@@ -295,6 +332,52 @@ class Scene:
         best = cand[np.argmin(np.linalg.norm(cand - target, axis=1))]
         part.position[:2] += best - centre
         return True
+
+    def place_spill(self, part: Part, near=None, plate: int = 0, spacing: float = 3.0) -> tuple[int, bool]:
+        """place_free on `plate`, else the first later plate with room, else a new plate
+        (11 §3 Spillover): (the plate it went on, whether a plate was added)."""
+        start = int(np.clip(plate, 0, self.plates - 1))
+        for i in range(start, self.plates):
+            tgt = near if i == start and near is not None else self.plate_offset(i)[:2]
+            if self.place_free(part, near=tgt, spacing=spacing, plate=i):
+                return i, False
+        self.plates += 1
+        i = self.plates - 1
+        lo, hi = part.bounds()
+        part.position[:2] += self.plate_offset(i)[:2] - (lo + hi)[:2] / 2
+        self.place_free(part, spacing=spacing, plate=i)
+        return i, True
+
+    def delete_plate(self, i: int, spacing: float = 3.0) -> list[Part]:
+        """Remove plate i (not the last one left): later plates and their parts move one pitch
+        left; i's parts go where they fit on the remaining plates, first plate first, adding
+        none. Returns the parts that fit nowhere (left beside the last plate)."""
+        if self.plates <= 1:
+            raise ValueError("there must always be at least one build plate")
+        i = int(i)
+        own = self.on_plate(i)
+        later = [p for p in self.parts if self.plate_of(p) > i]
+        for p in later:
+            p.position[0] -= self.pitch
+        self.plates -= 1
+        others = [p for p in self.parts if p not in own]
+        left = []
+        for p in own:
+            p.position[0] += 10 * self.pitch * self.plates + 10 * self.pitch    # out of the way
+            placed = False
+            for k in range(self.plates):
+                if self.place_free(p, near=self.plate_offset(k)[:2], spacing=spacing, plate=k):
+                    placed = True
+                    break
+            if not placed:
+                left.append(p)
+            others.append(p)
+        edge = self.plate_offset(self.plates - 1)[0] + self.size[0] / 2 + PLATE_GAP / 2
+        for p in left:                         # beside the last plate, in the gap (out of volume)
+            lo, hi = p.bounds()
+            p.position[0] += edge + (hi[0] - lo[0]) / 2 - (lo[0] + hi[0]) / 2 + 1.0
+            edge += (hi[0] - lo[0]) + spacing
+        return left
 
     def pick(self, origin, direction) -> tuple[Part | None, int, np.ndarray | None]:
         """Nearest part hit by a world-space ray: (part, local face index, world point)."""

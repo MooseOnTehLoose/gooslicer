@@ -32,6 +32,29 @@ class StateCommand(QUndoCommand):
         self._apply(0)
 
 
+class PlatesCommand(StateCommand):
+    """Change the number of build plates (11 §3), with the part moves that go with it
+    (Add/Delete plate, Arrange, spillover)."""
+
+    def __init__(self, win, plates: tuple[int, int], changes: dict | None = None, text: str = "Plates",
+                 current: tuple[int, int] | None = None, applied=True):
+        super().__init__(win, changes or {}, text, applied)
+        self.plates = plates
+        self.current = current or (win.current_plate, win.current_plate)
+
+    def _apply(self, idx: int):
+        self.win.scene.plates = self.plates[idx]
+        self.win.set_current_plate(self.current[idx], update=False)
+        super()._apply(idx)
+
+    def redo(self):
+        if self._skip:
+            self._skip = False
+            self.win.scene_changed()
+            return
+        self._apply(1)
+
+
 class AddPartsCommand(QUndoCommand):
     def __init__(self, win, parts: list[Part], text="Add parts"):
         super().__init__(text)

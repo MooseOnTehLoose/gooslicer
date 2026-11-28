@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, QTimer, Signal
-from PySide6.QtWidgets import QFileDialog, QMenu, QMessageBox
+from PySide6.QtWidgets import QDialog, QFileDialog, QMenu, QMessageBox
 
 from gooslicer import __version__
 from gooslicer import mesh as meshmod
@@ -99,6 +99,10 @@ class ProjectController(QObject):
     def update_title(self, *_):
         name = self.path.name if self.path else "Untitled"
         try:
+            d = self.library_design()
+            if d is not None:                # "Design — Project" (11 §4)
+                name = f"{d.name}{f' ({self.version_label})' if getattr(self, 'version_label', '') else ''}" \
+                       f" — {d.project.name}"
             self.win.setWindowTitle(f"{name}[*] — {APP}")
             self.win.setWindowModified(self.is_modified())
         except RuntimeError:                 # the window is being destroyed
@@ -223,6 +227,8 @@ class ProjectController(QObject):
         w.viewport.set_selection([], emit=False)
         w.undo.clear()
         w.scene.parts.clear()
+        w.scene.plates = 1
+        w.set_current_plate(0, update=False)
         w.reports.clear()
         w.held = None
         w.clear_flaws()
@@ -241,7 +247,81 @@ class ProjectController(QObject):
         """Open after the unsaved-changes prompt (Open recent, command line, drops)."""
         self.maybe_save(lambda: self._open(path))
 
-    def _open(self, path: str) -> None:
+    # ------------------------------------------------------------ project library (11 §4)
+    def library_design(self):
+        """The library design the open project is, or None."""
+        if self.path is None:
+            return None
+        from gooslicer.library import Library
+        return Library(self.win.library_root()).find(self.path)
+
+    def new_in_library(self, path, then=None) -> None:
+        """An empty project saved as a new library design, then open."""
+        def go():
+            self._clear()
+            self.path = None
+            self.version_label = ""
+            self.mark_saved()
+            self._write(Path(path), then)
+        self.maybe_save(go)
+
+    def save_to(self, path, then=None) -> None:
+        """Save the open project to `path` (a new library design), which it then is."""
+        self.version_label = ""
+        self._write(Path(path), then)
+
+    def open_version(self, design, version) -> None:
+        """A version as an unsaved copy of its design (Save writes it over the design)."""
+        self.maybe_save(lambda: self._open(str(version.path), as_copy=(design.path, f"V{version.n}")))
+
+    def save_version(self, then=None) -> None:
+        """File → Save version…: save, then keep the file as the design's next version, with a
+        note. A project outside the library is first added to it."""
+        from PySide6.QtWidgets import QInputDialog
+        from gooslicer.library import Library, LibraryError
+        from .library import AddToLibraryDialog
+        w = self.win
+        lib = Library(w.library_root())
+        d = self.library_design()
+        target = None
+        if d is None:
+            name = self.path.stem if self.path else (w.scene.parts[0].name if w.scene.parts else "Design")
+            if QMessageBox.question(w, APP, "Versions are kept in the project library. Add this project "
+                                            "to the library?") != QMessageBox.Yes:
+                return
+            dlg = AddToLibraryDialog(lib, name, w)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            try:
+                target = dlg.target()
+            except (LibraryError, OSError) as e:
+                QMessageBox.warning(w, APP, str(e))
+                return
+        note, ok = QInputDialog.getText(w, "Save version", "Note for this version (optional):")
+        if not ok:
+            return
+
+        def record():
+            design = lib.find(self.path)
+            if design is None:
+                return
+            try:
+                v = design.save_version(note, w.app_name())
+            except (LibraryError, OSError) as e:
+                QMessageBox.warning(w, APP, f"Could not save the version:\n{e}")
+                return
+            self.version_label = ""
+            self.update_title()
+            w.log_msg(f"Saved V{v.n} of {design.name} ({design.project.name})" + (f": {note}" if note else ""))
+            if then:
+                then()
+        if target is not None:
+            self.save_to(target, then=record)
+        else:
+            self.version_label = ""
+            self._write(self.path, then=record)
+
+    def _open(self, path: str, as_copy=None) -> None:
         path = str(path)
         if not Path(path).exists():
             QMessageBox.warning(self.win, APP, f"{path} no longer exists.")
@@ -255,7 +335,7 @@ class ProjectController(QObject):
             self.win.import_files([path])
             return
         self.win.log_msg(f"Opening {path}…")
-        workers.submit(load_project, path, on_done=lambda res: self._opened(path, res),
+        workers.submit(load_project, path, on_done=lambda res: self._opened(path, res, as_copy=as_copy),
                        on_failed=lambda msg: self._open_failed(path, msg))
 
     def _open_failed(self, path, msg):
@@ -263,7 +343,7 @@ class ProjectController(QObject):
         self.win.log_msg(f"Could not open {Path(path).name}: {first}")
         QMessageBox.warning(self.win, APP, f"Could not open {Path(path).name}:\n{first}")
 
-    def _opened(self, path: str, res, restored: Leftover | None = None) -> None:
+    def _opened(self, path: str, res, restored: Leftover | None = None, as_copy=None) -> None:
         proj, reports = res
         w = self.win
         self._clear()
@@ -283,8 +363,10 @@ class ProjectController(QObject):
         if proj.support_type:
             w.job_panel.set_support_choice(proj.support_type)
         w.reports.update(reports)
+        w.scene.plates = max(1, int(proj.plates))
         for p in proj.parts:
             w.scene.add(p, place=False)
+        w.set_current_plate(proj.current_plate, update=False)
         w.set_dismissed(proj.dismissed)
         if proj.view:
             self._apply_view(proj.view)
@@ -299,8 +381,18 @@ class ProjectController(QObject):
             w.log_msg(f"Opened {proj.source} project {Path(path).name}: {n} part{'s' * (n != 1)}"
                       + (f", {sup} with {proj.source}'s supports" if sup else "")
                       + ". Save writes a GooSlicer project.")
+        elif restored is None and as_copy is not None:
+            # a library version: unsaved, as its design (Save writes over the design)
+            self.path = Path(as_copy[0])
+            self.version_label = as_copy[1]
+            w.undo.setClean()
+            self._saved_state = None
+            self.update_title()
+            w.log_msg(f"Opened {as_copy[1]} of {Path(as_copy[0]).stem} as an unsaved copy: "
+                      f"{n} part{'s' * (n != 1)}")
         elif restored is None:
             self.path = Path(path)
+            self.version_label = ""
             self.mark_saved()
             self.add_recent(path)
             w.log_msg(f"Opened {Path(path).name}: {n} part{'s' * (n != 1)}")
@@ -349,7 +441,7 @@ class ProjectController(QObject):
             dismissed={k: [np.asarray(x, float) for x in v] for k, v in w.dismissed_points().items()},
             view={"yaw": float(cam.yaw), "pitch": float(cam.pitch), "distance": float(cam.distance),
                   "target": [float(x) for x in cam.target]},
-            app=f"{APP} {__version__}")
+            app=f"{APP} {__version__}", plates=w.scene.plates, current_plate=w.current_plate)
 
     def _support_meshes(self, snapshot: list[Part]) -> dict:
         """Ready support geometry only (saving never waits for a rebuild): {snapshot id: (mesh, offset)}."""
@@ -389,6 +481,7 @@ class ProjectController(QObject):
         def done(_):
             self._saving = False
             self.path = path
+            self.version_label = ""
             # edits made while the file was being written stay unsaved
             if self.win.undo.index() == undo_index:
                 self.win.undo.setClean()

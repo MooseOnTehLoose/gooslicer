@@ -54,15 +54,15 @@ def test_keyboard_page_changes_persist_and_reset(app, make_window):
     w = make_window()
     d = w.open_preferences("Keyboard")
     page = d.keyboard
-    assert page.assign("file.save", "Ctrl+Alt+S")
-    assert _key(w, "file.save") == "Ctrl+Alt+S" and w.settings.value("shortcuts/file.save") == "Ctrl+Alt+S"
+    assert page.assign("file.save", "Ctrl+Alt+F12")
+    assert _key(w, "file.save") == "Ctrl+Alt+F12" and w.settings.value("shortcuts/file.save") == "Ctrl+Alt+F12"
     assert not w.settings.contains("shortcuts/file.open")              # only changes are stored
-    assert page.edits["file.save"].keySequence().toString(QKeySequence.PortableText) == "Ctrl+Alt+S"
+    assert page.edits["file.save"].keySequence().toString(QKeySequence.PortableText) == "Ctrl+Alt+F12"
     assert page.assign("edit.lay_flat", "")                            # Clear
     assert _key(w, "edit.lay_flat") == "" and w.settings.value("shortcuts/edit.lay_flat") == ""
     d.close()
     w2 = make_window()                                                 # same settings file
-    assert _key(w2, "file.save") == "Ctrl+Alt+S" and _key(w2, "edit.lay_flat") == ""
+    assert _key(w2, "file.save") == "Ctrl+Alt+F12" and _key(w2, "edit.lay_flat") == ""
     d2 = w2.open_preferences("Keyboard")
     d2.reset_page()
     assert _key(w2, "file.save") == "Ctrl+S" and _key(w2, "edit.lay_flat") == "L"

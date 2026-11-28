@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QSettings, QStandardPaths, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QSettings, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QSurfaceFormat, QUndoStack
 from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QMenu,
                                QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog
 
 from elegoo_goo import goo
 from gooslicer import __version__, mesh as meshmod, preview, profiles
+from gooslicer import cut as cutmod
 from gooslicer import hollow as hollowmod
+from gooslicer import magnet as magnetmod
 from gooslicer import jobs
 from gooslicer import settings as settingsmod
 from gooslicer import slicer as slicermod
@@ -32,16 +34,18 @@ from .commands import (AddPartsCommand, MeshCommand, MirrorCommand, RemovePartsC
                        StateCommand)
 from .camera import CameraPanel
 from .hollowing import (DrainHoleDialog, DrainHolePanel, HollowPanel, see_through_opacity, drill_part_keep, hole_axis_world,
-                        hole_preview_mesh)
+                        hole_length_world, hole_preview_mesh)
 from .jobpanel import JobPanel
 from .memory import MemoryMonitor, StatusBar, trim_memory_soon
 from .panels import FlawsPanel, InfoButton, PartsList, PropertiesPanel, ToolWindow, show_popup
+from .plates import PlateController
 from .printers import PrinterControlPanel
 from .projectio import ProjectController
 from .shortcuts import MOUSE_HELP, ShortcutRegistry, ShortcutsDialog
 from .slicing import LayerPreview, PrintSettingsPanel, SliceThread
 from .supporting import SupportDialog, SupportManager, SupportsCommand, support_params
 from .theme import THEMES, ThemeManager
+from .tools import CutPanel, MagnetPanel, plane_preview
 from . import flaws as flawmod
 from .viewport import Viewport, default_format, island_guides
 
@@ -350,6 +354,8 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self._cancel_btn)
 
         self.project = ProjectController(self)
+        self.current_plate = 0                  # the plate slicing and new parts use (11 §3)
+        self.plate_ctl = PlateController(self)
         self.shortcuts = ShortcutRegistry(self.settings, self)
         self.viewport.set_handle_mode(str(self.settings.value("view/handleMode", "rotate")))
         self.viewport.colors = colormod.load_colors(self.settings)
@@ -435,6 +441,10 @@ class MainWindow(QMainWindow):
         self.project.update_recent_menu()
         self._act(m, "file.save", "&Save project", self.project.save)
         self._act(m, "file.save_as", "Save project &as…", self.project.save_as)
+        self._act(m, "file.save_version", "Save &version…", lambda: self.project.save_version(),
+                  "Save, and keep this state as a version of the design in the project library")
+        self._act(m, "file.library", "Project &library…", self.show_library,
+                  "Projects, their designs (one per resin or plate set) and each design's versions")
         m.addSeparator()
         self._act(m, "file.import", "&Import model…", self.import_dialog)
         self._act(m, "file.import_resin", "Import &resin profile…", self.import_resin_dialog,
@@ -442,6 +452,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         self.slice_action = self._act(m, "file.slice_save", "&Slice and save .goo…", self.slice_dialog)
         self.send_action = self._act(m, "file.slice_send", "Slice and sen&d to printer…", self.slice_and_send)
+        self.slice_all_action = self._act(m, "file.slice_all", "Slice a&ll plates…", self.plate_ctl.slice_all,
+                                          "Slice every plate with parts into <name>-plate<N>.goo")
         self._act(m, "file.open_goo", "&Open .goo for inspection…", self.open_goo_dialog)
         self._act(m, "file.locate_profiles", "Locate SatelLite &profiles…", self.locate_profiles)
         m.addSeparator()
@@ -474,11 +486,17 @@ class MainWindow(QMainWindow):
         e.addSeparator()
         self._act(e, "edit.hollow", "&Hollow…", self.hollow_dialog)
         self._act(e, "edit.drain_holes", "Add drain &holes…", self.drain_hole_mode)
+        self._act(e, "edit.magnet", "Add &magnet pockets…", self.magnet_mode,
+                  "Cut round pockets for disc magnets where you click")
+        self._act(e, "edit.cut", "&Cut…", self.cut_mode,
+                  "Split the selected part along a plane, optionally with a locating peg and socket")
         self._act(e, "edit.check_voids", "Check for &voids", self.check_trapped_resin,
                   "Look for sealed cavities and suction cups that would trap uncured resin")
         e.addSeparator()
         self.prefs_action = self._act(e, "edit.preferences", "&Preferences…", self.open_preferences,
                                       "Every GooSlicer option, by category")
+
+        self.plate_ctl.build_menu(mb)
 
         sm = mb.addMenu("&Supports")
         self._act(sm, "supports.auto", "&Auto-support…", self.auto_support_dialog)
@@ -501,6 +519,7 @@ class MainWindow(QMainWindow):
         v = mb.addMenu("&View")
         self._act(v, "view.reset", "&Reset view", self.viewport.reset_view)
         self._act(v, "view.frame", "&Frame selection", self.viewport.frame_selection)
+        self._act(v, "view.all_plates", "&All plates", self.viewport.frame_all_plates)
         self._act(v, "view.top", "&Top", lambda: self.viewport.set_view(-90, 89))
         self._act(v, "view.front", "F&ront", lambda: self.viewport.set_view(-90, 0))
         self._act(v, "view.side", "&Side", lambda: self.viewport.set_view(0, 0))
@@ -570,10 +589,52 @@ class MainWindow(QMainWindow):
 
     def select(self, ids: list[int]):
         self.viewport.set_selection(ids, emit=False)
+        p = self.primary()
+        if p is not None:                      # its plate becomes the current one (11 §3)
+            self.set_current_plate(self.scene.plate_of(p), update=False)
         self._sync_panels()
 
     def _on_viewport_selection(self, ids):
+        p = self.primary()
+        if p is not None:
+            self.set_current_plate(self.scene.plate_of(p), update=False)
+            panel = getattr(self, "cut_panel", None)
+            if panel is not None and not panel.isHidden() and p.id != getattr(self, "_cut_pid", None):
+                self._cut_pid = p.id                       # the Cut panel follows the selection
+                self._cut_face = None
+                self._cut_axis_reset(centre=True)
         self._sync_panels()
+
+    def library_root(self) -> Path:
+        from gooslicer.library import DEFAULT_ROOT
+        return Path(str(self.settings.value("library/root", "") or DEFAULT_ROOT))
+
+    def app_name(self) -> str:
+        return f"{APP} {__version__}"
+
+    def show_library(self) -> None:
+        from .library import LibraryWindow
+        w = getattr(self, "library_window", None)
+        if w is None:
+            w = self.library_window = LibraryWindow(self)
+            self.project.saved.connect(lambda _: w.refresh() if w.isVisible() else None)
+        w.refresh()
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
+    def set_current_plate(self, i: int, update: bool = True) -> None:
+        """The plate slicing, Reset view and new parts use (11 §3)."""
+        i = int(max(0, min(int(i), self.scene.plates - 1)))
+        changed = i != self.current_plate
+        self.current_plate = i
+        self.viewport.current_plate = i
+        if hasattr(self, "job_panel"):
+            self.job_panel.refresh_plates()
+        if changed:
+            self._check_held()
+        if update:
+            self.viewport.update()
 
     def _sync_panels(self):
         self.parts.refresh(self.scene, self.selected_ids())
@@ -581,6 +642,9 @@ class MainWindow(QMainWindow):
         self.props.set_part(p, self.reports.get(id(p.mesh)) if p else None)
         if hasattr(self, "job_panel"):
             self.job_panel.refresh()
+            if self.current_plate >= self.scene.plates:
+                self.set_current_plate(self.scene.plates - 1, update=False)
+            self.job_panel.refresh_plates()
             self._check_held()
         self._update_hollow_panel()
 
@@ -630,7 +694,14 @@ class MainWindow(QMainWindow):
             self.scene.remove(d.id)
             new.append(d)
         if new:
-            self.undo.push(AddPartsCommand(self, new, "Duplicate"))
+            self.plate_ctl.place_new(new, "Duplicate", near=self._beside(self.scene.get(self.selected_ids()[0])))
+
+    def _beside(self, src) -> list[float] | None:
+        """Where a copy of src should go: just right of it."""
+        if src is None:
+            return None
+        lo, hi = src.bounds()
+        return [hi[0] + (hi[0] - lo[0]) / 2 + 3, (lo[1] + hi[1]) / 2]
 
     def remove_part(self, pid: int) -> None:
         """Take one model off the build plate (the red x in the list); undoable."""
@@ -643,12 +714,10 @@ class MainWindow(QMainWindow):
             return
         src = self.scene.get(pid)
         d = self.scene.duplicate(pid)
-        # the free spot nearest the right of the original (a little apart), else anywhere free
-        lo, hi = src.bounds()
-        if not self.scene.place_free(d, near=[hi[0] + (hi[0] - lo[0]) / 2 + 3, (lo[1] + hi[1]) / 2]):
-            self.log_msg(f"Add instance: no free room on the plate for another {src.name}.")
         self.scene.remove(d.id)
-        self.undo.push(AddPartsCommand(self, [d], "Add instance"))
+        # the free spot nearest the right of the original (a little apart), else spilling over
+        self.set_current_plate(self.scene.plate_of(src), update=False)
+        self.plate_ctl.place_new([d], "Add instance", near=self._beside(src))
 
     def mirror_part(self, pid: int, axis: int = 1) -> None:
         """Mirror a model across the plane through its centre perpendicular to `axis` (1 = Y:
@@ -670,6 +739,8 @@ class MainWindow(QMainWindow):
         a.setCheckable(True)
         a.setChecked(bool(p and p.see_through))
         a.setToolTip("Draw the model see-through, to look at its inside (hollowed models start so)")
+        a = m.addAction("Cut…", lambda: (self.select([pid]), self.cut_mode()))
+        a.setToolTip("Split the model along a plane (11 §2)")
         return m
 
     def see_through_opacity(self) -> float:
@@ -703,13 +774,7 @@ class MainWindow(QMainWindow):
     def arrange_all(self):
         if not self.scene.parts:
             return
-        before = {p.id: p.state() for p in self.scene.parts}
-        fits = self.scene.arrange()
-        changes = {p.id: (before[p.id], p.state()) for p in self.scene.parts if p.state() != before[p.id]}
-        if changes:
-            self.undo.push(StateCommand(self, changes, "Arrange"))
-        if not fits:
-            self.log_msg("Arrange: the parts do not all fit on the build plate.")
+        self.plate_ctl.arrange()
 
     def auto_position(self):
         """Turn the selected parts to the angles needing the fewest supports (orient.py), in a
@@ -908,8 +973,10 @@ class MainWindow(QMainWindow):
             panel.finished.connect(self.viewport.stop_hole_mode)
             panel.entered.connect(self.viewport.clear_hole_hover)
             self.viewport.holeModeEnded.connect(panel.hide)
-            self.viewport.hole_preview_maker = lambda part, face, hit: hole_preview_mesh(
-                part, face, hit, *self.hole_panel.fields.value())
+        self._end_pick_tools()
+        self._pick_tool = "drain"
+        self.viewport.hole_preview_maker = lambda part, face, hit: hole_preview_mesh(
+            part, face, hit, *self.hole_panel.fields.value())
         if self.viewport.support_mode:
             self.viewport.stop_support_mode()
         self.end_hollow_mode()
@@ -928,15 +995,235 @@ class MainWindow(QMainWindow):
         self._hole_settings = f.value()
         self.viewport.refresh_hole_preview()
 
+    def _end_pick_tools(self) -> None:
+        """Before another click tool starts: end the one in use (its panel hides)."""
+        self.viewport.stop_hole_mode()
+        panel = getattr(self, "cut_panel", None)
+        if panel is not None and not panel.isHidden():
+            self.end_cut_mode()
+
     def _hole_picked(self, pid, face, hit):
-        """A click in drain-hole mode: the hole is drilled in the background (the view stays
-        responsive); clicks made meanwhile wait their turn."""
+        """A click in drain-hole (or magnet pocket) mode: the hole is drilled in the background
+        (the view stays responsive); clicks made meanwhile wait their turn. In the Cut panel's
+        Face mode, the click sets the plane."""
         p = self.scene.get(pid)
         if p is None:
             return
+        tool = getattr(self, "_pick_tool", "drain")
+        if tool == "cut_face":
+            self._cut_face_picked(p, face, hit)
+            return
+        if tool == "magnet":
+            ms = self.magnet_panel.fields.value()
+            axis = hole_axis_world(p, face, "normal")
+            wall = hole_length_world(p, hit, axis)
+            self._hole_queue.append((pid, np.asarray(hit, float), axis, ms.hole_settings(),
+                                     ("magnet", ms, wall - ms.depth if wall > 0 else None)))
+            self._drill_next()
+            return
         s, direction = getattr(self, "_hole_settings", None) or DrainHoleDialog(self.settings).value()
-        self._hole_queue.append((pid, np.asarray(hit, float), hole_axis_world(p, face, direction, s.direction), s))
+        self._hole_queue.append((pid, np.asarray(hit, float), hole_axis_world(p, face, direction, s.direction), s,
+                                 None))
         self._drill_next()
+
+    # ------------------------------------------------------------ magnet pockets (11 §1)
+    def magnet_mode(self):
+        """Show the magnet-pocket settings over the 3D view and cut a pocket where the user clicks."""
+        if not self.scene.parts:
+            return
+        panel = getattr(self, "magnet_panel", None)
+        if panel is None:
+            panel = self.magnet_panel = MagnetPanel(self.settings, self.viewport)
+            panel.fields.changed.connect(self.viewport.refresh_hole_preview)
+            panel.finished.connect(self.viewport.stop_hole_mode)
+            panel.entered.connect(self.viewport.clear_hole_hover)
+            self.viewport.holeModeEnded.connect(panel.hide)
+        self._end_pick_tools()
+        self._pick_tool = "magnet"
+        self.viewport.hole_preview_maker = lambda part, face, hit: hole_preview_mesh(
+            part, face, hit, self.magnet_panel.fields.value().hole_settings(), "normal")
+        if self.viewport.support_mode:
+            self.viewport.stop_support_mode()
+        self.end_hollow_mode()
+        self.viewport.lay_flat_mode = False
+        panel.fields.load()
+        panel.place()
+        panel.show()
+        self.viewport.start_hole_mode()
+        self.viewport.setFocus()
+        self.statusBar().showMessage("Magnet pockets: click on a part (Esc or Done to finish)")
+
+    # ------------------------------------------------------------ planar cuts (11 §2)
+    def cut_mode(self):
+        """The Cut panel for the selected part (or the only one)."""
+        pid = self.selected_ids()[0] if self.selected_ids() else (
+            self.scene.parts[0].id if len(self.scene.parts) == 1 else None)
+        if pid is None:
+            QMessageBox.information(self, APP, "Select the part to cut first.")
+            return
+        panel = getattr(self, "cut_panel", None)
+        if panel is None:
+            panel = self.cut_panel = CutPanel(self.viewport)
+            panel.fields.changed.connect(self._cut_fields_changed)
+            panel.finished.connect(self.end_cut_mode)
+            panel.cut.connect(self.cut_selected)
+        self._end_pick_tools()
+        if self.viewport.support_mode:
+            self.viewport.stop_support_mode()
+        self.end_hollow_mode()
+        self.select([pid])
+        self._cut_pid = pid
+        self._cut_face = None
+        self._cut_busy = False
+        self._cut_axis_reset(centre=True)
+        panel.set_status("")
+        panel.place()
+        panel.show()
+        self.viewport.setFocus()
+
+    def end_cut_mode(self) -> None:
+        panel = getattr(self, "cut_panel", None)
+        if panel is not None:
+            panel.hide()
+        if getattr(self, "_pick_tool", None) == "cut_face":
+            self._pick_tool = "drain"
+            self.viewport.stop_hole_mode()
+        self.viewport.set_cut_preview(None)
+
+    def _cut_part(self):
+        return self.scene.get(getattr(self, "_cut_pid", -1))
+
+    def _cut_normal(self):
+        ax = self.cut_panel.fields.axis()
+        if ax is None:
+            return None if self._cut_face is None else self._cut_face[1]
+        return np.asarray(ax, float)
+
+    def _cut_axis_reset(self, centre: bool = False) -> None:
+        """Range the Position field over the part along the normal (centred on it if asked)."""
+        f = self.cut_panel.fields
+        p = self._cut_part()
+        if p is None:
+            return
+        if f.axis() is None and self._cut_face is None:   # Face: wait for the click
+            self._pick_tool = "cut_face"
+            self.viewport.hole_preview_maker = None
+            self.viewport.start_hole_mode()
+            self.cut_panel.set_status("Click the part where the plane should go.")
+            self.viewport.set_cut_preview(None)
+            return
+        n = self._cut_normal()
+        lo, hi = cutmod.extent(p.world_mesh(), n)
+        f.position.blockSignals(True)
+        f.position.setRange(lo, hi)
+        if centre:
+            f.position.setValue((lo + hi) / 2)
+        f.position.blockSignals(False)
+        self._update_cut_preview()
+
+    def _cut_fields_changed(self) -> None:
+        f = self.cut_panel.fields
+        if f.axis() is not None:
+            if getattr(self, "_pick_tool", None) == "cut_face":
+                self._pick_tool = "drain"
+                self.viewport.stop_hole_mode()
+            self._cut_face = None
+            n = np.asarray(f.axis(), float)
+            if getattr(self, "_cut_last_axis", None) is None or not np.allclose(self._cut_last_axis, n):
+                self._cut_last_axis = n
+                self._cut_axis_reset(centre=True)
+                return
+        elif self._cut_face is None:
+            self._cut_last_axis = None
+            self._cut_axis_reset()
+            return
+        self._update_cut_preview()
+
+    def _cut_face_picked(self, part, face, hit) -> None:
+        n = part.rotation @ (np.asarray(part.mesh.face_normals[face], float) / part.scale)
+        n /= np.linalg.norm(n)
+        self._cut_pid = part.id
+        self.select([part.id])
+        self._cut_face = (np.asarray(hit, float), n)
+        self._pick_tool = "drain"
+        self.viewport.stop_hole_mode()
+        f = self.cut_panel.fields
+        lo, hi = cutmod.extent(part.world_mesh(), n)
+        f.position.blockSignals(True)
+        f.position.setRange(lo, hi)
+        f.position.setValue(float(np.asarray(hit, float) @ n))
+        f.position.blockSignals(False)
+        self.cut_panel.set_status("")
+        self._update_cut_preview()
+
+    def _cut_plane(self):
+        n = self._cut_normal()
+        if n is None:
+            return None
+        return n * self.cut_panel.fields.position.value(), n
+
+    def _update_cut_preview(self) -> None:
+        p = self._cut_part()
+        plane = self._cut_plane()
+        if p is None or plane is None:
+            self.viewport.set_cut_preview(None)
+            return
+        self.viewport.set_cut_preview(plane_preview(p.world_mesh(), *plane))
+
+    def cut_selected(self) -> None:
+        p = self._cut_part()
+        plane = self._cut_plane()
+        if p is None or plane is None or self._cut_busy:
+            return
+        s = self.cut_panel.fields.settings()
+        name, src, opacity, had = p.name, p.mesh, p.opacity, p.supports is not None
+        pid = p.id
+        self._cut_busy = True
+        self.cut_panel.set_status(f"Cutting {name}…")
+
+        def done(res):
+            self._cut_busy = False
+            (lo, rlo, flo), (up, rup, fup), placed, before = res
+            now = self.scene.get(pid)
+            if now is None or now.mesh is not src:
+                self.cut_panel.set_status("")
+                return
+            halves = []
+            for suffix, (m, rep, fixed) in (("A", (lo, rlo, flo)), ("B", (up, rup, fup))):
+                h = Part.from_mesh(f"{name} {suffix}", m)
+                h.opacity = opacity
+                h.repaired = bool(fixed or before)
+                self.scene.drop_to_plate(h)
+                self.reports[id(h.mesh)] = rep
+                halves.append(h)
+            self.undo.beginMacro("Cut")
+            self.undo.push(RemovePartsCommand(self, [pid], "Cut"))
+            self.undo.push(AddPartsCommand(self, halves, "Cut"))
+            self.undo.endMacro()
+            msg = f"Cut {name} into {halves[0].name} and {halves[1].name}"
+            if s.connector != "none":
+                msg += f", {placed} of {s.count} {s.connector} connector{'' if s.count == 1 else 's'} placed"
+                if placed < s.count:
+                    msg += " (no room for more)"
+            if had:
+                msg += "; the halves have no supports yet"
+            if before:
+                msg += f"; the mesh was repaired first ({'; '.join(before)})"
+            self.log_msg(msg + ".")
+            self.cut_panel.set_status("")
+            self.select([halves[0].id])
+            self._cut_pid = halves[0].id
+            self._cut_face = None
+            self._update_cut_preview()
+
+        def failed(msg):
+            self._cut_busy = False
+            first = msg.strip().splitlines()[-1] if msg.strip() else msg
+            text = first.split(": ", 1)[-1] if "CutError" in first else first
+            self.cut_panel.set_status(f"Can't cut: {text}")
+            self.log_msg(f"Cut failed: {text}")
+        workers.submit_process(jobs.cut_checked, p.world_mesh(), plane[0], plane[1], s,
+                               self.repair_after_edits(), on_done=done, on_failed=failed)
 
     def drilling(self) -> bool:
         return self._drilling or bool(self._hole_queue)
@@ -945,7 +1232,7 @@ class MainWindow(QMainWindow):
         if self._drilling:
             return
         while self._hole_queue:
-            pid, hit, axis, s = self._hole_queue.pop(0)
+            pid, hit, axis, s, extra = self._hole_queue.pop(0)
             p = self.scene.get(pid)
             if p is not None:
                 break
@@ -973,16 +1260,25 @@ class MainWindow(QMainWindow):
             mesh, rep, fixed, pin = res
             now = self.scene.get(pid)
             if now is not None and now.mesh is src:         # not undone or changed meanwhile
-                kind = "Slot" if s.hole_form == "slot" else "Drain hole"
+                kind = "Magnet pocket" if extra else "Slot" if s.hole_form == "slot" else "Drain hole"
                 if pin is not None:
                     self.undo.beginMacro(kind)
                 self._replace_mesh(pid, mesh, kind, report=rep, fixed=fixed)
                 if pin is not None:
                     self._add_pin(name, pin)
                     self.undo.endMacro()
-                self.log_msg(f"{kind} in {name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
-                             f"Ø{2 * s.radius1:.1f} mm" + (", pin kept as a new part" if pin is not None else "")
-                             + "." + self._repair_note(fixed, rep))
+                if extra:
+                    _, ms, wall = extra
+                    self.log_msg(f"Magnet pocket in {name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
+                                 f"Ø{ms.diameter:.2f} × {ms.depth:.2f} mm." + self._repair_note(fixed, rep))
+                    if wall is None or wall < magnetmod.MIN_WALL:
+                        self.log_msg("⚠ Magnet pocket: " + (
+                            "it breaks through to the other side." if wall is None or wall <= 0 else
+                            f"only {wall:.1f} mm of wall left behind it (break-through risk)."))
+                else:
+                    self.log_msg(f"{kind} in {name} at ({hit[0]:.1f}, {hit[1]:.1f}, {hit[2]:.1f}), "
+                                 f"Ø{2 * s.radius1:.1f} mm" + (", pin kept as a new part" if pin is not None else "")
+                                 + "." + self._repair_note(fixed, rep))
                 self.viewport.repick_hole()                 # the surface under the cursor changed
             self._drill_finished()
 
@@ -999,14 +1295,13 @@ class MainWindow(QMainWindow):
         part = Part.from_mesh(f"{name} pin", pin)
         part.repaired = bool(fixed)
         self.scene.drop_to_plate(part)
-        self.scene.place_free(part)
         self.reports[id(part.mesh)] = rep                # the check doesn't depend on position
-        self.undo.push(AddPartsCommand(self, [part], "Add hole pin"))
+        self.plate_ctl.place_new([part], "Add hole pin")
 
     def _drill_finished(self) -> None:
         if self._hole_queue:
             self._drill_next()
-        elif self.viewport.hole_mode:
+        elif self.viewport.hole_mode and getattr(self, "_pick_tool", "drain") == "drain":
             self.statusBar().showMessage("Drain holes: click on a part to drill (Esc or Done to finish)")
         else:
             self.statusBar().clearMessage()
@@ -1660,13 +1955,14 @@ class MainWindow(QMainWindow):
                          f"{' × '.join(f'{x:.2f}' for x in part.mesh.extents)} mm"
                          + ("" if before is None else f" — repaired ({'; '.join(before)})")
                          + ("" if rep.ok else f" — ⚠ {'; '.join(rep.problems())}"))
+        off = self.scene.plate_offset(self.current_plate)
         for p in new:
+            p.position[:2] += off[:2]                      # on the current plate (11 §3)
             self.scene.drop_to_plate(p)
-        self.undo.beginMacro(f"Import {Path(f).name}")
-        self.undo.push(AddPartsCommand(self, new, "Add"))
-        if self._overlaps(new) or len(new) > 1:
-            self.arrange_all()
-        self.undo.endMacro()
+        if len(new) == 1 and not self._overlaps(new) and self.scene.in_volume(new[0]):
+            self.undo.push(AddPartsCommand(self, new, f"Import {Path(f).name}"))
+        else:                                              # where there's room, spilling over
+            self.plate_ctl.place_new(new, f"Import {Path(f).name}")
         for p in new:
             if not self.scene.in_volume(p):
                 self.log_msg(f"⚠ {p.name} does not fit in the build volume of the selected printer.")
@@ -1685,23 +1981,45 @@ class MainWindow(QMainWindow):
         return False
 
     # --------------------------------------------------------------- slicing
-    def make_slice_job(self) -> slicermod.SliceJob:
+    def _goo_name(self) -> str:
+        """A .goo's default name: the current plate's first part."""
+        parts = self.plate_parts() or self.scene.parts
+        return parts[0].name if parts else "model"
+
+    def plate_parts(self, plate: int | None = None) -> list[Part]:
+        return self.scene.on_plate(self.current_plate if plate is None else plate)
+
+    def make_slice_job(self, plate: int | None = None) -> slicermod.SliceJob:
+        """The slice of one plate (the current one by default): its parts and supports, moved so
+        the plate's centre is the printer's (11 §3). job.check_meshes keeps them in place, for
+        the island check and its red highlights."""
         p = self.printer_panel.current()
         if p is None:
             raise ValueError("No printer selected — locate the SatelLite profiles first.")
-        if not self.scene.parts:
-            raise ValueError("Nothing to slice — import a model first.")
-        outside = [x.name for x in self.scene.parts if not self.scene.in_volume(x)]
+        plate = self.current_plate if plate is None else plate
+        parts = self.plate_parts(plate)
+        if not parts:
+            raise ValueError("Nothing to slice — import a model first." if not self.scene.parts else
+                             f"Plate {plate + 1} is empty.")
+        outside = [x.name for x in parts if not self.scene.in_volume(x)]
         if outside:
             raise ValueError("These parts are outside the build volume: " + ", ".join(outside))
-        meshes = [x.world_mesh() for x in self.scene.parts]
-        for x in self.scene.parts:
+        world = [x.world_mesh() for x in parts]
+        for x in parts:
             sm = self.supports.world_mesh(x)
             if sm is not None:
-                meshes.append(sm)
+                world.append(sm)
+        off = self.scene.plate_offset(plate)
+        meshes = world
+        if plate:
+            meshes = [m.copy() for m in world]
+            for m in meshes:
+                m.apply_translation(-off)
         rgb = slicermod.packed_rgb(preview.render(meshes))
-        return slicermod.SliceJob(meshes, RasterSpec.from_profile(p), self.print_settings.settings(),
-                                  p.name, machine_z=p.size_z, preview_rgb=rgb)
+        job = slicermod.SliceJob(meshes, RasterSpec.from_profile(p), self.print_settings.settings(),
+                                 p.name, machine_z=p.size_z, preview_rgb=rgb)
+        job.check_meshes = world
+        return job
 
     # ---- the slice held in memory (Models → Slicing → Slice)
     def _plate_fingerprint(self):
@@ -1710,11 +2028,14 @@ class MainWindow(QMainWindow):
         p = self.printer_panel.current()
         parts = tuple((x.id, x.mesh, x.supports, x.position.tobytes(), x.rotation.tobytes(), x.scale.tobytes())
                       for x in self.scene.parts)
-        return (p.name if p else None, self.print_settings.settings(), parts)
+        # the slice is of one plate: which, and how many there are (a part's plate depends on it)
+        return (p.name if p else None, self.print_settings.settings(), parts, self.current_plate, self.scene.plates)
 
     @staticmethod
     def _same_plate(a, b) -> bool:
         if a is None or b is None or a[0] != b[0] or a[1] != b[1] or len(a[2]) != len(b[2]):
+            return False
+        if a[3:] != b[3:]:
             return False
         return all(x[0] == y[0] and x[1] is y[1] and x[2] is y[2] and x[3:] == y[3:]
                    for x, y in zip(a[2], b[2]))
@@ -1760,7 +2081,7 @@ class MainWindow(QMainWindow):
         held = self.held_slice()
         if held is None:
             return False
-        default = Path(self.settings.value("lastGooDir", str(Path.home()))) / f"{self.scene.parts[0].name}.goo"
+        default = Path(self.settings.value("lastGooDir", str(Path.home()))) / f"{self._goo_name()}.goo"
         path, _ = QFileDialog.getSaveFileName(self, "Export sliced file", str(default), "ELEGOO GOO (*.goo)")
         if not path:
             return False
@@ -1776,7 +2097,7 @@ class MainWindow(QMainWindow):
             return False
         out = Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / "sent"
         out.mkdir(parents=True, exist_ok=True)
-        name = "".join(c if c.isalnum() or c in "-_." else "_" for c in self.scene.parts[0].name) or "model"
+        name = "".join(c if c.isalnum() or c in "-_." else "_" for c in self._goo_name()) or "model"
         path = str(out / f"{name}.goo")
         if not self._save_held(held, path):
             return False
@@ -1813,7 +2134,7 @@ class MainWindow(QMainWindow):
         def go():
             out = Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / "sent"
             out.mkdir(parents=True, exist_ok=True)
-            name = "".join(c if c.isalnum() or c in "-_." else "_" for c in self.scene.parts[0].name) or "model"
+            name = "".join(c if c.isalnum() or c in "-_." else "_" for c in self._goo_name()) or "model"
             self._send_after_slice = True
             self.start_slice(job, str(out / f"{name}.goo"))
         self._island_check_then(job, go)
@@ -1831,7 +2152,7 @@ class MainWindow(QMainWindow):
             return
 
         def go():
-            default = Path(self.settings.value("lastGooDir", str(Path.home()))) / f"{self.scene.parts[0].name}.goo"
+            default = Path(self.settings.value("lastGooDir", str(Path.home()))) / f"{self._goo_name()}.goo"
             path, _ = QFileDialog.getSaveFileName(self, "Save sliced file", str(default), "ELEGOO GOO (*.goo)")
             if path:
                 if not path.lower().endswith(".goo"):
@@ -1869,7 +2190,8 @@ class MainWindow(QMainWindow):
             self._set_slicing_enabled(True)
             self.log_msg("Island check failed (slicing anyway): " + msg.splitlines()[0])
             proceed()
-        workers.submit_process(jobs.islands_and_faces, job.meshes, h, self.gpu_slicing(), then=_reds_ready,
+        workers.submit_process(jobs.islands_and_faces, getattr(job, "check_meshes", job.meshes), h,
+                               self.gpu_slicing(), then=_reds_ready,
                                on_done=done, on_failed=failed)
 
     def _set_slicing_enabled(self, on: bool) -> None:
@@ -1953,6 +2275,7 @@ class MainWindow(QMainWindow):
             self.lan.send_file(str(res.path), start=True)
 
     def _slice_failed(self, msg):
+        self.plate_ctl.cancel_queue()
         self._send_after_slice = False
         self._slicing_fp = None
         self.job_panel.slicing_failed(msg)
@@ -1968,6 +2291,7 @@ class MainWindow(QMainWindow):
         self._cancel_btn.hide()
         self.slice_action.setEnabled(True)
         self.send_action.setEnabled(True)
+        QTimer.singleShot(0, self.plate_ctl.next_in_queue)      # Slice all plates: the next one
         self._slice_thread = None
         self._check_held()                   # Export / Send become available
 

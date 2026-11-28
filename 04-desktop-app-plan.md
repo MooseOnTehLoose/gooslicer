@@ -1,6 +1,6 @@
 # Stage 4: Native Linux desktop app — architecture and phased plan
 
-Status: **approved 2026-11-23**. P0 done, P1 done, P2 done (2026-11-23; see 05-slicing-spec.md), P3 done (2026-11-23; simulator plus hardware tests on the user's printer, see 02-lan-sdcp-spec.md §6–7), P4 done (2026-11-23; see 06-support-hollow-defaults-spec.md), P5 done (2026-11-23; see 07-hollow-drain-spec.md), P6 done (2026-11-23; EVO and tree supports, raft, editing, island check with pre-slice warning; see 08-supports-spec.md), P7 done (2026-11-24; projects, recent files, autosave, shortcuts, drag handles, checked in the Flatpak; see 09-projects-polish-spec.md).
+Status: **approved 2026-11-23**. P0 done, P1 done, P2 done (2026-11-23; see 05-slicing-spec.md), P3 done (2026-11-23; simulator plus hardware tests on the user's printer, see 02-lan-sdcp-spec.md §6–7), P4 done (2026-11-23; see 06-support-hollow-defaults-spec.md), P5 done (2026-11-23; see 07-hollow-drain-spec.md), P6 done (2026-11-23; EVO and tree supports, raft, editing, island check with pre-slice warning; see 08-supports-spec.md), P7 done (2026-11-24; projects, recent files, autosave, shortcuts, drag handles, checked in the Flatpak; see 09-projects-polish-spec.md). P8 built (2026-11-27; project library with versions, build plates, planar cuts with pegs, magnet pockets; see 11-library-plates-cuts-spec.md): awaiting the user's check.
 Decisions so far (2026-11-23):
 - Toolkit: Qt6 / PySide6.
 - Algorithms: hybrid. Open, clean-room algorithms, with SatelLite's *defaults and parameters* recovered by reverse engineering.
@@ -183,6 +183,13 @@ GooSlicer's output for the same STL will be compared against it layer by layer: 
 - ~~Translations scaffold~~: dropped from P7 (2026-11-24).
 - 3D drag handles: move arrows and scale handles beside the rotation rings, with a handle-mode switch (09 §8).
 - **Flatpak build: done (2026-11-23).** `io.github.mooseontehloose.GooSlicer` on `io.qt.PySide.BaseApp` 6.11 / KDE 6.11 (Python 3.13), with the `.desktop` file, AppStream metainfo and an original icon. `scripts/build-flatpak.sh` builds, installs and writes `dist/GooSlicer.flatpak` (84 MB; 106 MB since PyAV for the camera). Checked in the sandbox: the support → slice pipeline, the GL window, and discovery, status and upload against the printer simulator.
+
+**P8: Library, plates, cuts and magnets** (11-library-plates-cuts-spec.md)
+- Project library: projects holding several designs (e.g. one per resin), with status, notes and explicit named versions (File → Save version…, Project library…).
+- Build plates side by side; imports and Arrange spill onto new plates; Delete plate moves its parts; Slice all plates writes one .goo per plate.
+- Planar cuts (X/Y/Z or a clicked face) with round or square pegs on one half and matching sockets in the other.
+- Magnet pockets from a list of common disc sizes, with adjustable diameter, depth and clearance.
+- ✔ Tests: tests/test_library.py, tests/test_cut_magnet.py, plate tests in tests/test_scene.py and tests/test_project.py, GUI tests in tests/test_gui_tools.py.
 
 Rough order of effort: P0 S · P1 L · P2 M · P3 S–M · P4 M · P5 M–L · P6 XL · P7 M.
 

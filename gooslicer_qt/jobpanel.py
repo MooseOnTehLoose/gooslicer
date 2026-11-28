@@ -147,6 +147,16 @@ class JobPanel(QWidget):
             w.setTextInteractionFlags(Qt.TextSelectableByMouse)
             bf.addRow(k, w)
         self.results.hide()
+        self.plate_row = QWidget()
+        pr = QHBoxLayout(self.plate_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.addWidget(QLabel("Plate"))
+        self.plate_combo = QComboBox()
+        self.plate_combo.setToolTip("The build plate Slice, Export and Send to printer use (11 §3)")
+        self.plate_combo.activated.connect(lambda i: self.win.set_current_plate(i))
+        pr.addWidget(self.plate_combo, 1)
+        self.plate_row.hide()
+        vl.addWidget(self.plate_row)
         vl.addWidget(self.slice_btn)
         vl.addWidget(self.gpu_box)
         out = QHBoxLayout()                      # progress is in the status bar while slicing
@@ -186,6 +196,22 @@ class JobPanel(QWidget):
 
     def _height(self, parts) -> float:
         return max((float(np.ptp(p.world_vertices()[:, 2])) for p in parts), default=0.0)
+
+    def refresh_plates(self) -> None:
+        """The Plate selector: shown with more than one plate."""
+        sc = self.win.scene
+        labels = []
+        for i in range(sc.plates):
+            n = len(sc.on_plate(i))
+            labels.append(f"Plate {i + 1} — {n} part{'' if n == 1 else 's'}")
+        c = self.plate_combo
+        c.blockSignals(True)
+        if [c.itemText(i) for i in range(c.count())] != labels:
+            c.clear()
+            c.addItems(labels)
+        c.setCurrentIndex(min(self.win.current_plate, sc.plates - 1))
+        c.blockSignals(False)
+        self.plate_row.setVisible(sc.plates > 1)
 
     def refresh(self, reload: bool = False) -> None:
         """Follow the selection; with reload, re-read the templates (printer change). The user's

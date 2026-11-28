@@ -73,3 +73,19 @@ def hollow_checked(mesh: trimesh.Trimesh, scale, s, repair: bool):
     out, res = hollow_mesh(mesh, scale, s)
     out, rep, fixed = checked(out, repair)
     return out, res, rep, fixed
+
+
+def cut_checked(world_mesh: trimesh.Trimesh, origin, normal, s, repair: bool):
+    """A planar cut of a part's world mesh (11 §2): the mesh is repaired first when it fails its
+    check and `repair` is on (else refused), then each half is checked. Returns
+    ((lower, check, fixed), (upper, check, fixed), connectors placed, what the first repair fixed)."""
+    from . import cut as C
+    from . import mesh as M
+    rep = M.analyze(world_mesh)
+    before = None
+    if not rep.ok:
+        if not repair:
+            raise C.CutError("the mesh isn't closed: repair it first (Edit → Repair mesh)")
+        world_mesh, before = M.repair(world_mesh), rep.problems()
+    lo, up, placed = C.cut(world_mesh, origin, normal, s)
+    return checked(lo, repair), checked(up, repair), placed, before

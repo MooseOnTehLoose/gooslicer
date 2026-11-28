@@ -68,6 +68,8 @@ class Project:
     saved: str = ""
     newer: bool = False          # written by a newer GooSlicer (loaded anyway, with a warning)
     source: str = ""             # "SatelLite" for a project read from another program's format
+    plates: int = 1              # build plates (11 §3)
+    current_plate: int = 0
 
 
 # --------------------------------------------------------------------------- writing
@@ -175,6 +177,9 @@ def save(path: str | os.PathLike, project: Project, *, support_meshes: dict | No
                    "support_type": project.support_type, "parts": parts_json, "plans": plan_list,
                    "dismissed_flaws": {k: [list(map(float, p)) for p in v] for k, v in project.dismissed.items()},
                    "view": project.view}
+            if project.plates > 1 or project.current_plate:
+                doc["plates"] = int(project.plates)
+                doc["current_plate"] = int(project.current_plate)
             z.writestr(PROJECT_PATH, json.dumps(doc, indent=1))
             if thumbnail:
                 z.writestr(THUMB_PATH, thumbnail)
@@ -343,6 +348,11 @@ def _build(doc: dict, model: bytes, progress) -> Project:
     dismissed = {str(k): [np.asarray(p, float).reshape(3) for p in v]
                  for k, v in (doc.get("dismissed_flaws") or {}).items()}
     ver = doc.get("version", 0)
+    try:
+        plates = max(1, min(int(doc.get("plates", 1)), 1000))
+        current = max(0, min(int(doc.get("current_plate", 0)), plates - 1))
+    except (TypeError, ValueError):
+        plates, current = 1, 0
     return Project(parts, doc.get("printer"), doc.get("print_settings"), doc.get("support_type"),
                    dismissed, doc.get("view"), str(doc.get("app", "")), str(doc.get("saved", "")),
-                   newer=isinstance(ver, int) and ver > VERSION)
+                   newer=isinstance(ver, int) and ver > VERSION, plates=plates, current_plate=current)

@@ -174,3 +174,17 @@ def test_speed_large(tmp_path):
     assert len(got.parts[0].mesh.faces) == len(m.faces)
     scale = 2.24e6 / len(m.faces)
     assert t_save * scale <= 5.0 and t_load * scale <= 5.0, (t_save, t_load)
+
+
+def test_plates_round_trip(tmp_path):
+    """11 §3: the plate count and current plate are saved, left out for one plate."""
+    s, a, b, c = _scene()
+    out = _save(tmp_path, s.parts)
+    got = proj.load(out)
+    assert (got.plates, got.current_plate) == (1, 0)
+    with zipfile.ZipFile(out) as z:
+        assert "plates" not in json.loads(z.read(proj.PROJECT_PATH))
+    p = proj.Project(s.parts, plates=3, current_plate=2)
+    proj.save(tmp_path / "plates.3mf", p)
+    got = proj.load(tmp_path / "plates.3mf")
+    assert (got.plates, got.current_plate) == (3, 2)

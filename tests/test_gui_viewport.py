@@ -43,14 +43,15 @@ def win(app, tmp_path, monkeypatch):
 
 
 def wait_import(app, w, files):
+    """Import and wait for every file (importFinished comes once per file); the parts added."""
     loop = QEventLoop()
     got = []
-    w.importFinished.connect(lambda n: (got.append(n), loop.quit()))
+    w.importFinished.connect(lambda n: (got.append(n), loop.quit() if w._pending == 0 else None))
     QTimer.singleShot(60000, loop.quit)
     w.import_files([str(f) for f in files])
     loop.exec()
     w.importFinished.disconnect()
-    return got[0] if got else None
+    return sum(got) if got else None
 
 
 def pump(app, n=5):
@@ -547,7 +548,7 @@ def test_right_click_menu_on_a_part(app, win, tmp_path, monkeypatch):
     mouse(vp, QEvent.MouseButtonPress, at, Qt.RightButton)
     mouse(vp, QEvent.MouseButtonRelease, at, Qt.RightButton, Qt.NoButton)
     assert asked == [p.id] and win.selected_ids() == [p.id]
-    assert shown == [["Add instance", "Mirror", "See-through"]]
+    assert shown == [["Add instance", "Mirror", "See-through", "Cut…"]]
     # a right drag orbits and opens nothing
     yaw = vp.camera.yaw
     mouse(vp, QEvent.MouseButtonPress, at, Qt.RightButton)
